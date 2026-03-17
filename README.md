@@ -56,7 +56,23 @@ docker run -it --rm -v $(pwd):/workspace -w /workspace ghcr.io/arceos-org/arceos
 
 **Note:** The `--rm` flag will destroy the container instance upon exit. Any changes made inside the container (outside of the mounted `/workspace` volume) will be lost. Please refer to the [Docker documentation](https://docs.docker.com/) for more advanced usage.
 
-#### B. Manual Setup
+#### B. Using Nix + direnv
+
+This repository also ships a `flake.nix` and `.envrc` for a project-local development shell:
+
+```bash
+direnv allow
+# or enter it manually:
+nix develop path:$PWD
+```
+
+The shell follows [`rust-toolchain.toml`](./rust-toolchain.toml), adds QEMU plus the tools used by the Makefiles and transitive build scripts (`cmake`, `libclang`, `mkimage`, `mkfs.fat`, Python, curl, xz, GDB), and exposes compatibility wrappers for the `*-linux-musl-*` cross-compiler names that the build expects.
+
+`cargo-axplat` and `axconfig-gen` are not packaged in nixpkgs at the moment. The dev shell sets `CARGO_INSTALL_ROOT=./.cargo/nix-tools`, so the first `make build` or `make run` will install missing cargo tools into the repository instead of your global Cargo home.
+
+For `loongarch64`, nixpkgs currently exposes a GNU cross toolchain rather than a musl one. The flake wraps it under the expected command names, which matches this repository's current build flow.
+
+#### C. Manual Setup
 
 ##### i. Install System Dependencies
 

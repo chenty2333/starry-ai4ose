@@ -10,7 +10,7 @@
 /kernel-la
 /.cargo
 /.crates*
+/.direnv
 /mnt
 *.swp
 *.swo
-
