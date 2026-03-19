@@ -17,3 +17,4 @@
 *.pyc
 /lab-out
 /scripts/__pycache__
+/.lab-bin

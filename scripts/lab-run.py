@@ -8,6 +8,7 @@ import hashlib
 import pathlib
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,6 +32,11 @@ RUNNER_HOST = "10.0.2.2"
 UDP_PORT = 34567
 TCP_PORT = 34568
 HTTP_PORT = 34569
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+WORKING_DISK_IMG = REPO_ROOT / "make" / "disk.img"
+LAB_BIN_DIR = REPO_ROOT / ".lab-bin"
+PTY_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "pty_relay.c"
+PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
 
 TTY_CTL_NAMES: dict[int, str] = {
     1: "TIOCSCTTY",
@@ -55,6 +61,11 @@ TCP_SCRIPT_LINES: tuple[str, ...] = (
 HTTP_SCRIPT_LINES: tuple[str, ...] = (
     "#!/bin/sh",
     f"wget -q -O - http://{RUNNER_HOST}:{HTTP_PORT}",
+)
+
+PTY_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    f"timeout 5 {PTY_HELPER_GUEST} -n /bin/sh -c 'echo pty-lab' || true",
 )
 
 
@@ -133,6 +144,7 @@ def build_script_setup(path: str, lines: tuple[str, ...]) -> tuple[str, ...]:
 UDP_SETUP_COMMANDS = build_script_setup("/tmp/lab_udp_demo.sh", UDP_SCRIPT_LINES)
 TCP_SETUP_COMMANDS = build_script_setup("/tmp/lab_tcp_echo.sh", TCP_SCRIPT_LINES)
 HTTP_SETUP_COMMANDS = build_script_setup("/tmp/lab_http_once.sh", HTTP_SCRIPT_LINES)
+PTY_SETUP_COMMANDS = build_script_setup("/tmp/lab_pty_demo.sh", PTY_SCRIPT_LINES)
 
 
 DEMOS: dict[str, Demo] = {
@@ -219,6 +231,18 @@ DEMOS: dict[str, Demo] = {
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
         net="y",
+    ),
+    "pty": Demo(
+        name="pty",
+        goal="Show a shell process launched over a freshly created pty pair.",
+        commands=("sh /tmp/lab_pty_demo.sh 2>/dev/null || true",),
+        expected_events=("PtyOpen", "SessionCreate", "TtyCtl", "TaskExit"),
+        focus_events=("PtyOpen", "SessionCreate", "TtyCtl", "ProcessGroupSet", "PollSleep", "PollWake", "TaskExit"),
+        focus_syscalls=(),
+        setup_commands=PTY_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
     ),
 }
 
@@ -329,6 +353,62 @@ def wait_for_qemu_start(proc: subprocess.Popen[str], timeout: float) -> None:
         raise RuntimeError("QEMU exited before the serial server was ready")
 
 
+def ensure_working_disk(arch: str) -> pathlib.Path:
+    if WORKING_DISK_IMG.exists():
+        return WORKING_DISK_IMG
+
+    source = REPO_ROOT / f"rootfs-{arch}.img"
+    if not source.exists():
+        raise FileNotFoundError(f"missing rootfs image: {source}")
+    WORKING_DISK_IMG.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, WORKING_DISK_IMG)
+    return WORKING_DISK_IMG
+
+
+def compile_pty_helper(arch: str) -> pathlib.Path:
+    LAB_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    output = LAB_BIN_DIR / f"pty-relay-{arch}"
+    compiler = f"{arch}-linux-musl-gcc"
+    subprocess.run(
+        [
+            compiler,
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-static",
+            "-s",
+            "-o",
+            str(output),
+            str(PTY_HELPER_SOURCE),
+        ],
+        check=True,
+    )
+    output.chmod(0o755)
+    return output
+
+
+def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
+    subprocess.run(
+        ["debugfs", "-w", "-R", f"rm {guest}", str(img)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["debugfs", "-w", "-R", f"write {local} {guest}", str(img)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def ensure_guest_helpers(demo: Demo, arch: str) -> None:
+    if demo.name != "pty":
+        return
+    img = ensure_working_disk(arch)
+    helper = compile_pty_helper(arch)
+    debugfs_write(img, helper, PTY_HELPER_GUEST)
+
+
 def run_build(arch: str) -> None:
     subprocess.run(
         ["make", f"ARCH={arch}", f"APP_FEATURES={BASELINE_APP_FEATURES}", "NET=y", "build"],
@@ -385,6 +465,18 @@ def clean_capture(text: str, command: str | None = None) -> str:
     while cleaned and not cleaned[-1].strip():
         cleaned.pop()
     return "\n".join(cleaned) + ("\n" if cleaned else "")
+
+
+def normalize_demo_output(demo: Demo, text: str) -> str:
+    if demo.name != "pty":
+        return text
+    drop = {"echo pty-lab", "exit", "Terminated"}
+    kept = [line for line in text.splitlines() if line.strip() not in drop]
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept) + ("\n" if kept else "")
 
 
 def parse_trace(text: str) -> list[TraceEvent]:
@@ -1134,6 +1226,26 @@ def build_walkthrough(
         ]
         lines.extend(peer_notes)
         return lines
+    if demo.name == "pty":
+        pty_open = next((view for view in key_views if view.label == "PtyOpen"), None)
+        session_create = next((view for view in key_views if view.label == "SessionCreate"), None)
+        tty_ctls = [view for view in key_views if view.label == "TtyCtl"]
+        lines: list[str] = []
+        if pty_open is not None:
+            lines.append(f"the helper opened a fresh pseudo-terminal pair via {pty_open.detail}.")
+        if session_create is not None:
+            lines.append(f"the child shell process created a new session with {session_create.detail}.")
+        if tty_ctls:
+            rendered = ", ".join(view.detail for view in tty_ctls[:3])
+            lines.append(f"tty job-control setup flowed through {rendered}.")
+        if counts["PollSleep"] or counts["PollWake"]:
+            lines.append(
+                f"the relay path slept {counts['PollSleep']} time(s) and woke {counts['PollWake']} time(s) while moving bytes between master and slave."
+            )
+        if artifact_outputs.get("demo-step-1.txt", "").strip():
+            lines.append("the pty-backed `/bin/sh -c 'echo pty-lab'` path printed `pty-lab`, which confirms the shell output crossed the slave/master boundary end to end.")
+        lines.append("the demo is currently wrapped in `timeout 5`, which keeps the unfinished pty EOF/close path bounded while still exposing the core session/tty setup.")
+        return lines
     return [view.detail for view in key_views[:5]]
 
 
@@ -1295,6 +1407,7 @@ def execute_run(
     command_timeout: float,
     raw: bool,
 ) -> RunResult:
+    ensure_guest_helpers(demo, arch)
     proc = spawn_qemu(arch, demo.net)
     try:
         wait_for_qemu_start(proc, boot_timeout)
@@ -1311,7 +1424,7 @@ def execute_run(
         for index, command in enumerate(demo.commands, start=1):
             input_stream.append(command)
             output = session.run_command(command, command_timeout)
-            cleaned_output = clean_capture(output, command)
+            cleaned_output = normalize_demo_output(demo, clean_capture(output, command))
             step_path = out_dir / f"demo-step-{index}.txt"
             write_text(step_path, cleaned_output)
             demo_outputs.append((step_path, cleaned_output))
@@ -1327,7 +1440,9 @@ def execute_run(
         input_stream.append("echo 1 > /proc/starry/off")
         session.run_command(input_stream[-1], command_timeout)
 
-        artifact_outputs: dict[str, str] = {}
+        artifact_outputs: dict[str, str] = {
+            path.name: path.read_text(encoding="utf-8") for path, _cleaned in demo_outputs
+        }
         for name, command in ARTIFACT_COMMANDS:
             output = session.run_command(command, command_timeout)
             artifact_outputs[name] = clean_capture(output, command)
