@@ -7,5 +7,6 @@ Use `references/` for internal project direction, scope control, and implementat
 
 Files:
 
+- `lab-baseline.md`: frozen execution baseline for deterministic lab runs.
 - `starry-lab-v1.md`: product definition, scope, milestones, and acceptance criteria.
 - `TODO.md`: actionable backlog for the first implementation stages.

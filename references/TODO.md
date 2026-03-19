@@ -4,10 +4,10 @@ This file tracks the first implementation backlog for `Starry Lab v1`.
 
 ## M0: Baseline
 
-- [ ] Freeze the initial target as `riscv64 + qemu + single core`.
-- [ ] Document the exact boot command used for lab runs.
-- [ ] Confirm the initial shell prompt and serial interaction path remain stable.
-- [ ] List the minimum rootfs commands required by the first four demos.
+- [x] Freeze the initial target as `riscv64 + qemu + single core`.
+- [x] Document the exact boot command used for lab runs.
+- [x] Confirm the initial shell prompt and serial interaction path remain stable.
+- [x] List the minimum rootfs commands required by the first four demos.
 
 Exit condition:
 The same baseline can repeatedly boot to shell and accept scripted input.
@@ -75,11 +75,11 @@ All four demos run through the host runner and produce explainable traces.
 
 ## M6: Cheap Deterministic Mode
 
-- [ ] Fix the lab baseline to one architecture and one scheduler configuration.
-- [ ] Introduce a stable seed for lab runs where randomness exists.
-- [ ] Audit obvious wall-clock uses and replace or wrap them where needed for repeatability.
-- [ ] Record demo input streams.
-- [ ] Compare traces from repeated runs and measure drift.
+- [x] Fix the lab baseline to one architecture and one scheduler configuration.
+- [x] Introduce a stable seed for lab runs where randomness exists.
+- [x] Audit obvious wall-clock uses and replace or wrap them where needed for repeatability.
+- [x] Record demo input streams.
+- [x] Compare traces from repeated runs and measure drift.
 
 Exit condition:
 Running the same demo twice produces traces that are close enough to compare meaningfully.

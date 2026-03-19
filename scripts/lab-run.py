@@ -3,6 +3,7 @@
 import argparse
 import collections
 import datetime as dt
+import hashlib
 import pathlib
 import re
 import socket
@@ -16,6 +17,13 @@ from dataclasses import dataclass
 PROMPT = "starry:~#"
 SERIAL_PORT = 4444
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+BASELINE_ARCH = "riscv64"
+BASELINE_APP_FEATURES = "qemu,lab"
+BASELINE_ACCEL = "n"
+BASELINE_NET = "n"
+BASELINE_ICOUNT = "y"
+BASELINE_SMP = "1"
+BASELINE_RANDOM_SEED = "0123456789abcdef0123456789abcdef"
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,16 @@ class TraceEvent:
     kind: str
     arg0: str
     arg1: str
+
+
+@dataclass(frozen=True)
+class RunResult:
+    out_dir: pathlib.Path
+    events: list[TraceEvent]
+    stats_text: str
+    last_fault_text: str
+    key_events: list[TraceEvent]
+    input_stream: tuple[str, ...]
 
 
 DEMOS: dict[str, Demo] = {
@@ -133,7 +151,7 @@ def wait_for_qemu_start(proc: subprocess.Popen[str], timeout: float) -> None:
 
 def run_build(arch: str) -> None:
     subprocess.run(
-        ["make", f"ARCH={arch}", "APP_FEATURES=qemu,lab", "build"],
+        ["make", f"ARCH={arch}", f"APP_FEATURES={BASELINE_APP_FEATURES}", "build"],
         check=True,
     )
 
@@ -143,9 +161,11 @@ def spawn_qemu(arch: str) -> subprocess.Popen[str]:
         [
             "make",
             f"ARCH={arch}",
-            "APP_FEATURES=qemu,lab",
-            "NET=n",
-            "ACCEL=n",
+            f"APP_FEATURES={BASELINE_APP_FEATURES}",
+            f"NET={BASELINE_NET}",
+            f"ACCEL={BASELINE_ACCEL}",
+            f"ICOUNT={BASELINE_ICOUNT}",
+            f"SMP={BASELINE_SMP}",
             "justrun",
             f"QEMU_ARGS=-snapshot -monitor none -serial tcp::{SERIAL_PORT},server=on",
         ],
@@ -200,9 +220,8 @@ def parse_trace(text: str) -> list[TraceEvent]:
     return events
 
 
-def render_key_trace(path: pathlib.Path, demo: Demo, events: list[TraceEvent]) -> None:
-    interesting = demo.focus_events
-    selected = [event for event in events if event.kind in interesting]
+def select_key_events(demo: Demo, events: list[TraceEvent]) -> list[TraceEvent]:
+    selected = [event for event in events if event.kind in demo.focus_events]
     if demo.focus_page_fault_arg0 is not None:
         keep = {
             event.seq
@@ -219,11 +238,47 @@ def render_key_trace(path: pathlib.Path, demo: Demo, events: list[TraceEvent]) -
             selected = [
                 event for event in selected if event.kind != "PageFault" or event.seq in keep
             ]
+    return selected
+
+
+def render_key_trace(path: pathlib.Path, demo: Demo, events: list[TraceEvent]) -> list[TraceEvent]:
+    selected = select_key_events(demo, events)
     lines = ["seq\ttid\tkind\targ0\targ1"]
     lines.extend(
         f"{event.seq}\t{event.tid}\t{event.kind}\t{event.arg0}\t{event.arg1}" for event in selected
     )
     write_text(path, "\n".join(lines) + "\n")
+    return selected
+
+
+def normalize_events(events: list[TraceEvent]) -> list[str]:
+    tid_map: dict[int, str] = {}
+    lines: list[str] = []
+    for event in events:
+        tid_label = tid_map.setdefault(event.tid, f"T{len(tid_map)}")
+        lines.append(f"{tid_label}\t{event.kind}\t{event.arg0}\t{event.arg1}")
+    return lines
+
+
+def digest_lines(lines: list[str]) -> str:
+    data = "\n".join(lines).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def compare_lines(reference: list[str], current: list[str]) -> tuple[bool, str]:
+    shared = min(len(reference), len(current))
+    for index in range(shared):
+        if reference[index] != current[index]:
+            return (
+                False,
+                f"first diff at line {index + 1}: ref={reference[index]!r} current={current[index]!r}",
+            )
+    if len(reference) != len(current):
+        return (
+            False,
+            f"line count differs: ref={len(reference)} current={len(current)}",
+        )
+    return True, "exact match"
 
 
 def parse_tab_values(text: str) -> dict[str, str]:
@@ -244,6 +299,7 @@ def create_summary(
     events: list[TraceEvent],
     stats_text: str,
     last_fault_text: str,
+    input_stream: tuple[str, ...],
 ) -> None:
     counts = collections.Counter(event.kind for event in events)
     present = [kind for kind in demo.expected_events if counts[kind] > 0]
@@ -266,9 +322,21 @@ def create_summary(
         f"artifacts: {artifact_dir}",
         f"trace_events: {len(events)}",
         "",
+        "baseline:",
+        f"- arch: {BASELINE_ARCH}",
+        f"- app_features: {BASELINE_APP_FEATURES}",
+        f"- accel: {BASELINE_ACCEL}",
+        f"- net: {BASELINE_NET}",
+        f"- icount: {BASELINE_ICOUNT}",
+        f"- smp: {BASELINE_SMP}",
+        f"- dev_random_seed: {BASELINE_RANDOM_SEED}",
+        "",
         "commands:",
     ]
     lines.extend(f"- {cmd}" for cmd in demo.commands)
+    lines.append("")
+    lines.append("input stream:")
+    lines.extend(f"- {cmd}" for cmd in input_stream)
     lines.append("")
     lines.append("expected events:")
     lines.extend(f"- {kind}" for kind in demo.expected_events)
@@ -328,48 +396,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boot-timeout", type=float, default=30.0)
     parser.add_argument("--command-timeout", type=float, default=15.0)
     parser.add_argument("--raw", action="store_true")
+    parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--skip-build", action="store_true")
     return parser.parse_args()
 
-
-def main() -> int:
-    args = parse_args()
-    demo = DEMOS[args.demo]
-
-    if not args.skip_build:
-        run_build(args.arch)
-
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_dir = pathlib.Path(args.out_dir) / f"{demo.name}-{stamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    proc = spawn_qemu(args.arch)
+def execute_run(
+    demo: Demo,
+    arch: str,
+    out_dir: pathlib.Path,
+    boot_timeout: float,
+    command_timeout: float,
+    raw: bool,
+) -> RunResult:
+    proc = spawn_qemu(arch)
     try:
-        wait_for_qemu_start(proc, args.boot_timeout)
-        sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=args.boot_timeout)
+        wait_for_qemu_start(proc, boot_timeout)
+        sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=boot_timeout)
         session = Session(sock)
-        session.wait_for_prompt(args.boot_timeout)
-        session.run_command("echo 1 > /proc/starry/reset", args.command_timeout)
+        session.wait_for_prompt(boot_timeout)
+        input_stream = ["echo 1 > /proc/starry/reset"]
+        session.run_command(input_stream[0], command_timeout)
 
         for index, command in enumerate(demo.commands, start=1):
-            output = session.run_command(command, args.command_timeout)
+            input_stream.append(command)
+            output = session.run_command(command, command_timeout)
             write_text(out_dir / f"demo-step-{index}.txt", clean_capture(output))
 
-        session.run_command("echo 1 > /proc/starry/off", args.command_timeout)
+        input_stream.append("echo 1 > /proc/starry/off")
+        session.run_command(input_stream[-1], command_timeout)
 
         artifact_outputs: dict[str, str] = {}
         for name, command in ARTIFACT_COMMANDS:
-            output = session.run_command(command, args.command_timeout)
+            output = session.run_command(command, command_timeout)
             artifact_outputs[name] = clean_capture(output)
-            if args.raw:
+            if raw:
                 write_text(out_dir / name, artifact_outputs[name])
 
         trace_text = artifact_outputs["starry_trace.txt"]
         stats_text = artifact_outputs["starry_stats.txt"]
         last_fault_text = artifact_outputs["starry_last_fault.txt"]
         events = parse_trace(trace_text)
-        render_key_trace(out_dir / "key_trace.txt", demo, events)
-        if args.raw:
+        key_events = render_key_trace(out_dir / "key_trace.txt", demo, events)
+        if raw:
             write_text(out_dir / "session.log", session.log)
         create_summary(
             out_dir / "summary.txt",
@@ -378,17 +446,103 @@ def main() -> int:
             events,
             stats_text,
             last_fault_text,
+            tuple(input_stream),
         )
 
         sock.sendall(b"exit\r\n")
-        print(out_dir)
-        return 0
+        return RunResult(
+            out_dir=out_dir,
+            events=events,
+            stats_text=stats_text,
+            last_fault_text=last_fault_text,
+            key_events=key_events,
+            input_stream=tuple(input_stream),
+        )
     finally:
         try:
             proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
             proc.terminate()
             proc.wait()
+
+
+def create_repeatability_report(path: pathlib.Path, demo: Demo, runs: list[RunResult]) -> None:
+    reference = runs[0]
+    ref_full = normalize_events(reference.events)
+    ref_key = normalize_events(reference.key_events)
+
+    lines = [
+        f"demo: {demo.name}",
+        f"repeats: {len(runs)}",
+        "",
+        "baseline:",
+        f"- arch: {BASELINE_ARCH}",
+        f"- app_features: {BASELINE_APP_FEATURES}",
+        f"- accel: {BASELINE_ACCEL}",
+        f"- net: {BASELINE_NET}",
+        f"- icount: {BASELINE_ICOUNT}",
+        f"- smp: {BASELINE_SMP}",
+        f"- dev_random_seed: {BASELINE_RANDOM_SEED}",
+        "",
+        "input stream:",
+    ]
+    lines.extend(f"- {cmd}" for cmd in reference.input_stream)
+    lines.append("")
+    lines.append("runs:")
+    for index, run in enumerate(runs, start=1):
+        full_norm = normalize_events(run.events)
+        key_norm = normalize_events(run.key_events)
+        lines.append(f"- run-{index:02d}: {run.out_dir.name}")
+        lines.append(f"  full_events={len(run.events)} full_digest={digest_lines(full_norm)}")
+        lines.append(f"  key_events={len(run.key_events)} key_digest={digest_lines(key_norm)}")
+    lines.append("")
+    lines.append("comparisons against run-01:")
+    for index, run in enumerate(runs[1:], start=2):
+        full_norm = normalize_events(run.events)
+        key_norm = normalize_events(run.key_events)
+        full_match, full_note = compare_lines(ref_full, full_norm)
+        key_match, key_note = compare_lines(ref_key, key_norm)
+        lines.append(f"- run-{index:02d}")
+        lines.append(f"  full_trace_match={int(full_match)}")
+        lines.append(f"  full_trace_note={full_note}")
+        lines.append(f"  key_trace_match={int(key_match)}")
+        lines.append(f"  key_trace_note={key_note}")
+    write_text(path, "\n".join(lines) + "\n")
+
+
+def main() -> int:
+    args = parse_args()
+    demo = DEMOS[args.demo]
+
+    if args.arch != BASELINE_ARCH:
+        raise SystemExit(f"Starry Lab deterministic baseline only supports arch={BASELINE_ARCH}")
+    if args.repeat < 1:
+        raise SystemExit("--repeat must be at least 1")
+
+    if not args.skip_build:
+        run_build(args.arch)
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    if args.repeat == 1:
+        out_dir = pathlib.Path(args.out_dir) / f"{demo.name}-{stamp}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        execute_run(demo, args.arch, out_dir, args.boot_timeout, args.command_timeout, args.raw)
+        print(out_dir)
+        return 0
+
+    out_dir = pathlib.Path(args.out_dir) / f"{demo.name}-repeat-{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    runs: list[RunResult] = []
+    for index in range(1, args.repeat + 1):
+        run_dir = out_dir / f"run-{index:02d}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        runs.append(
+            execute_run(demo, args.arch, run_dir, args.boot_timeout, args.command_timeout, args.raw)
+        )
+
+    create_repeatability_report(out_dir / "repeatability.txt", demo, runs)
+    print(out_dir)
+    return 0
 
 
 if __name__ == "__main__":
