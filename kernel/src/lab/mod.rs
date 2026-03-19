@@ -8,6 +8,10 @@ mod imp {
 
     const TRACE_CAPACITY: usize = 4096;
 
+    pub const TTY_CTL_TIOCSCTTY: usize = 1;
+    pub const TTY_CTL_TIOCSPGRP: usize = 2;
+    pub const TTY_CTL_TIOCNOTTY: usize = 3;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum EventKind {
         #[default]
@@ -22,6 +26,11 @@ mod imp {
         PollSleep,
         PollWake,
         TaskExit,
+        SessionCreate,
+        ProcessGroupSet,
+        WaitReap,
+        PtyOpen,
+        TtyCtl,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -168,6 +177,10 @@ mod imp {
 mod imp {
     use alloc::vec::Vec;
 
+    pub const TTY_CTL_TIOCSCTTY: usize = 1;
+    pub const TTY_CTL_TIOCSPGRP: usize = 2;
+    pub const TTY_CTL_TIOCNOTTY: usize = 3;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum EventKind {
         #[default]
@@ -182,6 +195,11 @@ mod imp {
         PollSleep,
         PollWake,
         TaskExit,
+        SessionCreate,
+        ProcessGroupSet,
+        WaitReap,
+        PtyOpen,
+        TtyCtl,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -248,6 +266,11 @@ impl EventKind {
             EventKind::PollSleep => "PollSleep",
             EventKind::PollWake => "PollWake",
             EventKind::TaskExit => "TaskExit",
+            EventKind::SessionCreate => "SessionCreate",
+            EventKind::ProcessGroupSet => "ProcessGroupSet",
+            EventKind::WaitReap => "WaitReap",
+            EventKind::PtyOpen => "PtyOpen",
+            EventKind::TtyCtl => "TtyCtl",
         }
     }
 }

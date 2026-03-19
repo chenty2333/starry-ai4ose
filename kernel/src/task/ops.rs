@@ -28,6 +28,14 @@ static PROCESS_GROUP_TABLE: RwLock<WeakMap<Pid, Weak<ProcessGroup>>> = RwLock::n
 
 static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap::new());
 
+fn register_process_group_inner(group: &Arc<ProcessGroup>) {
+    PROCESS_GROUP_TABLE.write().insert(group.pgid(), group);
+}
+
+fn register_session_inner(session: &Arc<Session>) {
+    SESSION_TABLE.write().insert(session.sid(), session);
+}
+
 /// Cleanup expired entries in the task tables.
 ///
 /// This function is intended to be used during memory leak analysis to remove
@@ -57,18 +65,8 @@ pub fn add_task_to_table(task: &AxTaskRef) {
     proc_table.insert(pid, proc_data);
 
     let pg = proc.group();
-    let mut pg_table = PROCESS_GROUP_TABLE.write();
-    if pg_table.contains_key(&pg.pgid()) {
-        return;
-    }
-    pg_table.insert(pg.pgid(), &pg);
-
-    let session = pg.session();
-    let mut session_table = SESSION_TABLE.write();
-    if session_table.contains_key(&session.sid()) {
-        return;
-    }
-    session_table.insert(session.sid(), &session);
+    register_process_group(&pg);
+    register_session(&pg.session());
 }
 
 /// Lists all tasks.
@@ -108,6 +106,14 @@ pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
 /// Finds the session with the given SID.
 pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
     SESSION_TABLE.read().get(&sid).ok_or(AxError::NoSuchProcess)
+}
+
+pub fn register_process_group(group: &Arc<ProcessGroup>) {
+    register_process_group_inner(group);
+}
+
+pub fn register_session(session: &Arc<Session>) {
+    register_session_inner(session);
 }
 
 /// Poll the timer

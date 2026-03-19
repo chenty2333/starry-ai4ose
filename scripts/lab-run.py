@@ -32,6 +32,12 @@ UDP_PORT = 34567
 TCP_PORT = 34568
 HTTP_PORT = 34569
 
+TTY_CTL_NAMES: dict[int, str] = {
+    1: "TIOCSCTTY",
+    2: "TIOCSPGRP",
+    3: "TIOCNOTTY",
+}
+
 UDP_SCRIPT_LINES: tuple[str, ...] = (
     "#!/bin/sh",
     "rm -f /tmp/udp.out",
@@ -146,8 +152,8 @@ DEMOS: dict[str, Demo] = {
         name="wait",
         goal="Show child execution, blocking, and wait-based completion.",
         commands=("sleep 1 & wait",),
-        expected_events=("SysEnter", "SysExit", "TaskExit", "PollSleep", "PollWake"),
-        focus_events=("PollSleep", "PollWake", "TaskExit", "SignalSend", "SignalHandle"),
+        expected_events=("SysEnter", "SysExit", "TaskExit", "ProcessGroupSet", "PollSleep", "PollWake"),
+        focus_events=("PollSleep", "PollWake", "TaskExit", "ProcessGroupSet", "WaitReap", "SignalSend", "SignalHandle"),
         focus_syscalls=(),
         setup_commands=(),
         focus_page_fault_arg0=None,
@@ -591,6 +597,27 @@ def describe_task_exit(event: TraceEvent) -> str:
     return f"status={format_exit_status(event.arg0)} group_exit={format_boolish(event.arg1)}"
 
 
+def describe_session_create(event: TraceEvent) -> str:
+    return f"setsid -> sid={format_small_int(event.arg0)} pgid={format_small_int(event.arg1)}"
+
+
+def describe_process_group_set(event: TraceEvent) -> str:
+    return f"setpgid(pid={format_small_int(event.arg0)}, pgid={format_small_int(event.arg1)})"
+
+
+def describe_wait_reap(event: TraceEvent) -> str:
+    return f"wait4 reaped pid={format_small_int(event.arg0)} status={format_exit_status(event.arg1)}"
+
+
+def describe_pty_open(event: TraceEvent) -> str:
+    return f"open /dev/ptmx -> fd={format_fd(event.arg0)} pty={format_small_int(event.arg1)}"
+
+
+def describe_tty_ctl(event: TraceEvent) -> str:
+    op = TTY_CTL_NAMES.get(parse_usize(event.arg0), event.arg0)
+    return f"{op} value={format_small_int(event.arg1)}"
+
+
 def build_event_views(events: list[TraceEvent]) -> list[EventView]:
     views: list[EventView] = []
     active_syscalls: dict[int, str] = {}
@@ -615,6 +642,16 @@ def build_event_views(events: list[TraceEvent]) -> list[EventView]:
             detail = describe_fd_close(event)
         elif event.kind == "TaskExit":
             detail = describe_task_exit(event)
+        elif event.kind == "SessionCreate":
+            detail = describe_session_create(event)
+        elif event.kind == "ProcessGroupSet":
+            detail = describe_process_group_set(event)
+        elif event.kind == "WaitReap":
+            detail = describe_wait_reap(event)
+        elif event.kind == "PtyOpen":
+            detail = describe_pty_open(event)
+        elif event.kind == "TtyCtl":
+            detail = describe_tty_ctl(event)
         else:
             detail = f"arg0={event.arg0} arg1={event.arg1}"
         views.append(EventView(event=event, label=event.kind, detail=detail))
@@ -977,6 +1014,8 @@ def build_walkthrough(
         return lines
     if demo.name == "wait":
         child_exit = next((view for view in task_exits), None)
+        pg_set = next((view for view in key_views if view.label == "ProcessGroupSet"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
         child_tid = child_exit.event.tid if child_exit is not None else None
         sigchld_send = next(
             (view for view in key_views if view.label == "SignalSend" and view.event.arg0 == "0x11"),
@@ -1011,6 +1050,9 @@ def build_walkthrough(
                 f"the shell cloned child tid={parse_i64(clone_exit.event.arg1)} to start the background job."
             )
 
+        if pg_set is not None:
+            lines.append(f"job-control setup included {pg_set.detail} before the shell went into its wait path.")
+
         if wait_enter is not None and suspend_enter is not None and parent_tid is not None:
             lines.append(
                 f"parent tid={parent_tid} entered wait4(pid=-1) and then blocked in rt_sigsuspend waiting for child completion."
@@ -1036,6 +1078,9 @@ def build_walkthrough(
             )
         elif child_exit is not None:
             lines.append(f"child completion showed up as {child_exit.detail}.")
+
+        if wait_reap is not None:
+            lines.append(f"the wait path finished by observing {wait_reap.detail}.")
 
         if sigchld_handle is not None and parent_tid is not None:
             lines.append(

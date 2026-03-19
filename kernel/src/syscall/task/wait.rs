@@ -13,7 +13,10 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::AsThread;
+use crate::{
+    lab::{self, EventKind},
+    task::AsThread,
+};
 
 bitflags! {
     #[derive(Debug)]
@@ -61,7 +64,7 @@ impl WaitPid {
 }
 
 pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
-    let options = WaitOptions::from_bits_truncate(options);
+    let options = WaitOptions::from_bits(options).ok_or(AxError::InvalidInput)?;
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
     let curr = current();
@@ -91,6 +94,11 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
 
     let check_children = || {
         if let Some(child) = children.iter().find(|child| child.is_zombie()) {
+            lab::emit(
+                EventKind::WaitReap,
+                child.pid() as usize,
+                child.exit_code() as usize,
+            );
             if !options.contains(WaitOptions::WNOWAIT) {
                 child.free();
             }

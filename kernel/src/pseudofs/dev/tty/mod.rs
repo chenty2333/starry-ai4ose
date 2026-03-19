@@ -31,6 +31,7 @@ pub use self::{
     pty::PtyDriver,
 };
 use crate::{
+    lab::{self, EventKind, TTY_CTL_TIOCSCTTY, TTY_CTL_TIOCNOTTY, TTY_CTL_TIOCSPGRP},
     pseudofs::{DeviceOps, SimpleFs},
     task::{AsThread, get_process_group, send_signal_to_process_group},
 };
@@ -156,6 +157,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 self.terminal
                     .job_control
                     .set_foreground(&pg)?;
+                lab::emit(EventKind::TtyCtl, TTY_CTL_TIOCSPGRP, pgid as usize);
             }
             TIOCGWINSZ => {
                 (arg as *mut WindowSize).vm_write(*self.terminal.window_size.lock())?;
@@ -168,10 +170,14 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 (arg as *mut u32).vm_write(self.pty_number())?;
             }
             TIOCSCTTY => {
-                self.this
-                    .upgrade()
-                    .unwrap()
-                    .bind_to(&current().as_thread().proc_data.proc)?;
+                let curr = current();
+                let proc = &curr.as_thread().proc_data.proc;
+                self.this.upgrade().unwrap().bind_to(proc)?;
+                lab::emit(
+                    EventKind::TtyCtl,
+                    TTY_CTL_TIOCSCTTY,
+                    proc.group().session().sid() as usize,
+                );
             }
             TIOCNOTTY => {
                 let curr = current();
@@ -184,6 +190,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
 
                 if session.unset_terminal(&term_any) {
                     self.terminal.job_control.clear_session(&session);
+                    lab::emit(EventKind::TtyCtl, TTY_CTL_TIOCNOTTY, session.sid() as usize);
 
                     if was_session_leader && let Some(pg) = foreground {
                         let _ = send_signal_to_process_group(

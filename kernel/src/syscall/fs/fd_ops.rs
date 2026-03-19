@@ -17,6 +17,7 @@ use crate::{
         Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, get_file_like,
         with_fs,
     },
+    lab::{self, EventKind},
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     syscall::sys::{sys_getegid, sys_geteuid},
@@ -61,6 +62,7 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
 }
 
 fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
+    let mut pty_number = None;
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             // /dev/xx handling
@@ -68,13 +70,14 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                 let inner = device.inner().as_any();
                 if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
                     // Opening /dev/ptmx creates a new pseudo-terminal
-                    let (master, pty_number) = ptmx.create_pty()?;
+                    let (master, number) = ptmx.create_pty()?;
+                    pty_number = Some(number);
                     // TODO: this is cursed
                     let pts = FS_CONTEXT.lock().resolve("/dev/pts")?;
                     let entry = DirEntry::new_file(
                         FileNode::new(master),
                         NodeType::CharacterDevice,
-                        Reference::new(Some(pts.entry().clone()), pty_number.to_string()),
+                        Reference::new(Some(pts.entry().clone()), number.to_string()),
                     );
                     let loc = Location::new(file.location().mountpoint().clone(), entry);
                     file = axfs::File::new(FileBackend::Direct(loc), file.flags());
@@ -105,7 +108,11 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    add_file_like(f, flags & O_CLOEXEC != 0)
+    let fd = add_file_like(f, flags & O_CLOEXEC != 0)?;
+    if let Some(number) = pty_number {
+        lab::emit(EventKind::PtyOpen, fd as usize, number as usize);
+    }
+    Ok(fd)
 }
 
 /// Open or create a file.
