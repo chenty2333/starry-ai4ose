@@ -220,3 +220,21 @@ mod imp {
 }
 
 pub use imp::*;
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::None => "None",
+            EventKind::SysEnter => "SysEnter",
+            EventKind::SysExit => "SysExit",
+            EventKind::PageFault => "PageFault",
+            EventKind::SignalSend => "SignalSend",
+            EventKind::SignalHandle => "SignalHandle",
+            EventKind::FdOpen => "FdOpen",
+            EventKind::FdClose => "FdClose",
+            EventKind::PollSleep => "PollSleep",
+            EventKind::PollWake => "PollWake",
+            EventKind::TaskExit => "TaskExit",
+        }
+    }
+}

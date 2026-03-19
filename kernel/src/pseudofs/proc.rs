@@ -20,6 +20,7 @@ use starry_process::Process;
 
 use crate::{
     file::FD_TABLE,
+    lab,
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
@@ -86,6 +87,72 @@ const DUMMY_MEMINFO: &str = indoc! {"
     DirectMap2M:    31492096 kB
     DirectMap1G:     1048576 kB
 "};
+
+fn lab_stats_text() -> String {
+    let stats = lab::stats();
+    let buffered = lab::trace_snapshot().len();
+    format!(
+        "enabled\t{}\n\
+         emitted\t{}\n\
+         overwritten\t{}\n\
+         buffered\t{}\n",
+        usize::from(lab::enabled()),
+        stats.emitted,
+        stats.overwritten,
+        buffered,
+    )
+}
+
+fn lab_last_fault_text() -> String {
+    match lab::last_fault() {
+        Some(fault) => format!(
+            "tid\t{}\n\
+             addr\t{:#x}\n\
+             flags\t{:#x}\n",
+            fault.tid, fault.addr, fault.flags,
+        ),
+        None => "none\n".to_string(),
+    }
+}
+
+fn lab_trace_text() -> String {
+    let mut out = String::from("seq\ttime_ns\ttid\tkind\targ0\targ1\n");
+    for event in lab::trace_snapshot() {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:#x}\t{:#x}\n",
+            event.seq,
+            event.time_ns,
+            event.tid,
+            event.kind.as_str(),
+            event.arg0,
+            event.arg1,
+        ));
+    }
+    out
+}
+
+fn lab_fd_text() -> String {
+    let curr = current();
+    let Some(thread) = curr.try_as_thread() else {
+        return "fd\tcloexec\tpath\n".to_string();
+    };
+
+    let scope = thread.proc_data.scope.read();
+    let fd_table = FD_TABLE.scope(&scope);
+    let table = fd_table.read();
+    let mut out = String::from("fd\tcloexec\tpath\n");
+    for fd in table.ids() {
+        if let Some(desc) = table.get(fd) {
+            out.push_str(&format!(
+                "{}\t{}\t{}\n",
+                fd,
+                usize::from(desc.cloexec),
+                desc.inner.path(),
+            ));
+        }
+    }
+    out
+}
 
 pub fn new_procfs() -> Filesystem {
     SimpleFs::new_with("proc".into(), 0x9fa0, builder)
@@ -418,6 +485,19 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         });
 
         SimpleDir::new_maker(fs.clone(), Arc::new(sys))
+    });
+
+    root.add("starry", {
+        let mut starry = DirMapping::new();
+        starry.add("trace", SimpleFile::new_regular(fs.clone(), || Ok(lab_trace_text())));
+        starry.add("stats", SimpleFile::new_regular(fs.clone(), || Ok(lab_stats_text())));
+        starry.add(
+            "last_fault",
+            SimpleFile::new_regular(fs.clone(), || Ok(lab_last_fault_text())),
+        );
+        starry.add("fd", SimpleFile::new_regular(fs.clone(), || Ok(lab_fd_text())));
+
+        SimpleDir::new_maker(fs.clone(), Arc::new(starry))
     });
 
     let proc_dir = ProcFsHandler(fs.clone());

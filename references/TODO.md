@@ -14,24 +14,24 @@ The same baseline can repeatedly boot to shell and accept scripted input.
 
 ## M1: Lab Subsystem
 
-- [ ] Add a `lab` feature gate in [`kernel/Cargo.toml`](/home/dia/starry-ai4ose/kernel/Cargo.toml).
-- [ ] Add a new `kernel/src/lab/` module tree.
-- [ ] Define the initial event enum and record format.
-- [ ] Implement a fixed-size in-memory ring buffer.
-- [ ] Add simple counters for event totals and drops.
-- [ ] Add a `last_fault` snapshot structure.
-- [ ] Provide a small `emit()` API or macro that is cheap to call from hot paths.
+- [x] Add a `lab` feature gate in [`kernel/Cargo.toml`](/home/dia/starry-ai4ose/kernel/Cargo.toml).
+- [x] Add a new `kernel/src/lab/` module tree.
+- [x] Define the initial event enum and record format.
+- [x] Implement a fixed-size in-memory ring buffer.
+- [x] Add simple counters for event totals and drops.
+- [x] Add a `last_fault` snapshot structure.
+- [x] Provide a small `emit()` API or macro that is cheap to call from hot paths.
 
 Exit condition:
 Kernel code can record events without needing `/proc` or host tooling yet.
 
 ## M2: First Trace Points
 
-- [ ] Instrument syscall enter in [`kernel/src/syscall/mod.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/mod.rs).
-- [ ] Instrument syscall exit in [`kernel/src/syscall/mod.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/mod.rs).
-- [ ] Instrument page faults in [`kernel/src/task/user.rs`](/home/dia/starry-ai4ose/kernel/src/task/user.rs).
+- [x] Instrument syscall enter in [`kernel/src/syscall/mod.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/mod.rs).
+- [x] Instrument syscall exit in [`kernel/src/syscall/mod.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/mod.rs).
+- [x] Instrument page faults in [`kernel/src/task/user.rs`](/home/dia/starry-ai4ose/kernel/src/task/user.rs).
 - [ ] Instrument fatal signal send/handle paths near [`kernel/src/task/user.rs`](/home/dia/starry-ai4ose/kernel/src/task/user.rs).
-- [ ] Instrument fd add/remove in [`kernel/src/file/mod.rs`](/home/dia/starry-ai4ose/kernel/src/file/mod.rs).
+- [x] Instrument fd add/remove in [`kernel/src/file/mod.rs`](/home/dia/starry-ai4ose/kernel/src/file/mod.rs).
 - [ ] Instrument poll sleep/wake in [`kernel/src/syscall/io_mpx/poll.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/io_mpx/poll.rs).
 - [ ] Instrument task exit in the task exit path.
 
@@ -40,12 +40,12 @@ At least one shell command produces a non-empty kernel trace that includes sysca
 
 ## M3: `/proc/starry`
 
-- [ ] Extend [`kernel/src/pseudofs/proc.rs`](/home/dia/starry-ai4ose/kernel/src/pseudofs/proc.rs) with a `/proc/starry` directory.
-- [ ] Add `/proc/starry/trace` for recent event dump.
-- [ ] Add `/proc/starry/stats` for aggregate counts and drop counters.
-- [ ] Add `/proc/starry/last_fault` for the latest page-fault snapshot.
-- [ ] Add `/proc/starry/fd` for a readable view of current fd state.
-- [ ] Make file output line-oriented and script-friendly.
+- [x] Extend [`kernel/src/pseudofs/proc.rs`](/home/dia/starry-ai4ose/kernel/src/pseudofs/proc.rs) with a `/proc/starry` directory.
+- [x] Add `/proc/starry/trace` for recent event dump.
+- [x] Add `/proc/starry/stats` for aggregate counts and drop counters.
+- [x] Add `/proc/starry/last_fault` for the latest page-fault snapshot.
+- [x] Add `/proc/starry/fd` for a readable view of current fd state.
+- [x] Make file output line-oriented and script-friendly.
 
 Exit condition:
 All observability data needed by the first four demos is available from `/proc/starry/*`.
