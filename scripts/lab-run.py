@@ -6,6 +6,7 @@ import datetime as dt
 import errno
 import hashlib
 import pathlib
+import queue
 import re
 import socket
 import subprocess
@@ -26,6 +27,29 @@ BASELINE_NET = "n"
 BASELINE_ICOUNT = "y"
 BASELINE_SMP = "1"
 BASELINE_RANDOM_SEED = "0123456789abcdef0123456789abcdef"
+RUNNER_HOST = "10.0.2.2"
+UDP_PORT = 34567
+TCP_PORT = 34568
+HTTP_PORT = 34569
+
+UDP_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    "rm -f /tmp/udp.out",
+    f"timeout 5 sh -c \"printf 'udp-lab' | nc -u -w 1 {RUNNER_HOST} {UDP_PORT} >/tmp/udp.out 2>/dev/null || true\" || true",
+    "cat /tmp/udp.out",
+)
+
+TCP_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    "rm -f /tmp/tcp.out",
+    f"timeout 5 sh -c \"printf 'tcp-lab\\n' | nc -w 2 {RUNNER_HOST} {TCP_PORT} >/tmp/tcp.out 2>/dev/null || true\" || true",
+    "head -n 1 /tmp/tcp.out",
+)
+
+HTTP_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    f"wget -q -O - http://{RUNNER_HOST}:{HTTP_PORT}",
+)
 
 
 @dataclass(frozen=True)
@@ -35,8 +59,11 @@ class Demo:
     commands: tuple[str, ...]
     expected_events: tuple[str, ...]
     focus_events: tuple[str, ...]
+    focus_syscalls: tuple[str, ...] = ()
+    setup_commands: tuple[str, ...] = ()
     focus_page_fault_arg0: str | None = None
     focus_signal_arg0: str | None = None
+    net: str = "n"
 
 
 @dataclass(frozen=True)
@@ -66,6 +93,40 @@ class RunResult:
     key_events: list[TraceEvent]
     key_views: list[EventView]
     input_stream: tuple[str, ...]
+    net: str
+    peer_notes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PeerController:
+    thread: threading.Thread
+    notes: "queue.Queue[tuple[str, ...]]"
+
+    def finish(self, timeout: float) -> tuple[str, ...]:
+        try:
+            result = self.notes.get(timeout=timeout)
+        except queue.Empty:
+            result = ("runner peer timed out waiting for guest traffic.",)
+        self.thread.join(timeout=0.1)
+        return result
+
+
+def shell_quote(raw: str) -> str:
+    return "'" + raw.replace("'", "'\"'\"'") + "'"
+
+
+def build_script_setup(path: str, lines: tuple[str, ...]) -> tuple[str, ...]:
+    commands = [f"rm -f {path}"]
+    for index, line in enumerate(lines):
+        redirect = ">" if index == 0 else ">>"
+        commands.append(f"printf '%s\\n' {shell_quote(line)} {redirect}{path}")
+    commands.append(f"chmod +x {path}")
+    return tuple(commands)
+
+
+UDP_SETUP_COMMANDS = build_script_setup("/tmp/lab_udp_demo.sh", UDP_SCRIPT_LINES)
+TCP_SETUP_COMMANDS = build_script_setup("/tmp/lab_tcp_echo.sh", TCP_SCRIPT_LINES)
+HTTP_SETUP_COMMANDS = build_script_setup("/tmp/lab_http_once.sh", HTTP_SCRIPT_LINES)
 
 
 DEMOS: dict[str, Demo] = {
@@ -75,8 +136,11 @@ DEMOS: dict[str, Demo] = {
         commands=("echo hi | cat",),
         expected_events=("SysEnter", "SysExit", "FdOpen", "FdClose", "PollSleep", "PollWake"),
         focus_events=("FdOpen", "FdClose", "PollSleep", "PollWake", "TaskExit"),
+        focus_syscalls=(),
+        setup_commands=(),
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
+        net="n",
     ),
     "wait": Demo(
         name="wait",
@@ -84,8 +148,11 @@ DEMOS: dict[str, Demo] = {
         commands=("sleep 1 & wait",),
         expected_events=("SysEnter", "SysExit", "TaskExit", "PollSleep", "PollWake"),
         focus_events=("PollSleep", "PollWake", "TaskExit", "SignalSend", "SignalHandle"),
+        focus_syscalls=(),
+        setup_commands=(),
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
+        net="n",
     ),
     "fd": Demo(
         name="fd",
@@ -93,8 +160,11 @@ DEMOS: dict[str, Demo] = {
         commands=("ls -l /proc/self/fd", "cat /proc/starry/fd"),
         expected_events=("SysEnter", "SysExit", "FdOpen", "FdClose"),
         focus_events=("FdOpen", "FdClose"),
+        focus_syscalls=(),
+        setup_commands=(),
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
+        net="n",
     ),
     "fault": Demo(
         name="fault",
@@ -102,8 +172,47 @@ DEMOS: dict[str, Demo] = {
         commands=("sh -c 'echo 1 > /proc/starry/fault_demo' || true",),
         expected_events=("PageFault", "SignalSend", "SignalHandle", "TaskExit"),
         focus_events=("PageFault", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=(),
+        setup_commands=(),
         focus_page_fault_arg0="0xdeadbeef",
         focus_signal_arg0="0xb",
+        net="n",
+    ),
+    "udp": Demo(
+        name="udp",
+        goal="Show one datagram crossing the guest stack and bouncing off the runner-side UDP peer.",
+        commands=("timeout 5 sh /tmp/lab_udp_demo.sh 2>/dev/null || true",),
+        expected_events=("SysEnter", "SysExit", "FdOpen", "FdClose", "PollSleep", "PollWake"),
+        focus_events=("FdOpen", "FdClose", "PollSleep", "PollWake", "TaskExit"),
+        focus_syscalls=("socket", "sendto", "recvfrom", "close"),
+        setup_commands=UDP_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="y",
+    ),
+    "tcp": Demo(
+        name="tcp",
+        goal="Show one guest TCP connection against a runner-side echo peer.",
+        commands=("timeout 5 sh /tmp/lab_tcp_echo.sh 2>/dev/null || true",),
+        expected_events=("SysEnter", "SysExit", "FdOpen", "FdClose", "PollSleep", "PollWake"),
+        focus_events=("FdOpen", "FdClose", "PollSleep", "PollWake", "TaskExit"),
+        focus_syscalls=("socket", "connect", "read", "write", "close"),
+        setup_commands=TCP_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="y",
+    ),
+    "http": Demo(
+        name="http",
+        goal="Show a one-shot HTTP request/response against a runner-side HTTP peer.",
+        commands=("timeout 5 sh /tmp/lab_http_once.sh 2>/dev/null || true",),
+        expected_events=("SysEnter", "SysExit", "FdOpen", "FdClose", "PollSleep", "PollWake"),
+        focus_events=("FdOpen", "FdClose", "PollSleep", "PollWake", "TaskExit"),
+        focus_syscalls=("socket", "connect", "read", "write", "close"),
+        setup_commands=HTTP_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="y",
     ),
 }
 
@@ -185,12 +294,13 @@ class Session:
 
     def run_command(self, command: str, timeout: float) -> str:
         marker = f"__LAB_DONE__{time.time_ns()}__"
-        wrapped = f"{command}; printf '\\n{marker} %s\\n' $? \n"
+        wrapped = f"{command}\nprintf${{IFS}}'\\n{marker}:%s\\n'${{IFS}}$?\n"
         start = len(self.log)
         self.sock.sendall(wrapped.encode("utf-8"))
         self.recv_until(marker, timeout, start)
-        self.wait_for_prompt(timeout, start)
-        return self.log[start:]
+        marker_index = self.log.index(marker, start)
+        self.wait_for_prompt(timeout, marker_index)
+        return self.log[start:marker_index]
 
 
 def wait_for_qemu_start(proc: subprocess.Popen[str], timeout: float) -> None:
@@ -215,18 +325,18 @@ def wait_for_qemu_start(proc: subprocess.Popen[str], timeout: float) -> None:
 
 def run_build(arch: str) -> None:
     subprocess.run(
-        ["make", f"ARCH={arch}", f"APP_FEATURES={BASELINE_APP_FEATURES}", "build"],
+        ["make", f"ARCH={arch}", f"APP_FEATURES={BASELINE_APP_FEATURES}", "NET=y", "build"],
         check=True,
     )
 
 
-def spawn_qemu(arch: str) -> subprocess.Popen[str]:
+def spawn_qemu(arch: str, net: str) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [
             "make",
             f"ARCH={arch}",
             f"APP_FEATURES={BASELINE_APP_FEATURES}",
-            f"NET={BASELINE_NET}",
+            f"NET={net}",
             f"ACCEL={BASELINE_ACCEL}",
             f"ICOUNT={BASELINE_ICOUNT}",
             f"SMP={BASELINE_SMP}",
@@ -242,18 +352,25 @@ def write_text(path: pathlib.Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def clean_capture(text: str) -> str:
+def clean_capture(text: str, command: str | None = None) -> str:
     text = ANSI_RE.sub("", text).replace("\r", "")
     lines = text.splitlines()
     cleaned: list[str] = []
-    for index, line in enumerate(lines):
-        if index == 0 and "; printf " in line:
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append(line)
             continue
-        if "__LAB_DONE__" in line:
+        if command is not None and stripped == command:
             continue
-        if line.strip() == PROMPT:
+        if "__LAB_DONE__" in stripped:
             continue
-        if line.strip() == "$?":
+        if PROMPT in line:
+            prefix = line.split(PROMPT, 1)[0].rstrip()
+            if prefix.strip():
+                cleaned.append(prefix)
+            continue
+        if stripped == "$?":
             continue
         cleaned.append(line)
 
@@ -269,20 +386,25 @@ def parse_trace(text: str) -> list[TraceEvent]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return events
-    for line in lines[1:]:
+    for line in lines:
         parts = line.split("\t")
         if len(parts) != 6:
             continue
-        events.append(
-            TraceEvent(
-                seq=int(parts[0]),
-                time_ns=int(parts[1]),
-                tid=int(parts[2]),
-                kind=parts[3],
-                arg0=parts[4],
-                arg1=parts[5],
+        if parts[0] == "seq":
+            continue
+        try:
+            events.append(
+                TraceEvent(
+                    seq=int(parts[0]),
+                    time_ns=int(parts[1]),
+                    tid=int(parts[2]),
+                    kind=parts[3],
+                    arg0=parts[4],
+                    arg1=parts[5],
+                )
             )
-        )
+        except ValueError:
+            continue
     return events
 
 
@@ -553,7 +675,44 @@ def render_aligned_table(
 
 def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
     selected = select_key_events(demo, [view.event for view in views])
-    keep = {event.seq for event in selected}
+    network_tids: set[int] = set()
+    if demo.name in {"udp", "tcp", "http"}:
+        seed_syscalls = {"socket", "connect", "sendto", "recvfrom"}
+        for view in views:
+            if view.label != "SysEnter":
+                continue
+            name = syscall_name(view.event.arg0)
+            if name not in seed_syscalls:
+                continue
+            network_tids.add(view.event.tid)
+
+    keep = {
+        event.seq
+        for event in selected
+        if not network_tids or event.tid in network_tids
+    }
+    pending_syscalls: dict[int, str] = {}
+    if demo.focus_syscalls:
+        for view in views:
+            if view.label == "SysEnter":
+                name = syscall_name(view.event.arg0)
+                if name not in demo.focus_syscalls:
+                    continue
+                if network_tids and view.event.tid not in network_tids:
+                    continue
+                if name in {"read", "write", "close"} and parse_i64(view.event.arg1) in {0, 1, 2}:
+                    continue
+                keep.add(view.event.seq)
+                pending_syscalls[view.event.tid] = name
+                continue
+            if view.label != "SysExit":
+                continue
+            if network_tids and view.event.tid not in network_tids:
+                continue
+            name = syscall_name(view.event.arg0)
+            if pending_syscalls.get(view.event.tid) == name:
+                keep.add(view.event.seq)
+                pending_syscalls.pop(view.event.tid, None)
     return [view for view in views if view.event.seq in keep]
 
 
@@ -624,6 +783,119 @@ def parse_tab_values(text: str) -> dict[str, str]:
     return result
 
 
+def shorten_payload(payload: bytes, limit: int = 60) -> str:
+    rendered = payload.decode("utf-8", errors="replace").replace("\n", "\\n")
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[: limit - 3] + "..."
+
+
+def start_udp_echo_peer() -> PeerController:
+    notes: "queue.Queue[tuple[str, ...]]" = queue.Queue()
+
+    def worker() -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", UDP_PORT))
+        listener.settimeout(10)
+        try:
+            payload, addr = listener.recvfrom(4096)
+            listener.sendto(payload, addr)
+            notes.put(
+                (
+                    f"runner UDP peer received {len(payload)} byte(s) and echoed `{shorten_payload(payload)}`.",
+                )
+            )
+        except Exception as exc:
+            notes.put((f"runner UDP peer error: {exc}",))
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return PeerController(thread=thread, notes=notes)
+
+
+def start_tcp_echo_peer() -> PeerController:
+    notes: "queue.Queue[tuple[str, ...]]" = queue.Queue()
+
+    def worker() -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", TCP_PORT))
+        listener.listen(1)
+        listener.settimeout(10)
+        try:
+            conn, _addr = listener.accept()
+            with conn:
+                conn.settimeout(10)
+                payload = conn.recv(4096)
+                conn.sendall(payload)
+                conn.shutdown(socket.SHUT_WR)
+            notes.put(
+                (
+                    f"runner TCP peer echoed {len(payload)} byte(s): `{shorten_payload(payload)}`.",
+                )
+            )
+        except Exception as exc:
+            notes.put((f"runner TCP peer error: {exc}",))
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return PeerController(thread=thread, notes=notes)
+
+
+def start_http_peer() -> PeerController:
+    notes: "queue.Queue[tuple[str, ...]]" = queue.Queue()
+    body = b"hello-http!"
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode("ascii")
+        + b"Connection: close\r\n\r\n"
+        + body
+    )
+
+    def worker() -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", HTTP_PORT))
+        listener.listen(1)
+        listener.settimeout(10)
+        try:
+            conn, _addr = listener.accept()
+            with conn:
+                conn.settimeout(10)
+                request = conn.recv(4096)
+                conn.sendall(response)
+                conn.shutdown(socket.SHUT_WR)
+            first_line = request.splitlines()[0].decode("utf-8", errors="replace") if request else "no request line"
+            notes.put(
+                (
+                    f"runner HTTP peer served `{first_line}` with body `hello-http!`.",
+                )
+            )
+        except Exception as exc:
+            notes.put((f"runner HTTP peer error: {exc}",))
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return PeerController(thread=thread, notes=notes)
+
+
+def start_demo_peer(demo: Demo) -> PeerController | None:
+    if demo.name == "udp":
+        return start_udp_echo_peer()
+    if demo.name == "tcp":
+        return start_tcp_echo_peer()
+    if demo.name == "http":
+        return start_http_peer()
+    return None
+
+
 def summarize_syscalls(events: list[TraceEvent]) -> list[str]:
     counts: collections.Counter[str] = collections.Counter()
     for event in events:
@@ -675,6 +947,7 @@ def build_walkthrough(
     event_views: list[EventView],
     key_views: list[EventView],
     artifact_outputs: dict[str, str],
+    peer_notes: tuple[str, ...],
 ) -> list[str]:
     counts = collections.Counter(view.label for view in key_views)
     task_exits = [view for view in key_views if view.label == "TaskExit"]
@@ -780,6 +1053,27 @@ def build_walkthrough(
         if task_exit is not None:
             lines.append(f"the crashing task ended with {task_exit.detail}.")
         return lines
+    if demo.name == "udp":
+        lines = [
+            f"the guest sent one datagram to the runner-side UDP echo peer at {RUNNER_HOST}:{UDP_PORT}.",
+            "the same guest socket path then received the echoed payload and printed it back to stdout.",
+        ]
+        lines.extend(peer_notes)
+        return lines
+    if demo.name == "tcp":
+        lines = [
+            f"the guest opened one TCP connection to the runner-side echo peer at {RUNNER_HOST}:{TCP_PORT}.",
+            "the client wrote `tcp-lab` and then read the echoed line back into a temporary file before printing it.",
+        ]
+        lines.extend(peer_notes)
+        return lines
+    if demo.name == "http":
+        lines = [
+            f"`wget` connected to the runner-side HTTP peer at {RUNNER_HOST}:{HTTP_PORT}.",
+            "the guest printed the fixed response body `hello-http!`, which makes the TCP path easier to demo as an application request/response flow.",
+        ]
+        lines.extend(peer_notes)
+        return lines
     return [view.detail for view in key_views[:5]]
 
 
@@ -794,12 +1088,13 @@ def create_summary(
     last_fault_text: str,
     input_stream: tuple[str, ...],
     artifact_outputs: dict[str, str],
+    peer_notes: tuple[str, ...],
 ) -> None:
     counts = collections.Counter(event.kind for event in events)
     present = [kind for kind in demo.expected_events if counts[kind] > 0]
     missing = [kind for kind in demo.expected_events if counts[kind] == 0]
     stats = parse_tab_values(stats_text)
-    walkthrough = build_walkthrough(demo, event_views, key_views, artifact_outputs)
+    walkthrough = build_walkthrough(demo, event_views, key_views, artifact_outputs, peer_notes)
     syscall_summary = summarize_syscalls(events)
     signal_summary = summarize_signals(events)
     focus_page_fault = None
@@ -823,7 +1118,7 @@ def create_summary(
         f"- arch: {BASELINE_ARCH}",
         f"- app_features: {BASELINE_APP_FEATURES}",
         f"- accel: {BASELINE_ACCEL}",
-        f"- net: {BASELINE_NET}",
+        f"- net: {demo.net}",
         f"- icount: {BASELINE_ICOUNT}",
         f"- smp: {BASELINE_SMP}",
         f"- dev_random_seed: {BASELINE_RANDOM_SEED}",
@@ -840,6 +1135,10 @@ def create_summary(
     lines.append("")
     lines.append("focus events:")
     lines.extend(f"- {kind}" for kind in demo.focus_events)
+    if demo.focus_syscalls:
+        lines.append("")
+        lines.append("focus syscalls:")
+        lines.extend(f"- {name}" for name in demo.focus_syscalls)
     lines.append("")
     lines.append("walkthrough:")
     if walkthrough:
@@ -892,6 +1191,10 @@ def create_summary(
         lines.extend(f"- {line}" for line in signal_summary)
     else:
         lines.append("- none")
+    if peer_notes:
+        lines.append("")
+        lines.append("runner observations:")
+        lines.extend(f"- {line}" for line in peer_notes)
     lines.append("")
     lines.append("key trace preview:")
     if key_views:
@@ -932,19 +1235,34 @@ def execute_run(
     command_timeout: float,
     raw: bool,
 ) -> RunResult:
-    proc = spawn_qemu(arch)
+    proc = spawn_qemu(arch, demo.net)
     try:
         wait_for_qemu_start(proc, boot_timeout)
         sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=boot_timeout)
         session = Session(sock)
         session.wait_for_prompt(boot_timeout)
+        for command in demo.setup_commands:
+            session.run_command(command, command_timeout)
         input_stream = ["echo 1 > /proc/starry/reset"]
         session.run_command(input_stream[0], command_timeout)
 
+        peer = start_demo_peer(demo)
+        demo_outputs: list[tuple[pathlib.Path, str]] = []
         for index, command in enumerate(demo.commands, start=1):
             input_stream.append(command)
             output = session.run_command(command, command_timeout)
-            write_text(out_dir / f"demo-step-{index}.txt", clean_capture(output))
+            cleaned_output = clean_capture(output, command)
+            step_path = out_dir / f"demo-step-{index}.txt"
+            write_text(step_path, cleaned_output)
+            demo_outputs.append((step_path, cleaned_output))
+        peer_notes = peer.finish(command_timeout) if peer is not None else ()
+        if peer_notes:
+            for step_path, cleaned_output in demo_outputs:
+                if cleaned_output.strip():
+                    continue
+                fallback = ["(no guest stdout captured)"]
+                fallback.extend(peer_notes)
+                write_text(step_path, "\n".join(fallback) + "\n")
 
         input_stream.append("echo 1 > /proc/starry/off")
         session.run_command(input_stream[-1], command_timeout)
@@ -952,7 +1270,7 @@ def execute_run(
         artifact_outputs: dict[str, str] = {}
         for name, command in ARTIFACT_COMMANDS:
             output = session.run_command(command, command_timeout)
-            artifact_outputs[name] = clean_capture(output)
+            artifact_outputs[name] = clean_capture(output, command)
             if raw:
                 write_text(out_dir / name, artifact_outputs[name])
 
@@ -976,6 +1294,7 @@ def execute_run(
             last_fault_text,
             tuple(input_stream),
             artifact_outputs,
+            peer_notes,
         )
 
         sock.sendall(b"exit\r\n")
@@ -988,6 +1307,8 @@ def execute_run(
             key_events=key_events,
             key_views=key_views,
             input_stream=tuple(input_stream),
+            net=demo.net,
+            peer_notes=peer_notes,
         )
     finally:
         try:
@@ -1012,7 +1333,7 @@ def create_repeatability_report(path: pathlib.Path, demo: Demo, runs: list[RunRe
         f"- arch: {BASELINE_ARCH}",
         f"- app_features: {BASELINE_APP_FEATURES}",
         f"- accel: {BASELINE_ACCEL}",
-        f"- net: {BASELINE_NET}",
+        f"- net: {reference.net}",
         f"- icount: {BASELINE_ICOUNT}",
         f"- smp: {BASELINE_SMP}",
         f"- dev_random_seed: {BASELINE_RANDOM_SEED}",

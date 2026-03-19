@@ -89,6 +89,15 @@ lab-fd:
 lab-fault:
 	$(MAKE) --no-print-directory lab DEMO=fault LAB_RAW=$(LAB_RAW)
 
+lab-udp:
+	$(MAKE) --no-print-directory lab DEMO=udp LAB_RAW=$(LAB_RAW)
+
+lab-tcp:
+	$(MAKE) --no-print-directory lab DEMO=tcp LAB_RAW=$(LAB_RAW)
+
+lab-http:
+	$(MAKE) --no-print-directory lab DEMO=http LAB_RAW=$(LAB_RAW)
+
 lab-repeat:
 	python3 ./scripts/lab-run.py $(DEMO) $(LAB_RAW_FLAG) $(LAB_REPEAT_DEFAULT_FLAG)
 
@@ -104,6 +113,15 @@ lab-repeat-fd:
 lab-repeat-fault:
 	$(MAKE) --no-print-directory lab-repeat DEMO=fault REPEAT=2 LAB_RAW=$(LAB_RAW)
 
+lab-repeat-udp:
+	$(MAKE) --no-print-directory lab-repeat DEMO=udp REPEAT=2 LAB_RAW=$(LAB_RAW)
+
+lab-repeat-tcp:
+	$(MAKE) --no-print-directory lab-repeat DEMO=tcp REPEAT=2 LAB_RAW=$(LAB_RAW)
+
+lab-repeat-http:
+	$(MAKE) --no-print-directory lab-repeat DEMO=http REPEAT=2 LAB_RAW=$(LAB_RAW)
+
 # Aliases
 rv:
 	$(MAKE) ARCH=riscv64 run
@@ -114,4 +132,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean lab lab-run lab-pipe lab-wait lab-fd lab-fault lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-fd lab-repeat-fault
+.PHONY: build run justrun debug disasm clean lab lab-run lab-pipe lab-wait lab-fd lab-fault lab-udp lab-tcp lab-http lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-fd lab-repeat-fault lab-repeat-udp lab-repeat-tcp lab-repeat-http
