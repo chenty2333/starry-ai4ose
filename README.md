@@ -141,6 +141,8 @@ Note:
 
 You can check out the [GUI guide](./docs/x11.md) to set up a graphical environment, or explore other documentation in this folder.
 
+For the teaching and experimentation direction built on top of the current kernel, see the [Starry Lab v1 reference](./references/starry-lab-v1.md) and the [implementation TODO](./references/TODO.md).
+
 If you're interested in contributing to the project, please see our [Contributing Guide](./CONTRIBUTING.md).
 
 See more build options in the [Makefile](./Makefile).

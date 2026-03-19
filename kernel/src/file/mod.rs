@@ -27,6 +27,7 @@ pub use self::{
     pipe::Pipe,
 };
 use crate::task::{AX_FILE_LIMIT, AsThread};
+use crate::lab::{self, EventKind};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Kstat {
@@ -207,7 +208,9 @@ pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
         return Err(AxError::TooManyOpenFiles);
     }
     let fd = FileDescriptor { inner: f, cloexec };
-    Ok(table.add(fd).map_err(|_| AxError::TooManyOpenFiles)? as c_int)
+    let fd = table.add(fd).map_err(|_| AxError::TooManyOpenFiles)? as c_int;
+    lab::emit(EventKind::FdOpen, fd as usize, cloexec as usize);
+    Ok(fd)
 }
 
 /// Close a file by `fd`.
@@ -217,6 +220,7 @@ pub fn close_file_like(fd: c_int) -> AxResult {
         .remove(fd as usize)
         .ok_or(AxError::BadFileDescriptor)?;
     debug!("close_file_like <= count: {}", Arc::strong_count(&f.inner));
+    lab::emit(EventKind::FdClose, fd as usize, 0);
     Ok(())
 }
 

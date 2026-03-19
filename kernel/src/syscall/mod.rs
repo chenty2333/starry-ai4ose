@@ -18,6 +18,7 @@ pub use self::{
     fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, signal::*, sync::*, sys::*, task::*,
     time::*,
 };
+use crate::lab::{self, EventKind};
 
 pub fn handle_syscall(uctx: &mut UserContext) {
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
@@ -27,6 +28,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     };
 
     trace!("Syscall {sysno:?}");
+    lab::emit(EventKind::SysEnter, uctx.sysno() as usize, uctx.arg0());
 
     let result = match sysno {
         // fs ctl
@@ -636,5 +638,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     };
     debug!("Syscall {sysno} return {result:?}");
 
-    uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+    let retval = result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as isize;
+    lab::emit(EventKind::SysExit, uctx.sysno() as usize, retval as usize);
+    uctx.set_retval(retval as _);
 }

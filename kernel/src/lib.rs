@@ -14,6 +14,7 @@ extern crate axruntime;
 extern crate axlog;
 
 pub mod entry;
+pub mod lab;
 
 mod config;
 mod file;

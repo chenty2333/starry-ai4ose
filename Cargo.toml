@@ -50,6 +50,7 @@ repository.workspace = true
 
 [features]
 default = []
+lab = ["starry-kernel/lab"]
 qemu = [
     "axfeat/defplat",
     "axfeat/bus-pci",

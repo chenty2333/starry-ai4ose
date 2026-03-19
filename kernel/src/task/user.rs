@@ -7,7 +7,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 use super::{
     AsThread, TimerState, check_signals, raise_signal_fatal, set_timer_state, unblock_next_signal,
 };
-use crate::syscall::handle_syscall;
+use crate::{lab, syscall::handle_syscall};
 
 /// Create a new user task.
 pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) -> TaskInner {
@@ -30,6 +30,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 match reason {
                     ReturnReason::Syscall => handle_syscall(&mut uctx),
                     ReturnReason::PageFault(addr, flags) => {
+                        lab::record_fault(addr.into(), flags.bits() as usize);
                         if !thr.proc_data.aspace.lock().handle_page_fault(addr, flags) {
                             info!(
                                 "{:?}: segmentation fault at {:#x} {:?}",
