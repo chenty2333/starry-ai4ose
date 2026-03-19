@@ -84,6 +84,18 @@ All four demos run through the host runner and produce explainable traces.
 Exit condition:
 Running the same demo twice produces traces that are close enough to compare meaningfully.
 
+## M7: TCP Cleanup and SSH Prep
+
+- [x] Make the TCP echo demo print the echoed line from guest stdout.
+- [x] Trim the TCP teaching trace down to the stream main path: `connect -> write -> read -> EOF`.
+- [ ] Audit the `pty/tty` path needed for interactive remote shells.
+- [ ] Audit `session/process group` and job-control gaps on the SSH path.
+- [ ] Audit `SIGCHLD/wait4` behavior under interactive shell workloads.
+- [ ] Validate `poll/select` across socket and tty objects in one combined scenario.
+
+Exit condition:
+The TCP stream demo is clean enough to teach, and the next SSH-oriented backlog is explicit.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

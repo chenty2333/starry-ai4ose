@@ -42,7 +42,7 @@ UDP_SCRIPT_LINES: tuple[str, ...] = (
 TCP_SCRIPT_LINES: tuple[str, ...] = (
     "#!/bin/sh",
     "rm -f /tmp/tcp.out",
-    f"timeout 5 sh -c \"printf 'tcp-lab\\n' | nc -w 2 {RUNNER_HOST} {TCP_PORT} >/tmp/tcp.out 2>/dev/null || true\" || true",
+    f"timeout 5 sh -c \"{{ printf 'tcp-lab\\n'; sleep 1; }} | nc -w 2 {RUNNER_HOST} {TCP_PORT} >/tmp/tcp.out 2>/dev/null || true\" || true",
     "head -n 1 /tmp/tcp.out",
 )
 
@@ -193,7 +193,7 @@ DEMOS: dict[str, Demo] = {
     "tcp": Demo(
         name="tcp",
         goal="Show one guest TCP connection against a runner-side echo peer.",
-        commands=("timeout 5 sh /tmp/lab_tcp_echo.sh 2>/dev/null || true",),
+        commands=("sh /tmp/lab_tcp_echo.sh 2>/dev/null || true",),
         expected_events=("SysEnter", "SysExit", "FdOpen", "FdClose", "PollSleep", "PollWake"),
         focus_events=("FdOpen", "FdClose", "PollSleep", "PollWake", "TaskExit"),
         focus_syscalls=("socket", "connect", "read", "write", "close"),
@@ -713,7 +713,22 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
             if pending_syscalls.get(view.event.tid) == name:
                 keep.add(view.event.seq)
                 pending_syscalls.pop(view.event.tid, None)
-    return [view for view in views if view.event.seq in keep]
+    selected_views = [view for view in views if view.event.seq in keep]
+    if demo.name == "tcp":
+        eof_tids: set[int] = set()
+        trimmed: list[EventView] = []
+        for view in selected_views:
+            tid = view.event.tid
+            syscall = syscall_name(view.event.arg0) if view.label in {"SysEnter", "SysExit"} else None
+            if tid in eof_tids:
+                if view.label == "FdClose" or (view.label in {"SysEnter", "SysExit"} and syscall == "close"):
+                    trimmed.append(view)
+                continue
+            trimmed.append(view)
+            if view.label == "SysExit" and syscall == "read" and parse_i64(view.event.arg1) == 0:
+                eof_tids.add(tid)
+        selected_views = trimmed
+    return selected_views
 
 
 def render_key_trace(path: pathlib.Path, demo: Demo, views: list[EventView]) -> list[EventView]:
