@@ -241,13 +241,34 @@ def select_key_events(demo: Demo, events: list[TraceEvent]) -> list[TraceEvent]:
     return selected
 
 
+def render_aligned_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    aligns = [">", ">", "<", "<", "<"]
+
+    def format_row(row: tuple[str, ...]) -> str:
+        parts: list[str] = []
+        for index, cell in enumerate(row):
+            align = aligns[index] if index < len(aligns) else "<"
+            parts.append(f"{cell:{align}{widths[index]}}")
+        return "  ".join(parts)
+
+    divider = "  ".join("-" * width for width in widths)
+    lines = [format_row(headers), divider]
+    lines.extend(format_row(row) for row in rows)
+    return "\n".join(lines) + "\n"
+
+
 def render_key_trace(path: pathlib.Path, demo: Demo, events: list[TraceEvent]) -> list[TraceEvent]:
     selected = select_key_events(demo, events)
-    lines = ["seq\ttid\tkind\targ0\targ1"]
-    lines.extend(
-        f"{event.seq}\t{event.tid}\t{event.kind}\t{event.arg0}\t{event.arg1}" for event in selected
-    )
-    write_text(path, "\n".join(lines) + "\n")
+    rows = [
+        (str(event.seq), str(event.tid), event.kind, event.arg0, event.arg1)
+        for event in selected
+    ]
+    write_text(path, render_aligned_table(("seq", "tid", "kind", "arg0", "arg1"), rows))
     return selected
 
 
