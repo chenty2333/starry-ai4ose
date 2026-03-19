@@ -17,6 +17,7 @@ use axfs_ng_vfs::{Filesystem, NodeType, VfsError, VfsResult};
 use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use indoc::indoc;
 use starry_process::Process;
+use starry_signal::{SignalInfo, Signo};
 
 use crate::{
     file::FD_TABLE,
@@ -25,7 +26,7 @@ use crate::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
     },
-    task::{AsThread, TaskStat, get_task, tasks},
+    task::{AsThread, TaskStat, get_task, raise_signal_fatal, tasks},
 };
 
 const DUMMY_MEMINFO: &str = indoc! {"
@@ -152,6 +153,58 @@ fn lab_fd_text() -> String {
         }
     }
     out
+}
+
+fn lab_control_text() -> String {
+    format!(
+        "enabled\t{}\n\
+         action_files\tclear reset on off fault_demo\n",
+        usize::from(lab::enabled()),
+    )
+}
+
+fn handle_lab_action(action: &str) -> VfsResult<()> {
+    match action {
+        "clear" => lab::clear(),
+        "reset" => {
+            lab::clear();
+            lab::set_enabled(true);
+        }
+        "on" => lab::set_enabled(true),
+        "off" => lab::set_enabled(false),
+        _ => return Err(VfsError::InvalidInput),
+    }
+    Ok(())
+}
+
+fn lab_action_file(fs: Arc<SimpleFs>, action: &'static str) -> Arc<SimpleFile> {
+    SimpleFile::new_regular(
+        fs,
+        RwFile::new(move |req| match req {
+            SimpleFileOperation::Read => Ok(Some(format!("write any data to trigger {}\n", action))),
+            SimpleFileOperation::Write(_data) => {
+                handle_lab_action(action)?;
+                Ok(None::<String>)
+            }
+        }),
+    )
+}
+
+fn lab_fault_demo_file(fs: Arc<SimpleFs>) -> Arc<SimpleFile> {
+    SimpleFile::new_regular(
+        fs,
+        RwFile::new(move |req| match req {
+            SimpleFileOperation::Read => Ok(Some(
+                "write any data to trigger a synthetic fault demo in the current task\n".to_string(),
+            )),
+            SimpleFileOperation::Write(_data) => {
+                lab::record_fault(0xdead_beef, 0xc);
+                raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV))
+                    .map_err(|_| VfsError::Io)?;
+                Ok(None::<String>)
+            }
+        }),
+    )
 }
 
 pub fn new_procfs() -> Filesystem {
@@ -496,6 +549,12 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             SimpleFile::new_regular(fs.clone(), || Ok(lab_last_fault_text())),
         );
         starry.add("fd", SimpleFile::new_regular(fs.clone(), || Ok(lab_fd_text())));
+        starry.add("control", SimpleFile::new_regular(fs.clone(), || Ok(lab_control_text())));
+        starry.add("clear", lab_action_file(fs.clone(), "clear"));
+        starry.add("reset", lab_action_file(fs.clone(), "reset"));
+        starry.add("on", lab_action_file(fs.clone(), "on"));
+        starry.add("off", lab_action_file(fs.clone(), "off"));
+        starry.add("fault_demo", lab_fault_demo_file(fs.clone()));
 
         SimpleDir::new_maker(fs.clone(), Arc::new(starry))
     });

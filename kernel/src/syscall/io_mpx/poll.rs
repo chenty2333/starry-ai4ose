@@ -7,9 +7,10 @@ use axtask::future::{self, block_on, poll_io};
 use linux_raw_sys::general::{POLLNVAL, pollfd, timespec};
 use starry_signal::SignalSet;
 
-use super::FdPollSet;
+use super::{FdPollSet, ObservedPollable};
 use crate::{
     file::get_file_like,
+    lab::{self, EventKind},
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
     task::with_blocked_signals,
@@ -51,11 +52,12 @@ fn do_poll(
         return Ok(res);
     }
     let fds = FdPollSet(fds);
+    let observed = ObservedPollable::new(&fds, fds.0.len());
 
-    with_blocked_signals(sigmask, || {
+    let result = with_blocked_signals(sigmask, || {
         match block_on(future::timeout(
             timeout,
-            poll_io(&fds, IoEvents::empty(), false, || {
+            poll_io(&observed, IoEvents::empty(), false, || {
                 let mut res = 0usize;
                 for ((fd, events), revents) in fds.0.iter().zip(revents.iter_mut()) {
                     let mut result = fd.poll();
@@ -82,7 +84,17 @@ fn do_poll(
             Ok(r) => r,
             Err(_) => Ok(0),
         }
-    })
+    });
+
+    if observed.did_wait() {
+        lab::emit(
+            EventKind::PollWake,
+            result.as_ref().map_or(0, |ready| *ready as usize),
+            0,
+        );
+    }
+
+    result
 }
 
 #[cfg(target_arch = "x86_64")]

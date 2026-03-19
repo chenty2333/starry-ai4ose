@@ -14,3 +14,6 @@
 /mnt
 *.swp
 *.swo
+*.pyc
+/lab-out
+/scripts/__pycache__

@@ -7,6 +7,17 @@ use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalOSAction, SignalSet};
 
 use super::{AsThread, Thread, do_exit, get_process_data, get_process_group, get_task};
+use crate::lab::{self, EventKind};
+
+fn signal_action_code(action: SignalOSAction) -> usize {
+    match action {
+        SignalOSAction::Terminate => 1,
+        SignalOSAction::CoreDump => 2,
+        SignalOSAction::Stop => 3,
+        SignalOSAction::Continue => 4,
+        SignalOSAction::Handler => 5,
+    }
+}
 
 pub fn check_signals(
     thr: &Thread,
@@ -18,6 +29,11 @@ pub fn check_signals(
     };
 
     let signo = sig.signo();
+    lab::emit(
+        EventKind::SignalHandle,
+        signo as usize,
+        signal_action_code(os_action),
+    );
     match os_action {
         SignalOSAction::Terminate => {
             do_exit(signo as i32, true);
@@ -66,6 +82,11 @@ pub fn with_blocked_signals<R>(
 }
 
 pub(super) fn send_signal_thread_inner(task: &TaskInner, thr: &Thread, sig: SignalInfo) {
+    lab::emit(
+        EventKind::SignalSend,
+        sig.signo() as usize,
+        task.id().as_u64() as usize,
+    );
     if thr.signal.send_signal(sig) {
         task.interrupt();
     }
@@ -94,6 +115,7 @@ pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()>
     if let Some(sig) = sig {
         let signo = sig.signo();
         info!("Send signal {signo:?} to process {pid}");
+        lab::emit(EventKind::SignalSend, signo as usize, pid as usize);
         if let Some(tid) = proc_data.signal.send_signal(sig)
             && let Ok(task) = get_task(tid)
         {
@@ -125,6 +147,11 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
 
     let signo = sig.signo();
     info!("Send fatal signal {signo:?} to the current process");
+    lab::emit(
+        EventKind::SignalSend,
+        signo as usize,
+        proc_data.proc.pid() as usize,
+    );
     if let Some(tid) = proc_data.signal.send_signal(sig)
         && let Ok(task) = get_task(tid)
     {

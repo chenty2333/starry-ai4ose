@@ -30,10 +30,10 @@ Kernel code can record events without needing `/proc` or host tooling yet.
 - [x] Instrument syscall enter in [`kernel/src/syscall/mod.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/mod.rs).
 - [x] Instrument syscall exit in [`kernel/src/syscall/mod.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/mod.rs).
 - [x] Instrument page faults in [`kernel/src/task/user.rs`](/home/dia/starry-ai4ose/kernel/src/task/user.rs).
-- [ ] Instrument fatal signal send/handle paths near [`kernel/src/task/user.rs`](/home/dia/starry-ai4ose/kernel/src/task/user.rs).
+- [x] Instrument fatal signal send/handle paths near [`kernel/src/task/user.rs`](/home/dia/starry-ai4ose/kernel/src/task/user.rs).
 - [x] Instrument fd add/remove in [`kernel/src/file/mod.rs`](/home/dia/starry-ai4ose/kernel/src/file/mod.rs).
-- [ ] Instrument poll sleep/wake in [`kernel/src/syscall/io_mpx/poll.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/io_mpx/poll.rs).
-- [ ] Instrument task exit in the task exit path.
+- [x] Instrument poll sleep/wake in [`kernel/src/syscall/io_mpx/poll.rs`](/home/dia/starry-ai4ose/kernel/src/syscall/io_mpx/poll.rs).
+- [x] Instrument task exit in the task exit path.
 
 Exit condition:
 At least one shell command produces a non-empty kernel trace that includes syscall and fd events.
@@ -52,23 +52,23 @@ All observability data needed by the first four demos is available from `/proc/s
 
 ## M4: Host Runner
 
-- [ ] Add `scripts/lab-run.py`.
-- [ ] Reuse the current serial/TCP QEMU interaction pattern from [`scripts/ci-test.py`](/home/dia/starry-ai4ose/scripts/ci-test.py).
-- [ ] Support running one named demo at a time.
-- [ ] Capture command output and `/proc/starry/*` artifacts.
-- [ ] Save raw artifacts under a stable output directory.
-- [ ] Render one compact summary or timeline per run.
+- [x] Add `scripts/lab-run.py`.
+- [x] Reuse the current serial/TCP QEMU interaction pattern from [`scripts/ci-test.py`](/home/dia/starry-ai4ose/scripts/ci-test.py).
+- [x] Support running one named demo at a time.
+- [x] Capture command output and `/proc/starry/*` artifacts.
+- [x] Save raw artifacts under a stable output directory.
+- [x] Render one compact summary or timeline per run.
 
 Exit condition:
 A single command can boot the kernel, run one lab demo, and save a readable trace report.
 
 ## M5: Teaching Demos
 
-- [ ] Add a demo for `echo hi | cat`.
-- [ ] Add a demo for `sleep 1 & wait`.
-- [ ] Add a demo for bad-pointer fault handling.
-- [ ] Add a demo for `/proc/self/fd`.
-- [ ] For each demo, write down the teaching goal and the key expected events.
+- [x] Add a demo for `echo hi | cat`.
+- [x] Add a demo for `sleep 1 & wait`.
+- [x] Add a demo for bad-pointer fault handling.
+- [x] Add a demo for `/proc/self/fd`.
+- [x] For each demo, write down the teaching goal and the key expected events.
 
 Exit condition:
 All four demos run through the host runner and produce explainable traces.

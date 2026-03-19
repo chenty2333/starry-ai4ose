@@ -11,9 +11,10 @@ use linux_raw_sys::{
 };
 use starry_signal::SignalSet;
 
-use super::FdPollSet;
+use super::{FdPollSet, ObservedPollable};
 use crate::{
     file::FD_TABLE,
+    lab::{self, EventKind},
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
     task::with_blocked_signals,
@@ -97,6 +98,7 @@ fn do_select(
 
     drop(fd_table);
     let fds = FdPollSet(fds);
+    let observed = ObservedPollable::new(&fds, fd_indices.len());
 
     if let Some(readfds) = readfds.as_deref_mut() {
         unsafe { FD_ZERO(readfds) };
@@ -107,10 +109,10 @@ fn do_select(
     if let Some(exceptfds) = exceptfds.as_deref_mut() {
         unsafe { FD_ZERO(exceptfds) };
     }
-    with_blocked_signals(sigmask.copied(), || {
+    let result = with_blocked_signals(sigmask.copied(), || {
         match block_on(future::timeout(
             timeout,
-            poll_io(&fds, IoEvents::empty(), false, || {
+            poll_io(&observed, IoEvents::empty(), false, || {
                 let mut res = 0usize;
                 for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
                     let events = fd.poll() & *interested;
@@ -143,7 +145,17 @@ fn do_select(
             Ok(r) => r,
             Err(_) => Ok(0),
         }
-    })
+    });
+
+    if observed.did_wait() {
+        lab::emit(
+            EventKind::PollWake,
+            result.as_ref().map_or(0, |ready| *ready as usize),
+            0,
+        );
+    }
+
+    result
 }
 
 #[cfg(target_arch = "x86_64")]

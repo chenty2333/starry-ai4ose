@@ -1,12 +1,12 @@
 #[cfg(feature = "lab")]
 mod imp {
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use axhal::time::monotonic_time;
     use spin::Mutex;
 
-    const TRACE_CAPACITY: usize = 1024;
+    const TRACE_CAPACITY: usize = 4096;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum EventKind {
@@ -94,6 +94,7 @@ mod imp {
     }
 
     static TRACE: Mutex<TraceBuffer> = Mutex::new(TraceBuffer::new());
+    static ENABLED: AtomicBool = AtomicBool::new(true);
     static EMITTED: AtomicU64 = AtomicU64::new(0);
     static OVERWRITTEN: AtomicU64 = AtomicU64::new(0);
     static LAST_FAULT: Mutex<Option<LastFault>> = Mutex::new(None);
@@ -103,10 +104,17 @@ mod imp {
     }
 
     pub fn enabled() -> bool {
-        true
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(enabled: bool) {
+        ENABLED.store(enabled, Ordering::Relaxed);
     }
 
     pub fn emit(kind: EventKind, arg0: usize, arg1: usize) {
+        if !enabled() {
+            return;
+        }
         let seq = EMITTED.fetch_add(1, Ordering::Relaxed) + 1;
         let event = TraceEvent {
             seq,
@@ -122,6 +130,9 @@ mod imp {
     }
 
     pub fn record_fault(addr: usize, flags: usize) {
+        if !enabled() {
+            return;
+        }
         *LAST_FAULT.lock() = Some(LastFault {
             tid: current_tid(),
             addr,
@@ -199,6 +210,8 @@ mod imp {
     pub fn enabled() -> bool {
         false
     }
+
+    pub fn set_enabled(_enabled: bool) {}
 
     pub fn emit(_kind: EventKind, _arg0: usize, _arg1: usize) {}
 

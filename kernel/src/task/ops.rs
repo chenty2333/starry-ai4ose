@@ -18,6 +18,7 @@ use super::{
     AsThread, FutexKey, ProcessData, TimerState, futex_table_for, send_signal_thread_inner,
     send_signal_to_process, send_signal_to_thread,
 };
+use crate::lab::{self, EventKind};
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 
@@ -202,6 +203,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     let thr = curr.as_thread();
 
     info!("{} exit with code: {}", curr.id_name(), exit_code);
+    lab::emit(
+        EventKind::TaskExit,
+        exit_code as usize,
+        usize::from(group_exit),
+    );
 
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     if clear_child_tid.vm_write(0).is_ok() {

@@ -14,7 +14,9 @@ use crate::{
         FileLike,
         epoll::{Epoll, EpollEvent, EpollFlags},
     },
+    lab::{self, EventKind},
     mm::{UserConstPtr, UserPtr, nullable},
+    syscall::io_mpx::ObservedPollable,
     syscall::signal::check_sigset_size,
     task::with_blocked_signals,
     time::TimeValueLike,
@@ -93,18 +95,30 @@ fn do_epoll_wait(
     }
     let events = events.get_as_mut_slice(maxevents as usize)?;
 
-    with_blocked_signals(
+    let observed = ObservedPollable::new(epoll.as_ref(), epfd as usize);
+
+    let result = with_blocked_signals(
         nullable!(sigmask.get_as_ref())?.copied(),
         || match block_on(future::timeout(
             timeout,
-            poll_io(epoll.as_ref(), IoEvents::IN, false, || {
+            poll_io(&observed, IoEvents::IN, false, || {
                 epoll.poll_events(events)
             }),
         )) {
             Ok(r) => r.map(|n| n as _),
             Err(_) => Ok(0),
         },
-    )
+    );
+
+    if observed.did_wait() {
+        lab::emit(
+            EventKind::PollWake,
+            result.as_ref().map_or(0, |ready| *ready as usize),
+            0,
+        );
+    }
+
+    result
 }
 
 pub fn sys_epoll_pwait(
