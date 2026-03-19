@@ -652,7 +652,30 @@ def parse_fd_snapshot(text: str) -> int | None:
     return entries or None
 
 
-def build_walkthrough(demo: Demo, key_views: list[EventView], artifact_outputs: dict[str, str]) -> list[str]:
+def find_syscall_view(
+    views: list[EventView],
+    *,
+    syscall: str,
+    label: str = "SysEnter",
+    tid: int | None = None,
+) -> EventView | None:
+    for view in views:
+        if view.label != label:
+            continue
+        if syscall_name(view.event.arg0) != syscall:
+            continue
+        if tid is not None and view.event.tid != tid:
+            continue
+        return view
+    return None
+
+
+def build_walkthrough(
+    demo: Demo,
+    event_views: list[EventView],
+    key_views: list[EventView],
+    artifact_outputs: dict[str, str],
+) -> list[str]:
     counts = collections.Counter(view.label for view in key_views)
     task_exits = [view for view in key_views if view.label == "TaskExit"]
     signal_events = [view for view in key_views if view.label in {"SignalSend", "SignalHandle"}]
@@ -665,13 +688,72 @@ def build_walkthrough(demo: Demo, key_views: list[EventView], artifact_outputs: 
             lines.append(f"{len(task_exits)} task exit event(s) closed out the pipeline workload.")
         return lines
     if demo.name == "wait":
-        lines = [
-            f"the wait path blocked {counts['PollSleep']} time(s) before wakeup {counts['PollWake']} time(s).",
-        ]
-        if task_exits:
-            exits = ", ".join(view.detail for view in task_exits[:3])
-            lines.append(f"task exit observation(s): {exits}.")
-        if signal_events:
+        child_exit = next((view for view in task_exits), None)
+        child_tid = child_exit.event.tid if child_exit is not None else None
+        sigchld_send = next(
+            (view for view in key_views if view.label == "SignalSend" and view.event.arg0 == "0x11"),
+            None,
+        )
+        sigchld_handle = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.event.arg0 == "0x11"),
+            None,
+        )
+        parent_tid = None
+        if sigchld_send is not None:
+            parent_tid = parse_usize(sigchld_send.event.arg1)
+        elif sigchld_handle is not None:
+            parent_tid = sigchld_handle.event.tid
+
+        clone_exit = find_syscall_view(event_views, syscall="clone", label="SysExit", tid=parent_tid)
+        wait_enter = find_syscall_view(event_views, syscall="wait4", tid=parent_tid)
+        suspend_enter = find_syscall_view(event_views, syscall="rt_sigsuspend", tid=parent_tid)
+        child_exec = find_syscall_view(event_views, syscall="execve", tid=child_tid)
+        child_sleep = (
+            find_syscall_view(event_views, syscall="nanosleep", tid=child_tid)
+            or find_syscall_view(event_views, syscall="clock_nanosleep", tid=child_tid)
+        )
+
+        lines: list[str] = []
+        if parent_tid is not None and child_tid is not None:
+            lines.append(
+                f"shell task tid={parent_tid} launched a background child tid={child_tid} for `sleep 1`."
+            )
+        elif clone_exit is not None and parse_i64(clone_exit.event.arg1) > 0:
+            lines.append(
+                f"the shell cloned child tid={parse_i64(clone_exit.event.arg1)} to start the background job."
+            )
+
+        if wait_enter is not None and suspend_enter is not None and parent_tid is not None:
+            lines.append(
+                f"parent tid={parent_tid} entered wait4(pid=-1) and then blocked in rt_sigsuspend waiting for child completion."
+            )
+        elif counts["PollSleep"] or counts["PollWake"]:
+            lines.append(
+                f"the wait path blocked {counts['PollSleep']} time(s) before wakeup {counts['PollWake']} time(s)."
+            )
+
+        if child_tid is not None and child_exec is not None and child_sleep is not None:
+            sleep_name = syscall_name(child_sleep.event.arg0)
+            lines.append(
+                f"child tid={child_tid} execve'd the `sleep` workload and then called {sleep_name}, which is the core blocking step of `sleep 1`."
+            )
+        elif child_sleep is not None and child_tid is not None:
+            lines.append(
+                f"child tid={child_tid} reached {syscall_name(child_sleep.event.arg0)} and stayed asleep until the timer expired."
+            )
+
+        if child_exit is not None and sigchld_send is not None and parent_tid is not None:
+            lines.append(
+                f"when child tid={child_tid} exited with {child_exit.detail}, the kernel sent SIGCHLD to parent tid={parent_tid}."
+            )
+        elif child_exit is not None:
+            lines.append(f"child completion showed up as {child_exit.detail}.")
+
+        if sigchld_handle is not None and parent_tid is not None:
+            lines.append(
+                f"parent tid={parent_tid} handled SIGCHLD, its wait path resumed, and the shell regained control."
+            )
+        elif signal_events:
             lines.append("signal activity confirms the wait path observed child completion.")
         return lines
     if demo.name == "fd":
@@ -706,6 +788,7 @@ def create_summary(
     demo: Demo,
     artifact_dir: pathlib.Path,
     events: list[TraceEvent],
+    event_views: list[EventView],
     key_views: list[EventView],
     stats_text: str,
     last_fault_text: str,
@@ -716,7 +799,7 @@ def create_summary(
     present = [kind for kind in demo.expected_events if counts[kind] > 0]
     missing = [kind for kind in demo.expected_events if counts[kind] == 0]
     stats = parse_tab_values(stats_text)
-    walkthrough = build_walkthrough(demo, key_views, artifact_outputs)
+    walkthrough = build_walkthrough(demo, event_views, key_views, artifact_outputs)
     syscall_summary = summarize_syscalls(events)
     signal_summary = summarize_signals(events)
     focus_page_fault = None
@@ -887,6 +970,7 @@ def execute_run(
             demo,
             out_dir,
             events,
+            event_views,
             key_views,
             stats_text,
             last_fault_text,
