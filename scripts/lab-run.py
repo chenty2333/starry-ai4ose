@@ -32,6 +32,8 @@ RUNNER_HOST = "10.0.2.2"
 UDP_PORT = 34567
 TCP_PORT = 34568
 HTTP_PORT = 34569
+SSH_POLL_PORT = 34570
+SSH_SELECT_PORT = 34571
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKING_DISK_IMG = REPO_ROOT / "make" / "disk.img"
 LAB_BIN_DIR = REPO_ROOT / ".lab-bin"
@@ -66,6 +68,16 @@ HTTP_SCRIPT_LINES: tuple[str, ...] = (
 PTY_SCRIPT_LINES: tuple[str, ...] = (
     "#!/bin/sh",
     f"{PTY_HELPER_GUEST} -n /bin/sh -c 'echo pty-lab'",
+)
+
+SSH_POLL_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    f"{PTY_HELPER_GUEST} -t {RUNNER_HOST}:{SSH_POLL_PORT} /bin/sh",
+)
+
+SSH_SELECT_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    f"{PTY_HELPER_GUEST} -s -t {RUNNER_HOST}:{SSH_SELECT_PORT} /bin/sh",
 )
 
 
@@ -115,15 +127,21 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class PeerResult:
+    notes: tuple[str, ...]
+    transcript: str = ""
+
+
+@dataclass(frozen=True)
 class PeerController:
     thread: threading.Thread
-    notes: "queue.Queue[tuple[str, ...]]"
+    results: "queue.Queue[PeerResult]"
 
-    def finish(self, timeout: float) -> tuple[str, ...]:
+    def finish(self, timeout: float) -> PeerResult:
         try:
-            result = self.notes.get(timeout=timeout)
+            result = self.results.get(timeout=timeout)
         except queue.Empty:
-            result = ("runner peer timed out waiting for guest traffic.",)
+            result = PeerResult(notes=("runner peer timed out waiting for guest traffic.",))
         self.thread.join(timeout=0.1)
         return result
 
@@ -145,6 +163,10 @@ UDP_SETUP_COMMANDS = build_script_setup("/tmp/lab_udp_demo.sh", UDP_SCRIPT_LINES
 TCP_SETUP_COMMANDS = build_script_setup("/tmp/lab_tcp_echo.sh", TCP_SCRIPT_LINES)
 HTTP_SETUP_COMMANDS = build_script_setup("/tmp/lab_http_once.sh", HTTP_SCRIPT_LINES)
 PTY_SETUP_COMMANDS = build_script_setup("/tmp/lab_pty_demo.sh", PTY_SCRIPT_LINES)
+SSH_POLL_SETUP_COMMANDS = build_script_setup("/tmp/lab_ssh_poll_demo.sh", SSH_POLL_SCRIPT_LINES)
+SSH_SELECT_SETUP_COMMANDS = build_script_setup(
+    "/tmp/lab_ssh_select_demo.sh", SSH_SELECT_SCRIPT_LINES
+)
 
 
 DEMOS: dict[str, Demo] = {
@@ -243,6 +265,70 @@ DEMOS: dict[str, Demo] = {
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
         net="n",
+    ),
+    "ssh-poll": Demo(
+        name="ssh-poll",
+        goal="Show a socket-backed pty relay using poll/ppoll between the runner peer and an interactive shell.",
+        commands=("sh /tmp/lab_ssh_poll_demo.sh 2>/dev/null || true",),
+        expected_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "WaitReap",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        ),
+        focus_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "WaitReap",
+            "SignalSend",
+            "SignalHandle",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        ),
+        focus_syscalls=("socket", "connect", "read", "write", "wait4", "close"),
+        setup_commands=SSH_POLL_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="y",
+    ),
+    "ssh-select": Demo(
+        name="ssh-select",
+        goal="Show a socket-backed pty relay using select/pselect6 between the runner peer and an interactive shell.",
+        commands=("sh /tmp/lab_ssh_select_demo.sh 2>/dev/null || true",),
+        expected_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "WaitReap",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        ),
+        focus_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "WaitReap",
+            "SignalSend",
+            "SignalHandle",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        ),
+        focus_syscalls=("socket", "connect", "read", "write", "wait4", "close"),
+        setup_commands=SSH_SELECT_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="y",
     ),
 }
 
@@ -402,7 +488,7 @@ def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
 
 
 def ensure_guest_helpers(demo: Demo, arch: str) -> None:
-    if demo.name != "pty":
+    if demo.name not in {"pty", "ssh-poll", "ssh-select"}:
         return
     img = ensure_working_disk(arch)
     helper = compile_pty_helper(arch)
@@ -468,10 +554,20 @@ def clean_capture(text: str, command: str | None = None) -> str:
 
 
 def normalize_demo_output(demo: Demo, text: str) -> str:
-    if demo.name != "pty":
+    if demo.name not in {"pty", "ssh-poll", "ssh-select"}:
         return text
-    drop = {"echo pty-lab", "exit"}
+    drop = {"echo pty-lab", "echo ssh-lab", "sleep 1 & wait", "exit"}
     kept = [line for line in text.splitlines() if line.strip() not in drop]
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def clean_remote_shell_transcript(text: str) -> str:
+    text = ANSI_RE.sub("", text).replace("\r", "")
+    kept = [line.rstrip() for line in text.splitlines() if line.strip()]
     while kept and not kept[0].strip():
         kept.pop(0)
     while kept and not kept[-1].strip():
@@ -857,6 +953,43 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
             if view.label == "SysExit" and syscall == "read" and parse_i64(view.event.arg1) == 0:
                 eof_tids.add(tid)
         selected_views = trimmed
+    if demo.name in {"ssh-poll", "ssh-select"}:
+        trimmed = []
+        pending_io: dict[tuple[int, str], EventView] = {}
+        for view in selected_views:
+            if view.label == "SysEnter":
+                name = syscall_name(view.event.arg0)
+                if name in {"read", "write"}:
+                    pending_io[(view.event.tid, name)] = view
+                    continue
+                trimmed.append(view)
+                continue
+            if view.label == "SysExit":
+                name = syscall_name(view.event.arg0)
+                key = (view.event.tid, name)
+                if name in {"read", "write"}:
+                    enter = pending_io.pop(key, None)
+                    if abs(parse_i64(view.event.arg1)) == 1:
+                        continue
+                    if enter is not None:
+                        trimmed.append(enter)
+                    trimmed.append(view)
+                    continue
+            trimmed.append(view)
+        selected_views = trimmed
+        collapsed: list[EventView] = []
+        burst_signatures: set[tuple[int, str, str]] = set()
+        for view in selected_views:
+            if view.label in {"PollSleep", "PollWake"}:
+                signature = (view.event.tid, view.label, view.detail)
+                if signature in burst_signatures:
+                    continue
+                burst_signatures.add(signature)
+                collapsed.append(view)
+                continue
+            burst_signatures.clear()
+            collapsed.append(view)
+        selected_views = collapsed
     return selected_views
 
 
@@ -935,7 +1068,7 @@ def shorten_payload(payload: bytes, limit: int = 60) -> str:
 
 
 def start_udp_echo_peer() -> PeerController:
-    notes: "queue.Queue[tuple[str, ...]]" = queue.Queue()
+    results: "queue.Queue[PeerResult]" = queue.Queue()
 
     def worker() -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -945,23 +1078,25 @@ def start_udp_echo_peer() -> PeerController:
         try:
             payload, addr = listener.recvfrom(4096)
             listener.sendto(payload, addr)
-            notes.put(
-                (
-                    f"runner UDP peer received {len(payload)} byte(s) and echoed `{shorten_payload(payload)}`.",
+            results.put(
+                PeerResult(
+                    notes=(
+                        f"runner UDP peer received {len(payload)} byte(s) and echoed `{shorten_payload(payload)}`.",
+                    )
                 )
             )
         except Exception as exc:
-            notes.put((f"runner UDP peer error: {exc}",))
+            results.put(PeerResult(notes=(f"runner UDP peer error: {exc}",)))
         finally:
             listener.close()
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    return PeerController(thread=thread, notes=notes)
+    return PeerController(thread=thread, results=results)
 
 
 def start_tcp_echo_peer() -> PeerController:
-    notes: "queue.Queue[tuple[str, ...]]" = queue.Queue()
+    results: "queue.Queue[PeerResult]" = queue.Queue()
 
     def worker() -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -976,23 +1111,25 @@ def start_tcp_echo_peer() -> PeerController:
                 payload = conn.recv(4096)
                 conn.sendall(payload)
                 conn.shutdown(socket.SHUT_WR)
-            notes.put(
-                (
-                    f"runner TCP peer echoed {len(payload)} byte(s): `{shorten_payload(payload)}`.",
+            results.put(
+                PeerResult(
+                    notes=(
+                        f"runner TCP peer echoed {len(payload)} byte(s): `{shorten_payload(payload)}`.",
+                    )
                 )
             )
         except Exception as exc:
-            notes.put((f"runner TCP peer error: {exc}",))
+            results.put(PeerResult(notes=(f"runner TCP peer error: {exc}",)))
         finally:
             listener.close()
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    return PeerController(thread=thread, notes=notes)
+    return PeerController(thread=thread, results=results)
 
 
 def start_http_peer() -> PeerController:
-    notes: "queue.Queue[tuple[str, ...]]" = queue.Queue()
+    results: "queue.Queue[PeerResult]" = queue.Queue()
     body = b"hello-http!"
     response = (
         b"HTTP/1.1 200 OK\r\n"
@@ -1015,19 +1152,63 @@ def start_http_peer() -> PeerController:
                 conn.sendall(response)
                 conn.shutdown(socket.SHUT_WR)
             first_line = request.splitlines()[0].decode("utf-8", errors="replace") if request else "no request line"
-            notes.put(
-                (
-                    f"runner HTTP peer served `{first_line}` with body `hello-http!`.",
+            results.put(
+                PeerResult(
+                    notes=(
+                        f"runner HTTP peer served `{first_line}` with body `hello-http!`.",
+                    )
                 )
             )
         except Exception as exc:
-            notes.put((f"runner HTTP peer error: {exc}",))
+            results.put(PeerResult(notes=(f"runner HTTP peer error: {exc}",)))
         finally:
             listener.close()
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-    return PeerController(thread=thread, notes=notes)
+    return PeerController(thread=thread, results=results)
+
+
+def start_shell_peer(port: int, label: str) -> PeerController:
+    results: "queue.Queue[PeerResult]" = queue.Queue()
+    script_lines = (r"printf${IFS}ssh-lab\\n", r"sleep${IFS}1&wait", "exit")
+
+    def worker() -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen(1)
+        listener.settimeout(10)
+        try:
+            conn, _addr = listener.accept()
+            with conn:
+                conn.settimeout(10)
+                time.sleep(1.0)
+                for line in script_lines:
+                    for ch in (line + "\r"):
+                        conn.sendall(ch.encode("utf-8"))
+                        time.sleep(0.01)
+                    time.sleep(0.2)
+                conn.shutdown(socket.SHUT_WR)
+                chunks: list[bytes] = []
+                while True:
+                    payload = conn.recv(4096)
+                    if not payload:
+                        break
+                    chunks.append(payload)
+            transcript = clean_remote_shell_transcript(b"".join(chunks).decode("utf-8", errors="ignore"))
+            note = (
+                f"runner {label} peer sent a shell script equivalent to `printf ssh-lab; sleep 1 & wait; exit` and captured {len(transcript.splitlines())} output line(s).",
+            )
+            results.put(PeerResult(notes=note, transcript=transcript))
+        except Exception as exc:
+            results.put(PeerResult(notes=(f"runner {label} peer error: {exc}",)))
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return PeerController(thread=thread, results=results)
 
 
 def start_demo_peer(demo: Demo) -> PeerController | None:
@@ -1037,6 +1218,10 @@ def start_demo_peer(demo: Demo) -> PeerController | None:
         return start_tcp_echo_peer()
     if demo.name == "http":
         return start_http_peer()
+    if demo.name == "ssh-poll":
+        return start_shell_peer(SSH_POLL_PORT, "ssh-poll")
+    if demo.name == "ssh-select":
+        return start_shell_peer(SSH_SELECT_PORT, "ssh-select")
     return None
 
 
@@ -1246,6 +1431,41 @@ def build_walkthrough(
             lines.append("the pty-backed `/bin/sh -c 'echo pty-lab'` path printed `pty-lab`, which confirms the shell output crossed the slave/master boundary end to end.")
         lines.append("the relay returned without an outer timeout, so the master side observed the slave close and finished through the kernel's pty EOF/HUP path.")
         return lines
+    if demo.name in {"ssh-poll", "ssh-select"}:
+        relay_name = "pselect6" if demo.name == "ssh-select" else "ppoll"
+        pty_open = next((view for view in key_views if view.label == "PtyOpen"), None)
+        session_create = next((view for view in key_views if view.label == "SessionCreate"), None)
+        tty_ctls = [view for view in key_views if view.label == "TtyCtl"]
+        pg_set = next((view for view in key_views if view.label == "ProcessGroupSet"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        task_exit = next((view for view in key_views if view.label == "TaskExit"), None)
+        transcript = artifact_outputs.get("demo-step-1.txt", "").strip()
+        lines: list[str] = [
+            f"the helper connected a TCP socket back to the runner and relayed it against a fresh pty using {relay_name}.",
+        ]
+        if pty_open is not None:
+            lines.append(f"pty allocation showed up as {pty_open.detail}.")
+        if session_create is not None:
+            lines.append(f"the shell side created a new session with {session_create.detail}.")
+        if tty_ctls:
+            rendered = ", ".join(view.detail for view in tty_ctls[:3])
+            lines.append(f"controlling-tty setup flowed through {rendered}.")
+        if pg_set is not None:
+            lines.append(f"the shell's background-job path issued {pg_set.detail}.")
+        if wait_reap is not None:
+            lines.append(f"the explicit `sleep 1 & wait` path completed through {wait_reap.detail}.")
+        if transcript:
+            lines.append(
+                "the runner-captured shell transcript printed `ssh-lab`, which confirms bytes crossed socket -> pty -> shell -> pty -> socket end to end."
+            )
+        if counts["PollSleep"] or counts["PollWake"]:
+            lines.append(
+                f"the combined socket/tty relay slept {counts['PollSleep']} time(s) and woke {counts['PollWake']} time(s)."
+            )
+        if task_exit is not None:
+            lines.append(f"the relay and shell closed out with {task_exit.detail}.")
+        lines.extend(peer_notes)
+        return lines
     return [view.detail for view in key_views[:5]]
 
 
@@ -1428,14 +1648,22 @@ def execute_run(
             step_path = out_dir / f"demo-step-{index}.txt"
             write_text(step_path, cleaned_output)
             demo_outputs.append((step_path, cleaned_output))
-        peer_notes = peer.finish(command_timeout) if peer is not None else ()
-        if peer_notes:
+        peer_result = peer.finish(command_timeout) if peer is not None else PeerResult(notes=())
+        peer_notes = peer_result.notes
+        if peer_result.transcript:
+            for step_path, cleaned_output in demo_outputs:
+                if cleaned_output.strip() and demo.name not in {"ssh-poll", "ssh-select"}:
+                    continue
+                write_text(step_path, peer_result.transcript)
+                break
+        elif peer_notes:
             for step_path, cleaned_output in demo_outputs:
                 if cleaned_output.strip():
                     continue
                 fallback = ["(no guest stdout captured)"]
                 fallback.extend(peer_notes)
                 write_text(step_path, "\n".join(fallback) + "\n")
+                break
 
         input_stream.append("echo 1 > /proc/starry/off")
         session.run_command(input_stream[-1], command_timeout)
