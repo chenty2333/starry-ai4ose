@@ -50,6 +50,8 @@ ci-test:
 LAB_DEMO ?= pipe
 LAB_RAW ?= n
 LAB_REPEAT ?= 1
+DEMO ?= $(LAB_DEMO)
+REPEAT ?= $(LAB_REPEAT)
 
 ifeq ($(filter y yes 1,$(LAB_RAW)),)
 LAB_RAW_FLAG :=
@@ -57,41 +59,50 @@ else
 LAB_RAW_FLAG := --raw
 endif
 
-ifeq ($(LAB_REPEAT),1)
+ifeq ($(REPEAT),1)
 LAB_REPEAT_FLAG :=
 else
-LAB_REPEAT_FLAG := --repeat $(LAB_REPEAT)
+LAB_REPEAT_FLAG := --repeat $(REPEAT)
 endif
 
+ifeq ($(REPEAT),1)
+LAB_REPEAT_DEFAULT_FLAG := --repeat 2
+else
+LAB_REPEAT_DEFAULT_FLAG := --repeat $(REPEAT)
+endif
+
+lab:
+	python3 ./scripts/lab-run.py $(DEMO) $(LAB_RAW_FLAG)
+
 lab-run:
-	python3 ./scripts/lab-run.py $(LAB_DEMO) $(LAB_RAW_FLAG) $(LAB_REPEAT_FLAG)
+	python3 ./scripts/lab-run.py $(DEMO) $(LAB_RAW_FLAG) $(LAB_REPEAT_FLAG)
 
 lab-pipe:
-	python3 ./scripts/lab-run.py pipe $(LAB_RAW_FLAG)
+	$(MAKE) --no-print-directory lab DEMO=pipe LAB_RAW=$(LAB_RAW)
 
 lab-wait:
-	python3 ./scripts/lab-run.py wait $(LAB_RAW_FLAG)
+	$(MAKE) --no-print-directory lab DEMO=wait LAB_RAW=$(LAB_RAW)
 
 lab-fd:
-	python3 ./scripts/lab-run.py fd $(LAB_RAW_FLAG)
+	$(MAKE) --no-print-directory lab DEMO=fd LAB_RAW=$(LAB_RAW)
 
 lab-fault:
-	python3 ./scripts/lab-run.py fault $(LAB_RAW_FLAG)
+	$(MAKE) --no-print-directory lab DEMO=fault LAB_RAW=$(LAB_RAW)
 
 lab-repeat:
-	python3 ./scripts/lab-run.py $(LAB_DEMO) $(LAB_RAW_FLAG) --repeat 2
+	python3 ./scripts/lab-run.py $(DEMO) $(LAB_RAW_FLAG) $(LAB_REPEAT_DEFAULT_FLAG)
 
 lab-repeat-pipe:
-	python3 ./scripts/lab-run.py pipe $(LAB_RAW_FLAG) --repeat 2
+	$(MAKE) --no-print-directory lab-repeat DEMO=pipe REPEAT=2 LAB_RAW=$(LAB_RAW)
 
 lab-repeat-wait:
-	python3 ./scripts/lab-run.py wait $(LAB_RAW_FLAG) --repeat 2
+	$(MAKE) --no-print-directory lab-repeat DEMO=wait REPEAT=2 LAB_RAW=$(LAB_RAW)
 
 lab-repeat-fd:
-	python3 ./scripts/lab-run.py fd $(LAB_RAW_FLAG) --repeat 2
+	$(MAKE) --no-print-directory lab-repeat DEMO=fd REPEAT=2 LAB_RAW=$(LAB_RAW)
 
 lab-repeat-fault:
-	python3 ./scripts/lab-run.py fault $(LAB_RAW_FLAG) --repeat 2
+	$(MAKE) --no-print-directory lab-repeat DEMO=fault REPEAT=2 LAB_RAW=$(LAB_RAW)
 
 # Aliases
 rv:
@@ -103,4 +114,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean lab-run lab-pipe lab-wait lab-fd lab-fault lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-fd lab-repeat-fault
+.PHONY: build run justrun debug disasm clean lab lab-run lab-pipe lab-wait lab-fd lab-fault lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-fd lab-repeat-fault
