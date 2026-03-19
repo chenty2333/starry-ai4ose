@@ -66,11 +66,17 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             // /dev/xx handling
+            let mut pty_guard = None;
             if let Ok(device) = file.location().entry().downcast::<Device>() {
                 let inner = device.inner().as_any();
                 if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
                     // Opening /dev/ptmx creates a new pseudo-terminal
                     let (master, number) = ptmx.create_pty()?;
+                    pty_guard = master
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<tty::PtyDriver>()
+                        .map(|pty| pty.open_guard());
                     pty_number = Some(number);
                     // TODO: this is cursed
                     let pts = FS_CONTEXT.lock().resolve("/dev/pts")?;
@@ -99,9 +105,14 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                     };
                     let loc = FS_CONTEXT.lock().resolve(&path)?;
                     file = axfs::File::new(FileBackend::Direct(loc), file.flags());
+                } else if let Some(pty) = inner.downcast_ref::<tty::PtyDriver>() {
+                    pty_guard = Some(pty.open_guard());
                 }
             }
-            Arc::new(File::new(file))
+            match pty_guard {
+                Some(guard) => Arc::new(tty::OpenedPtyFile::new(File::new(file), guard)),
+                None => Arc::new(File::new(file)),
+            }
         }
         OpenResult::Dir(dir) => Arc::new(Directory::new(dir)),
     };

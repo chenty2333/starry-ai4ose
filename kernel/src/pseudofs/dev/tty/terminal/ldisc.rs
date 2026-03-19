@@ -55,6 +55,12 @@ pub struct TtyConfig<R, W> {
 
 pub trait TtyRead: Send + Sync + 'static {
     fn read(&mut self, buf: &mut [u8]) -> usize;
+
+    fn peer_closed(&self) -> bool {
+        false
+    }
+
+    fn register_close_waker(&self, _waker: &Waker) {}
 }
 pub trait TtyWrite: Send + Sync + 'static {
     fn write(&self, buf: &[u8]);
@@ -73,6 +79,7 @@ struct InputReader<R, W> {
     line_buf: Vec<u8>,
     line_read: Option<usize>,
     clear_line_buf: Arc<AtomicBool>,
+    eof: Arc<AtomicBool>,
 }
 impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
     pub fn poll(&mut self) -> bool {
@@ -81,6 +88,10 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         }
         if self.read_range.is_empty() {
             let read = self.reader.read(&mut self.read_buf);
+            if read == 0 && self.reader.peer_closed() {
+                self.eof.store(true, Ordering::Release);
+                return false;
+            }
             self.read_range = 0..read;
         }
         let term = self.terminal.load_termios();
@@ -154,6 +165,10 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         sent > 0
     }
 
+    pub fn register_close_waker(&self, waker: &Waker) {
+        self.reader.register_close_waker(waker);
+    }
+
     fn check_send_signal(&self, term: &Termios2, ch: u8) {
         if !term.canonical() || !term.has_lflag(ISIG) {
             return;
@@ -188,16 +203,25 @@ struct SimpleReader<R> {
     reader: R,
     read_buf: [u8; BUF_SIZE],
     buf_tx: CachingProd<ReadBuf>,
+    eof: Arc<AtomicBool>,
 }
 impl<R: TtyRead> SimpleReader<R> {
     pub fn poll(&mut self) {
         let read = self.reader.read(&mut self.read_buf);
+        if read == 0 && self.reader.peer_closed() {
+            self.eof.store(true, Ordering::Release);
+            return;
+        }
         for ch in &self.read_buf[..read] {
             if *ch == b'\n' {
                 let _ = self.buf_tx.try_push(b'\r');
             }
             let _ = self.buf_tx.try_push(*ch);
         }
+    }
+
+    pub fn register_close_waker(&self, waker: &Waker) {
+        self.reader.register_close_waker(waker);
     }
 }
 
@@ -212,6 +236,7 @@ pub struct LineDiscipline<R, W> {
     buf_rx: CachingCons<ReadBuf>,
     poll_tx: Arc<PollSet>,
     clear_line_buf: Arc<AtomicBool>,
+    eof: Arc<AtomicBool>,
     processor: Processor<R, W>,
 }
 
@@ -235,6 +260,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         let (buf_tx, buf_rx) = ReadBuf::default().split();
 
         let clear_line_buf = Arc::new(AtomicBool::new(false));
+        let eof = Arc::new(AtomicBool::new(false));
         let mut reader = InputReader {
             terminal: terminal.clone(),
 
@@ -248,6 +274,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             line_buf: Vec::new(),
             line_read: None,
             clear_line_buf: clear_line_buf.clone(),
+            eof: eof.clone(),
         };
 
         let poll_tx = Arc::new(PollSet::new());
@@ -255,6 +282,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             ProcessMode::Manual => Processor::Manual(reader),
             ProcessMode::External(register) => {
                 let poll_rx = Arc::new(PollSet::new());
+                let eof_in_task = eof.clone();
                 axtask::spawn_with_name(
                     {
                         let poll_rx = poll_rx.clone();
@@ -264,9 +292,16 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                                 while reader.poll() {
                                     poll_rx.wake();
                                 }
+                                if eof_in_task.load(Ordering::Acquire) {
+                                    poll_rx.wake();
+                                }
                                 poll_tx.register(cx.waker());
                                 register(cx.waker().clone());
+                                reader.register_close_waker(cx.waker());
                                 while reader.poll() {
+                                    poll_rx.wake();
+                                }
+                                if eof_in_task.load(Ordering::Acquire) {
                                     poll_rx.wake();
                                 }
                                 Poll::Pending
@@ -284,6 +319,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                         reader: reader.reader,
                         read_buf: [0; BUF_SIZE],
                         buf_tx: reader.buf_tx,
+                        eof: eof.clone(),
                     },
                     poll_rx,
                 )
@@ -294,6 +330,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             buf_rx,
             poll_tx,
             clear_line_buf,
+            eof,
             processor,
         }
     }
@@ -311,7 +348,11 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             Processor::None(reader, _) => reader.poll(),
             _ => {}
         }
-        !self.buf_rx.is_empty()
+        !self.buf_rx.is_empty() || self.eof.load(Ordering::Acquire)
+    }
+
+    pub fn poll_hup(&self) -> bool {
+        self.eof.load(Ordering::Acquire)
     }
 
     pub fn register_rx_waker(&self, waker: &Waker) {
@@ -323,6 +364,11 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                 set.register(waker);
             }
         }
+        match &self.processor {
+            Processor::Manual(reader) => reader.register_close_waker(waker),
+            Processor::External(_) => {}
+            Processor::None(reader, _) => reader.register_close_waker(waker),
+        }
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
@@ -332,7 +378,11 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         if matches!(self.processor, Processor::None(_, _)) {
             let read = self.buf_rx.pop_slice(buf);
             return if read == 0 {
-                Err(AxError::WouldBlock)
+                if self.eof.load(Ordering::Acquire) {
+                    Ok(0)
+                } else {
+                    Err(AxError::WouldBlock)
+                }
             } else {
                 Ok(read)
             };
@@ -363,9 +413,13 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         block_on(poll_io(&pollable, IoEvents::IN, false, || {
             total_read += self.buf_rx.pop_slice(&mut buf[total_read..]);
             self.poll_tx.wake();
-            (total_read >= vmin)
-                .then_some(total_read)
-                .ok_or(AxError::WouldBlock)
+            if total_read >= vmin {
+                return Ok(total_read);
+            }
+            if total_read == 0 && self.eof.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            Err(AxError::WouldBlock)
         }))
     }
 }

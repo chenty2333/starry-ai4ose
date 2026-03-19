@@ -102,6 +102,29 @@ static int relay_loop(int master_fd, int stdin_open) {
             }
         }
         if (revents & (POLLHUP | POLLERR)) {
+            int flags = fcntl(master_fd, F_GETFL);
+            if (flags >= 0) {
+                (void)fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+            }
+            for (;;) {
+                ssize_t n = read(master_fd, buf, sizeof(buf));
+                if (n > 0) {
+                    if (write_all(STDOUT_FILENO, buf, (size_t)n) < 0) {
+                        return -1;
+                    }
+                    continue;
+                }
+                if (n == 0) {
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EIO) {
+                    break;
+                }
+                return -1;
+            }
             return 0;
         }
     }

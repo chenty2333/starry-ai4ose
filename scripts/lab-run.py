@@ -65,7 +65,7 @@ HTTP_SCRIPT_LINES: tuple[str, ...] = (
 
 PTY_SCRIPT_LINES: tuple[str, ...] = (
     "#!/bin/sh",
-    f"timeout 5 {PTY_HELPER_GUEST} -n /bin/sh -c 'echo pty-lab' || true",
+    f"{PTY_HELPER_GUEST} -n /bin/sh -c 'echo pty-lab'",
 )
 
 
@@ -470,7 +470,7 @@ def clean_capture(text: str, command: str | None = None) -> str:
 def normalize_demo_output(demo: Demo, text: str) -> str:
     if demo.name != "pty":
         return text
-    drop = {"echo pty-lab", "exit", "Terminated"}
+    drop = {"echo pty-lab", "exit"}
     kept = [line for line in text.splitlines() if line.strip() not in drop]
     while kept and not kept[0].strip():
         kept.pop(0)
@@ -1244,7 +1244,7 @@ def build_walkthrough(
             )
         if artifact_outputs.get("demo-step-1.txt", "").strip():
             lines.append("the pty-backed `/bin/sh -c 'echo pty-lab'` path printed `pty-lab`, which confirms the shell output crossed the slave/master boundary end to end.")
-        lines.append("the demo is currently wrapped in `timeout 5`, which keeps the unfinished pty EOF/close path bounded while still exposing the core session/tty setup.")
+        lines.append("the relay returned without an outer timeout, so the master side observed the slave close and finished through the kernel's pty EOF/HUP path.")
         return lines
     return [view.detail for view in key_views[:5]]
 

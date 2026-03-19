@@ -28,7 +28,7 @@ pub use self::{
     ntty::{N_TTY, NTtyDriver},
     ptm::Ptmx,
     pts::PtsDir,
-    pty::PtyDriver,
+    pty::{OpenedPtyFile, PtyDriver},
 };
 use crate::{
     lab::{self, EventKind, TTY_CTL_TIOCSCTTY, TTY_CTL_TIOCNOTTY, TTY_CTL_TIOCSPGRP},
@@ -88,18 +88,22 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> AxResult<usize> {
-        block_on(poll_io(
-            &self.terminal.job_control,
-            IoEvents::IN,
-            false,
-            || {
-                if self.is_ptm || self.terminal.job_control.current_in_foreground() {
-                    self.ldisc.lock().read(buf)
-                } else {
-                    Err(AxError::WouldBlock)
-                }
-            },
-        ))
+        if self.is_ptm {
+            block_on(poll_io(self, IoEvents::IN, false, || self.ldisc.lock().read(buf)))
+        } else {
+            block_on(poll_io(
+                &self.terminal.job_control,
+                IoEvents::IN,
+                false,
+                || {
+                    if self.terminal.job_control.current_in_foreground() {
+                        self.ldisc.lock().read(buf)
+                    } else {
+                        Err(AxError::WouldBlock)
+                    }
+                },
+            ))
+        }
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> AxResult<usize> {
@@ -228,9 +232,11 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
 impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::OUT | self.terminal.job_control.poll();
+        let mut ldisc = self.ldisc.lock();
         if self.is_ptm || events.contains(IoEvents::IN) {
-            events.set(IoEvents::IN, self.ldisc.lock().poll_read());
+            events.set(IoEvents::IN, ldisc.poll_read());
         }
+        events.set(IoEvents::HUP, ldisc.poll_hup());
         events
     }
 
@@ -238,7 +244,7 @@ impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
         if !self.is_ptm {
             self.terminal.job_control.register(context, events);
         }
-        if events.contains(IoEvents::IN) {
+        if events.intersects(IoEvents::IN | IoEvents::HUP) {
             self.ldisc.lock().register_rx_waker(context.waker());
         }
     }
