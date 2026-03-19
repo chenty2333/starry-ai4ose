@@ -41,6 +41,10 @@ impl JobControl {
         self.foreground.lock().upgrade()
     }
 
+    pub fn session(&self) -> Option<Arc<Session>> {
+        self.session.lock().upgrade()
+    }
+
     pub fn set_foreground(&self, pg: &Arc<ProcessGroup>) -> AxResult<()> {
         let mut guard = self.foreground.lock();
         let weak = Arc::downgrade(pg);
@@ -71,6 +75,25 @@ impl JobControl {
         let mut guard = self.session.lock();
         assert!(guard.upgrade().is_none());
         *guard = Arc::downgrade(session);
+    }
+
+    pub fn clear_session(&self, session: &Arc<Session>) -> bool {
+        let mut session_guard = self.session.lock();
+        let Some(current) = session_guard.upgrade() else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current, session) {
+            return false;
+        }
+        *session_guard = Weak::new();
+        drop(session_guard);
+
+        let mut foreground_guard = self.foreground.lock();
+        *foreground_guard = Weak::new();
+        drop(foreground_guard);
+
+        self.poll_fg.wake();
+        true
     }
 }
 

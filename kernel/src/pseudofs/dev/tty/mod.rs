@@ -16,6 +16,7 @@ use axtask::{
     future::{block_on, poll_io},
 };
 use starry_process::Process;
+use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use self::terminal::{
@@ -31,7 +32,7 @@ pub use self::{
 };
 use crate::{
     pseudofs::{DeviceOps, SimpleFs},
-    task::AsThread,
+    task::{AsThread, get_process_group, send_signal_to_process_group},
 };
 
 pub fn create_pty_master(fs: Arc<SimpleFs>) -> AxResult<Arc<PtyDriver>> {
@@ -139,9 +140,22 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             }
             TIOCSPGRP => {
                 let curr = current();
+                let pgid = (arg as *const u32).vm_read()?;
+                let pg = get_process_group(pgid)?;
+                if !Arc::ptr_eq(&curr.as_thread().proc_data.proc.group().session(), &pg.session()) {
+                    return Err(AxError::OperationNotPermitted);
+                }
+                if !self
+                    .terminal
+                    .job_control
+                    .session()
+                    .is_some_and(|session| Arc::ptr_eq(&session, &pg.session()))
+                {
+                    return Err(AxError::OperationNotPermitted);
+                }
                 self.terminal
                     .job_control
-                    .set_foreground(&curr.as_thread().proc_data.proc.group())?;
+                    .set_foreground(&pg)?;
             }
             TIOCGWINSZ => {
                 (arg as *mut WindowSize).vm_write(*self.terminal.window_size.lock())?;
@@ -160,18 +174,27 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .bind_to(&current().as_thread().proc_data.proc)?;
             }
             TIOCNOTTY => {
-                if current()
-                    .as_thread()
-                    .proc_data
-                    .proc
-                    .group()
-                    .session()
-                    .unset_terminal(&(self.this.upgrade().unwrap() as _))
-                {
-                    // TODO: If the process was session leader, send SIGHUP and
-                    // SIGCONT to the foreground process group and all processes
-                    // in the current session lose their
-                    // controlling terminal.
+                let curr = current();
+                let proc = &curr.as_thread().proc_data.proc;
+                let session = proc.group().session();
+                let term = self.this.upgrade().unwrap();
+                let term_any: Arc<dyn Any + Send + Sync> = term.clone();
+                let was_session_leader = session.sid() == proc.pid();
+                let foreground = self.terminal.job_control.foreground();
+
+                if session.unset_terminal(&term_any) {
+                    self.terminal.job_control.clear_session(&session);
+
+                    if was_session_leader && let Some(pg) = foreground {
+                        let _ = send_signal_to_process_group(
+                            pg.pgid(),
+                            Some(SignalInfo::new_kernel(Signo::SIGHUP)),
+                        );
+                        let _ = send_signal_to_process_group(
+                            pg.pgid(),
+                            Some(SignalInfo::new_kernel(Signo::SIGCONT)),
+                        );
+                    }
                 } else {
                     warn!("Failed to unset terminal");
                 }
