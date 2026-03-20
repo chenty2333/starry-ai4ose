@@ -11,6 +11,8 @@ mod imp {
     pub const TTY_CTL_TIOCSCTTY: usize = 1;
     pub const TTY_CTL_TIOCSPGRP: usize = 2;
     pub const TTY_CTL_TIOCNOTTY: usize = 3;
+    pub const INPUT_NODE_EVENT: usize = 1;
+    pub const INPUT_NODE_MICE: usize = 2;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum EventKind {
@@ -33,6 +35,12 @@ mod imp {
         WaitContinue,
         PtyOpen,
         TtyCtl,
+        FbIoctl,
+        FbMap,
+        InputOpen,
+        InputRead,
+        InputPollWake,
+        DisplayFlush,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -182,6 +190,8 @@ mod imp {
     pub const TTY_CTL_TIOCSCTTY: usize = 1;
     pub const TTY_CTL_TIOCSPGRP: usize = 2;
     pub const TTY_CTL_TIOCNOTTY: usize = 3;
+    pub const INPUT_NODE_EVENT: usize = 1;
+    pub const INPUT_NODE_MICE: usize = 2;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum EventKind {
@@ -204,6 +214,12 @@ mod imp {
         WaitContinue,
         PtyOpen,
         TtyCtl,
+        FbIoctl,
+        FbMap,
+        InputOpen,
+        InputRead,
+        InputPollWake,
+        DisplayFlush,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -277,6 +293,12 @@ impl EventKind {
             EventKind::WaitContinue => "WaitContinue",
             EventKind::PtyOpen => "PtyOpen",
             EventKind::TtyCtl => "TtyCtl",
+            EventKind::FbIoctl => "FbIoctl",
+            EventKind::FbMap => "FbMap",
+            EventKind::InputOpen => "InputOpen",
+            EventKind::InputRead => "InputRead",
+            EventKind::InputPollWake => "InputPollWake",
+            EventKind::DisplayFlush => "DisplayFlush",
         }
     }
 }

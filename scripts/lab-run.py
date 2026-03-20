@@ -25,7 +25,6 @@ from functools import lru_cache
 
 PROMPT = "starry:~#"
 SERIAL_PORT = 4444
-QMP_PORT = 4445
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 BASELINE_ARCH = "riscv64"
 BASELINE_APP_FEATURES = "qemu,lab"
@@ -44,6 +43,7 @@ SSHD_PORT = 5555
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKING_DISK_IMG = REPO_ROOT / "make" / "disk.img"
 LAB_BIN_DIR = REPO_ROOT / ".lab-bin"
+QMP_SOCKET = LAB_BIN_DIR / "qmp.sock"
 PTY_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "pty_relay.c"
 WAITCTL_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "waitctl.c"
 TTYSIG_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "ttysig.c"
@@ -92,6 +92,7 @@ X11_SERVER_LOG_GUEST = "/tmp/lab_x11.log"
 X11_CLIENT_LOG_GUEST = "/tmp/lab_xcalc.log"
 X11_SERVER_PID_GUEST = "/tmp/lab_x11.pid"
 X11_CLIENT_PID_GUEST = "/tmp/lab_xcalc.pid"
+X11_CONFIG_GUEST = "/tmp/lab_x11.conf"
 SSHD_PHASE2_LINES: tuple[str, ...] = (
     "PS1=",
     "export PS1",
@@ -145,11 +146,77 @@ SSHD_PHASE5B_LINES: tuple[str, ...] = (
     f"printf '{SSHD_PHASE5B_TOKEN}\\n'",
     "exit",
 )
+X11_CONFIG_LINES: tuple[str, ...] = (
+    'Section "ServerFlags"',
+    '    Option "AutoAddDevices" "false"',
+    'EndSection',
+    'Section "InputDevice"',
+    '    Identifier "Keyboard0"',
+    '    Driver "evdev"',
+    '    Option "Device" "/dev/input/event0"',
+    'EndSection',
+    'Section "InputDevice"',
+    '    Identifier "Mouse0"',
+    '    Driver "evdev"',
+    '    Option "Device" "/dev/input/mice"',
+    'EndSection',
+    'Section "Device"',
+    '    Identifier "FB0"',
+    '    Driver "fbdev"',
+    '    Option "fbdev" "/dev/fb0"',
+    'EndSection',
+    'Section "Monitor"',
+    '    Identifier "Monitor0"',
+    'EndSection',
+    'Section "Screen"',
+    '    Identifier "Screen0"',
+    '    Device "FB0"',
+    '    Monitor "Monitor0"',
+    'EndSection',
+    'Section "ServerLayout"',
+    '    Identifier "Layout0"',
+    '    Screen "Screen0"',
+    '    InputDevice "Keyboard0" "CoreKeyboard"',
+    '    InputDevice "Mouse0" "CorePointer"',
+    'EndSection',
+)
 
 TTY_CTL_NAMES: dict[int, str] = {
     1: "TIOCSCTTY",
     2: "TIOCSPGRP",
     3: "TIOCNOTTY",
+}
+
+FB_IOCTL_NAMES: dict[int, str] = {
+    0x4600: "FBIOGET_VSCREENINFO",
+    0x4601: "FBIOPUT_VSCREENINFO",
+    0x4602: "FBIOGET_FSCREENINFO",
+    0x4604: "FBIOGETCMAP",
+    0x4605: "FBIOPUTCMAP",
+}
+
+INPUT_NODE_NAMES: dict[int, str] = {
+    1: "event",
+    2: "mice",
+}
+
+INPUT_EVENT_TYPE_NAMES: dict[int, str] = {
+    0x01: "EV_KEY",
+    0x02: "EV_REL",
+}
+
+INPUT_EVENT_CODE_NAMES: dict[tuple[int, int], str] = {
+    (0x01, 30): "KEY_A",
+    (0x01, 31): "KEY_S",
+    (0x01, 32): "KEY_D",
+    (0x01, 17): "KEY_W",
+    (0x01, 103): "KEY_UP",
+    (0x01, 108): "KEY_DOWN",
+    (0x01, 105): "KEY_LEFT",
+    (0x01, 106): "KEY_RIGHT",
+    (0x01, 272): "BTN_LEFT",
+    (0x02, 0): "REL_X",
+    (0x02, 1): "REL_Y",
 }
 
 UDP_SCRIPT_LINES: tuple[str, ...] = (
@@ -304,6 +371,7 @@ SSH_SELECT_SETUP_COMMANDS = build_script_setup(
     "/tmp/lab_ssh_select_demo.sh", SSH_SELECT_SCRIPT_LINES
 )
 WAITCTL_SETUP_COMMANDS = build_script_setup("/tmp/lab_waitctl_demo.sh", WAITCTL_SCRIPT_LINES)
+X11_CONFIG_SETUP_COMMANDS = build_script_setup(X11_CONFIG_GUEST, X11_CONFIG_LINES)
 
 
 DEMOS: dict[str, Demo] = {
@@ -371,8 +439,8 @@ DEMOS: dict[str, Demo] = {
         name="fb",
         goal="Show raw framebuffer bring-up through /dev/fb0 ioctls, mmap, and direct pixel writes.",
         commands=(FBDRAW_HELPER_GUEST,),
-        expected_events=("SysEnter", "SysExit", "PageFault", "WaitReap", "TaskExit"),
-        focus_events=("PageFault", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        expected_events=("FbIoctl", "FbMap", "DisplayFlush", "PageFault", "WaitReap", "TaskExit"),
+        focus_events=("FbIoctl", "FbMap", "DisplayFlush", "PageFault", "WaitReap", "TaskExit"),
         focus_syscalls=("openat", "ioctl", "mmap", "munmap", "close"),
         setup_commands=(),
         focus_page_fault_arg0=None,
@@ -385,8 +453,8 @@ DEMOS: dict[str, Demo] = {
         name="ev",
         goal="Show raw evdev input through /dev/input/event0 and /dev/input/mice using poll/read on injected keyboard and mouse activity.",
         commands=(EVWATCH_HELPER_GUEST,),
-        expected_events=("SysEnter", "SysExit", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
-        focus_events=("PollSleep", "PollWake", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        expected_events=("InputOpen", "InputPollWake", "InputRead", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
+        focus_events=("InputOpen", "InputPollWake", "InputRead", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
         focus_syscalls=("openat", "ioctl", "read", "close"),
         setup_commands=(),
         focus_page_fault_arg0=None,
@@ -399,8 +467,8 @@ DEMOS: dict[str, Demo] = {
         name="gui",
         goal="Show a tiny interactive userspace program that combines fbdev drawing with evdev-driven movement and clicks.",
         commands=(MINIGUI_HELPER_GUEST,),
-        expected_events=("SysEnter", "SysExit", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
-        focus_events=("PageFault", "PollSleep", "PollWake", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        expected_events=("FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputPollWake", "InputRead", "PageFault", "WaitReap", "TaskExit"),
+        focus_events=("FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputPollWake", "InputRead", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
         focus_syscalls=("openat", "ioctl", "mmap", "read", "munmap", "close"),
         setup_commands=(),
         focus_page_fault_arg0=None,
@@ -413,8 +481,8 @@ DEMOS: dict[str, Demo] = {
         name="snake",
         goal="Show a playable snake game built directly on fbdev and evdev, with a deterministic scripted run for repeatable lab output.",
         commands=(f"{SNAKE_HELPER_GUEST} --scripted",),
-        expected_events=("SysEnter", "SysExit", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
-        focus_events=("PageFault", "PollSleep", "PollWake", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        expected_events=("FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputPollWake", "InputRead", "PageFault", "WaitReap", "TaskExit"),
+        focus_events=("FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputPollWake", "InputRead", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
         focus_syscalls=("openat", "ioctl", "mmap", "read", "munmap", "close"),
         setup_commands=(),
         focus_page_fault_arg0=None,
@@ -427,8 +495,8 @@ DEMOS: dict[str, Demo] = {
         name="x11",
         goal="Bring up X11 over fbdev+evdev, launch a real X client, and capture a guest framebuffer screenshot as proof of GUI output.",
         commands=(),
-        expected_events=("SysEnter", "SysExit", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
-        focus_events=("PageFault", "PollSleep", "PollWake", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        expected_events=("FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputPollWake", "InputRead", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
+        focus_events=("FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputPollWake", "InputRead", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
         focus_syscalls=("openat", "ioctl", "mmap", "read", "write", "socket", "connect", "close"),
         setup_commands=(),
         focus_page_fault_arg0=None,
@@ -925,7 +993,7 @@ def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
 
 
 def ensure_guest_helpers(demo: Demo, arch: str, img: pathlib.Path) -> None:
-    if demo.name not in {"cow", "filemap", "shm", "fb", "ev", "gui", "snake", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
+    if demo.name not in {"cow", "filemap", "shm", "fb", "ev", "gui", "snake", "x11", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
         return
     if demo.name == "cow":
         helper = compile_helper(COWCTL_HELPER_SOURCE, "cowctl", arch)
@@ -942,6 +1010,11 @@ def ensure_guest_helpers(demo: Demo, arch: str, img: pathlib.Path) -> None:
     if demo.name == "ev":
         helper = compile_helper(EVWATCH_HELPER_SOURCE, "evwatch", arch)
         debugfs_write(img, helper, EVWATCH_HELPER_GUEST)
+    if demo.name == "x11":
+        fb_helper = compile_helper(FBDRAW_HELPER_SOURCE, "fbdraw", arch)
+        ev_helper = compile_helper(EVWATCH_HELPER_SOURCE, "evwatch", arch)
+        debugfs_write(img, fb_helper, FBDRAW_HELPER_GUEST)
+        debugfs_write(img, ev_helper, EVWATCH_HELPER_GUEST)
     if demo.name == "gui":
         helper = compile_helper(MINIGUI_HELPER_SOURCE, "minigui", arch)
         debugfs_write(img, helper, MINIGUI_HELPER_GUEST)
@@ -990,7 +1063,15 @@ def spawn_qemu(
     hostfwd: str = "n",
     snapshot: str = "y",
 ) -> subprocess.Popen[str]:
-    qmp_args = f" -qmp tcp::{QMP_PORT},server=on,wait=off" if graphic == "y" or input_devices == "y" else ""
+    if graphic == "y" or input_devices == "y":
+        LAB_BIN_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            QMP_SOCKET.unlink()
+        except FileNotFoundError:
+            pass
+        qmp_args = f" -qmp unix:{QMP_SOCKET},server=on,wait=off"
+    else:
+        qmp_args = ""
     qemu_args = f"{'-snapshot ' if snapshot == 'y' else ''}-monitor none -serial tcp::{SERIAL_PORT},server=on{qmp_args}"
     return subprocess.Popen(
         [
@@ -1273,6 +1354,24 @@ def format_boolish(raw: str) -> str:
     return "yes" if parse_usize(raw) != 0 else "no"
 
 
+def format_fb_ioctl(raw: str) -> str:
+    value = parse_usize(raw)
+    return FB_IOCTL_NAMES.get(value, raw)
+
+
+def decode_input_event(raw: str) -> str:
+    value = parse_usize(raw)
+    if value == 0:
+        return "unknown"
+    event_type = (value >> 16) & 0xffff
+    code = value & 0xffff
+    ty_name = INPUT_EVENT_TYPE_NAMES.get(event_type, f"type={event_type}")
+    code_name = INPUT_EVENT_CODE_NAMES.get((event_type, code))
+    if code_name is None:
+        return f"{ty_name}/code={code}"
+    return f"{ty_name}/{code_name}"
+
+
 def first_arg_label(syscall_name: str) -> str:
     return SYSCALL_FIRST_ARG_LABELS.get(syscall_name, "arg0")
 
@@ -1399,6 +1498,39 @@ def describe_tty_ctl(event: TraceEvent) -> str:
     return f"{op} value={format_small_int(event.arg1)}"
 
 
+def describe_fb_ioctl(event: TraceEvent) -> str:
+    cmd = parse_usize(event.arg0)
+    if cmd == 0x4600:
+        packed = parse_usize(event.arg1)
+        width = packed >> 16
+        height = packed & 0xffff
+        return f"{format_fb_ioctl(event.arg0)} -> {width}x{height}"
+    if cmd == 0x4602:
+        return f"{format_fb_ioctl(event.arg0)} -> line_length={format_small_int(event.arg1)}"
+    return format_fb_ioctl(event.arg0)
+
+
+def describe_fb_map(event: TraceEvent) -> str:
+    return f"map /dev/fb0 size={format_small_int(event.arg0)}"
+
+
+def describe_input_open(event: TraceEvent) -> str:
+    node = INPUT_NODE_NAMES.get(parse_usize(event.arg1), "unknown")
+    return f"open /dev/input/{node} -> fd={format_fd(event.arg0)}"
+
+
+def describe_input_read(event: TraceEvent) -> str:
+    return f"read {format_small_int(event.arg0)} byte(s) first={decode_input_event(event.arg1)}"
+
+
+def describe_input_poll_wake(event: TraceEvent) -> str:
+    return f"input became ready via {decode_input_event(event.arg1)}"
+
+
+def describe_display_flush(_event: TraceEvent) -> str:
+    return "first framebuffer flush reached the display backend"
+
+
 def build_event_views(events: list[TraceEvent]) -> list[EventView]:
     views: list[EventView] = []
     active_syscalls: dict[int, str] = {}
@@ -1437,6 +1569,18 @@ def build_event_views(events: list[TraceEvent]) -> list[EventView]:
             detail = describe_pty_open(event)
         elif event.kind == "TtyCtl":
             detail = describe_tty_ctl(event)
+        elif event.kind == "FbIoctl":
+            detail = describe_fb_ioctl(event)
+        elif event.kind == "FbMap":
+            detail = describe_fb_map(event)
+        elif event.kind == "InputOpen":
+            detail = describe_input_open(event)
+        elif event.kind == "InputRead":
+            detail = describe_input_read(event)
+        elif event.kind == "InputPollWake":
+            detail = describe_input_poll_wake(event)
+        elif event.kind == "DisplayFlush":
+            detail = describe_display_flush(event)
         else:
             detail = f"arg0={event.arg0} arg1={event.arg1}"
         views.append(EventView(event=event, label=event.kind, detail=detail))
@@ -1711,7 +1855,7 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                 break
         if helper_tid is not None:
             keep_syscalls = {"openat", "ioctl", "mmap", "munmap", "close"}
-            keep_labels = {"PageFault", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep_labels = {"FbIoctl", "FbMap", "DisplayFlush", "PageFault", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
             keep: set[int] = set()
             pending_syscalls: dict[int, str] = {}
             parent_tid = next(
@@ -1719,6 +1863,9 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                 None,
             )
             for view in views:
+                if view.label == "DisplayFlush":
+                    keep.add(view.event.seq)
+                    continue
                 if view.event.tid == helper_tid:
                     if (
                         view.label == "SysExit"
@@ -1769,7 +1916,7 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                 break
         if helper_tid is not None:
             keep_syscalls = {"openat", "ioctl", "read", "close"}
-            keep_labels = {"PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep_labels = {"InputOpen", "InputRead", "InputPollWake", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
             keep: set[int] = set()
             pending_syscalls: dict[int, str] = {}
             parent_tid = next(
@@ -1832,7 +1979,7 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                 break
         if helper_tid is not None:
             keep_syscalls = {"openat", "ioctl", "mmap", "read", "munmap", "close"}
-            keep_labels = {"PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep_labels = {"FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputRead", "InputPollWake", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
             keep: set[int] = set()
             pending_syscalls: dict[int, str] = {}
             parent_tid = next(
@@ -1840,6 +1987,9 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                 None,
             )
             for view in views:
+                if view.label == "DisplayFlush":
+                    keep.add(view.event.seq)
+                    continue
                 if view.event.tid == helper_tid:
                     if (
                         view.label == "SysExit"
@@ -1913,7 +2063,7 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                 break
         if helper_tid is not None:
             keep_syscalls = {"openat", "ioctl", "mmap", "read", "munmap", "close"}
-            keep_labels = {"PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep_labels = {"FbIoctl", "FbMap", "DisplayFlush", "InputOpen", "InputRead", "InputPollWake", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
             keep: set[int] = set()
             pending_syscalls: dict[int, str] = {}
             parent_tid = next(
@@ -1921,6 +2071,9 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                 None,
             )
             for view in views:
+                if view.label == "DisplayFlush":
+                    keep.add(view.event.seq)
+                    continue
                 if view.event.tid == helper_tid:
                     if (
                         view.label == "SysExit"
@@ -2425,21 +2578,45 @@ def select_waitctl_phase_views(phase_name: str, views: list[EventView]) -> list[
 
 
 def select_x11_phase_views(phase_name: str, views: list[EventView]) -> list[EventView]:
-    if phase_name == "phase-1-server":
-        keep_labels = {"PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
-        focus_syscalls = {"openat", "ioctl", "mmap", "read", "close"}
-    elif phase_name == "phase-2-client":
-        keep_labels = {"PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+    helper_wait = next((view for view in views if view.label == "WaitReap"), None)
+    helper_tid = parse_usize(helper_wait.event.arg0) if helper_wait is not None else None
+    shell_tid = helper_wait.event.tid if helper_wait is not None else None
+
+    if phase_name == "phase-1-fb":
+        keep_labels = {"FbIoctl", "FbMap", "DisplayFlush", "PageFault", "WaitReap", "TaskExit"}
+        focus_syscalls = {"openat", "mmap", "munmap", "close"}
+    elif phase_name == "phase-2-input":
+        keep_labels = {"InputOpen", "InputRead", "InputPollWake", "PollSleep", "PollWake", "WaitReap", "TaskExit"}
+        focus_syscalls = {"openat", "ioctl", "read", "close"}
+    elif phase_name == "phase-3-x11":
+        keep_labels = {"PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
         focus_syscalls = {"socket", "connect", "openat", "read", "write", "close"}
     else:
         return views
 
-    keep: set[int] = {view.event.seq for view in views if view.label in keep_labels}
+    keep: set[int] = set()
+    for view in views:
+        if view.label not in keep_labels:
+            continue
+        if phase_name in {"phase-1-fb", "phase-2-input"}:
+            if view.label == "DisplayFlush":
+                keep.add(view.event.seq)
+                continue
+            if view.label == "WaitReap" and shell_tid is not None and view.event.tid == shell_tid:
+                keep.add(view.event.seq)
+                continue
+            if helper_tid is not None and view.event.tid == helper_tid:
+                keep.add(view.event.seq)
+            continue
+        keep.add(view.event.seq)
+
     pending_syscalls: dict[int, str] = {}
     for view in views:
         if view.label == "SysEnter":
             name = syscall_name(view.event.arg0)
             if name in focus_syscalls:
+                if phase_name in {"phase-1-fb", "phase-2-input"} and helper_tid is not None and view.event.tid != helper_tid:
+                    continue
                 if name in {"read", "write"} and parse_i64(view.event.arg1) in {0, 1, 2}:
                     continue
                 keep.add(view.event.seq)
@@ -2448,6 +2625,9 @@ def select_x11_phase_views(phase_name: str, views: list[EventView]) -> list[Even
         if view.label == "SysExit":
             name = syscall_name(view.event.arg0)
             if pending_syscalls.get(view.event.tid) == name:
+                if phase_name in {"phase-1-fb", "phase-2-input"} and helper_tid is not None and view.event.tid != helper_tid:
+                    pending_syscalls.pop(view.event.tid, None)
+                    continue
                 if name in {"read", "write"} and abs(parse_i64(view.event.arg1)) == 1:
                     pending_syscalls.pop(view.event.tid, None)
                     continue
@@ -2475,22 +2655,44 @@ def build_x11_phase_walkthrough(
     transcript: str,
     notes: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
-    if phase_name == "phase-1-server":
+    if phase_name == "phase-1-fb":
         lines = [
-            "this phase isolates X server bring-up over fbdev and evdev: package setup is already done, then `X -retro` opens the framebuffer, input devices, and its local UNIX socket.",
+            "this phase isolates the raw framebuffer layer underneath X11 by running a tiny fbdev helper directly on `/dev/fb0`: it opens the node, queries fixed and variable metadata, maps the framebuffer, and draws one deterministic scene.",
         ]
+        fb_ioctls = [view for view in key_views if view.label == "FbIoctl"]
+        if fb_ioctls:
+            lines.append(f"framebuffer metadata flowed through {', '.join(view.detail for view in fb_ioctls[:2])}.")
+        fb_map = next((view for view in key_views if view.label == "FbMap"), None)
+        if fb_map is not None:
+            lines.append(f"userspace gained direct pixel access through {fb_map.detail}.")
         if any(view.label == "PageFault" for view in key_views):
-            lines.append("framebuffer-backed pages faulted into the X server while it brought the screen up.")
-        if any(view.label in {"PollSleep", "PollWake"} for view in key_views):
-            lines.append("the server's device/event loop entered poll and woke again while finishing initialization.")
-        if X11_SERVER_TOKEN in transcript:
-            lines.append("the guest printed the server-ready token, so `/tmp/.X11-unix/X0` was live and ready for clients.")
+            lines.append("framebuffer-backed pages faulted into the helper while it populated the first frame.")
+        if any(view.label == "DisplayFlush" for view in key_views):
+            lines.append("the first framebuffer flush reached the display backend, so the raw fbdev scene was no longer only dirty userspace memory.")
         lines.extend(notes)
         return tuple(lines)
 
-    if phase_name == "phase-2-client":
+    if phase_name == "phase-2-input":
         lines = [
-            "this phase isolates the first real X client: `xcalc` connects to the local X server, draws one window, and stays alive long enough for the runner to capture a framebuffer screenshot.",
+            "this phase isolates the raw evdev layer underneath X11 by running a tiny helper directly on `/dev/input/event0` and `/dev/input/mice`: it opens the nodes, blocks in poll(), and drains deterministic keyboard and mouse activity injected through QEMU.",
+        ]
+        input_opens = [view for view in key_views if view.label == "InputOpen"]
+        if input_opens:
+            lines.append(f"the input path opened {', '.join(view.detail for view in input_opens[:2])}.")
+        if any(view.label == "InputPollWake" for view in key_views):
+            rendered = ", ".join(view.detail for view in key_views if view.label == "InputPollWake")
+            lines.append(f"readiness first surfaced as {rendered}.")
+        if any(view.label == "InputRead" for view in key_views):
+            rendered = ", ".join(view.detail for view in key_views if view.label == "InputRead")
+            lines.append(f"userspace then drained actual input records through {rendered}.")
+        if any(view.label in {"PollSleep", "PollWake"} for view in key_views):
+            lines.append("the server's input loop visibly blocked in poll() and woke again as events arrived.")
+        lines.extend(notes)
+        return tuple(lines)
+
+    if phase_name == "phase-3-x11":
+        lines = [
+            "this phase isolates the first real X11 client after the raw fbdev and evdev layers are already proven separately: a fresh `X -retro` instance comes up, `xcalc` connects to it, draws one window, and stays alive long enough for the runner to capture a framebuffer screenshot.",
         ]
         if any(view.label in {"PollSleep", "PollWake"} for view in key_views):
             lines.append("client/server interaction stayed visible through poll wakeups while the X connection became active.")
@@ -2943,15 +3145,64 @@ def qmp_execute(handle: "socket.SocketIO", execute: str, arguments: dict[str, ob
             raise RuntimeError(f"qmp {execute} failed: {message['error']}")
 
 
+def wait_for_unix_socket(path: pathlib.Path, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"timed out waiting for unix socket: {path}")
+
+
 def qmp_screendump(path: pathlib.Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = path.resolve()
-    wait_for_tcp_port("127.0.0.1", QMP_PORT, timeout=10.0)
-    with socket.create_connection(("127.0.0.1", QMP_PORT), timeout=10) as sock:
+    wait_for_unix_socket(QMP_SOCKET, timeout=10.0)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(10)
+        sock.connect(str(QMP_SOCKET))
         handle = sock.makefile("rwb")
         qmp_read_message(handle)
         qmp_execute(handle, "qmp_capabilities")
         qmp_execute(handle, "screendump", {"filename": str(resolved)})
+
+
+def qmp_send_input_batches(
+    batches: tuple[tuple[dict[str, object], ...], ...],
+    delay_s: float = 0.08,
+) -> None:
+    wait_for_unix_socket(QMP_SOCKET, timeout=10.0)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(10)
+        sock.connect(str(QMP_SOCKET))
+        handle = sock.makefile("rwb")
+        qmp_read_message(handle)
+        qmp_execute(handle, "qmp_capabilities")
+        for events in batches:
+            qmp_execute(handle, "input-send-event", {"events": list(events)})
+            time.sleep(delay_s)
+
+
+def inject_x11_input_sequence() -> str:
+    qmp_send_input_batches(
+        (
+            (
+                {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
+                {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
+            ),
+            (
+                {"type": "rel", "data": {"axis": "x", "value": 9}},
+                {"type": "rel", "data": {"axis": "y", "value": -5}},
+            ),
+            (
+                {"type": "btn", "data": {"down": True, "button": "left"}},
+            ),
+            (
+                {"type": "btn", "data": {"down": False, "button": "left"}},
+            ),
+        )
+    )
+    return "the runner injected keyboard `A`, mouse move `(9,-5)`, and a left-button click while the X server trace window was still open."
 
 
 def start_input_peer() -> PeerController:
@@ -2959,9 +3210,11 @@ def start_input_peer() -> PeerController:
 
     def worker() -> None:
         try:
-            wait_for_tcp_port("127.0.0.1", QMP_PORT, timeout=10.0)
+            wait_for_unix_socket(QMP_SOCKET, timeout=10.0)
             time.sleep(1.0)
-            with socket.create_connection(("127.0.0.1", QMP_PORT), timeout=10) as sock:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect(str(QMP_SOCKET))
                 handle = sock.makefile("rwb")
                 qmp_read_message(handle)
                 qmp_execute(handle, "qmp_capabilities")
@@ -3018,9 +3271,11 @@ def start_gui_peer() -> PeerController:
 
     def worker() -> None:
         try:
-            wait_for_tcp_port("127.0.0.1", QMP_PORT, timeout=10.0)
+            wait_for_unix_socket(QMP_SOCKET, timeout=10.0)
             time.sleep(1.0)
-            with socket.create_connection(("127.0.0.1", QMP_PORT), timeout=10) as sock:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect(str(QMP_SOCKET))
                 handle = sock.makefile("rwb")
                 qmp_read_message(handle)
                 qmp_execute(handle, "qmp_capabilities")
@@ -3088,9 +3343,11 @@ def start_snake_peer() -> PeerController:
 
     def worker() -> None:
         try:
-            wait_for_tcp_port("127.0.0.1", QMP_PORT, timeout=10.0)
+            wait_for_unix_socket(QMP_SOCKET, timeout=10.0)
             time.sleep(1.0)
-            with socket.create_connection(("127.0.0.1", QMP_PORT), timeout=10) as sock:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect(str(QMP_SOCKET))
                 handle = sock.makefile("rwb")
                 qmp_read_message(handle)
                 qmp_execute(handle, "qmp_capabilities")
@@ -3369,19 +3626,16 @@ def x11_install_command() -> str:
     )
 
 
-def x11_server_command() -> str:
+def x11_server_start_command() -> str:
     return (
         "sh -c '"
-        f"rm -f {X11_SERVER_LOG_GUEST} {X11_SERVER_PID_GUEST}; "
-        f"X -retro >{X11_SERVER_LOG_GUEST} 2>&1 & "
+        "mkdir -p /tmp/.X11-unix; "
+        f"rm -f {X11_SERVER_LOG_GUEST} {X11_SERVER_PID_GUEST} /tmp/.X0-lock /tmp/.X11-unix/X0; "
+        f"X -config {X11_CONFIG_GUEST} -retro >{X11_SERVER_LOG_GUEST} 2>&1 & "
         "pid=$!; "
         f"echo $pid > {X11_SERVER_PID_GUEST}; "
-        "for i in $(seq 1 80); do "
-        f"  [ -S /tmp/.X11-unix/X0 ] && {{ printf \"{X11_SERVER_TOKEN}\\n\"; exit 0; }}; "
-        "  sleep 0.25; "
-        "done; "
-        "kill $pid 2>/dev/null || true; "
-        "exit 1'"
+        "kill -0 $pid 2>/dev/null; "
+        f"printf \"{X11_SERVER_TOKEN}\\n\"'"
     )
 
 
@@ -3398,6 +3652,23 @@ def x11_client_command() -> str:
     )
 
 
+def x11_wait_server_ready_command() -> str:
+    return (
+        "sh -c '"
+        "for i in $(seq 1 40); do "
+        f"  [ -S /tmp/.X11-unix/X0 ] && {{ printf \"{X11_SERVER_TOKEN}\\n\"; exit 0; }}; "
+        f"  pid=$(cat {X11_SERVER_PID_GUEST} 2>/dev/null || true); "
+        "  if [ -n \"$pid\" ] && ! kill -0 \"$pid\" 2>/dev/null; then "
+        f"    cat {X11_SERVER_LOG_GUEST} 2>/dev/null || true; "
+        "    exit 1; "
+        "  fi; "
+        "  sleep 0.05; "
+        "done; "
+        f"cat {X11_SERVER_LOG_GUEST} 2>/dev/null || true; "
+        "exit 1'"
+    )
+
+
 def x11_cleanup_command() -> str:
     return (
         "sh -c '"
@@ -3407,6 +3678,7 @@ def x11_cleanup_command() -> str:
         "  [ -n \"$pid\" ] && kill \"$pid\" 2>/dev/null || true; "
         "done; "
         "sleep 1; "
+        "rm -f /tmp/.X0-lock /tmp/.X11-unix/X0; "
         "for f in "
         f"{X11_CLIENT_PID_GUEST} {X11_SERVER_PID_GUEST}; do rm -f \"$f\"; done'"
     )
@@ -3462,6 +3734,7 @@ def build_walkthrough(
     demo: Demo,
     event_views: list[EventView],
     key_views: list[EventView],
+    artifact_dir: pathlib.Path,
     artifact_outputs: dict[str, str],
     peer_notes: tuple[str, ...],
     phase_results: tuple[PhaseResult, ...] = (),
@@ -3657,41 +3930,36 @@ def build_walkthrough(
         helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
         helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
         helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
-        open_exit = next(
-            (view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "openat"),
-            None,
-        )
-        ioctl_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"
-        ]
-        mmap_exit = next(
-            (view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "mmap"),
-            None,
-        )
+        fb_ioctls = [view for view in helper_views if view.label == "FbIoctl"]
+        fb_map = next((view for view in helper_views if view.label == "FbMap"), None)
+        display_flush = next((view for view in helper_views if view.label == "DisplayFlush"), None)
         page_faults = [view for view in helper_views if view.label == "PageFault"]
         task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
         transcript = artifact_outputs.get("demo-step-1.txt", "")
         lines = [
             "the helper opened `/dev/fb0`, queried both fixed and variable framebuffer metadata, mapped the backing memory, and drew a small teaching scene directly into the framebuffer.",
         ]
-        if open_exit is not None:
-            lines.append(f"the framebuffer device opened successfully through {open_exit.detail}.")
-        if len(ioctl_exits) >= 2:
+        if len(fb_ioctls) >= 2:
             lines.append(
-                f"two framebuffer metadata ioctls completed as {ioctl_exits[0].detail} and {ioctl_exits[1].detail} before drawing began."
+                f"framebuffer metadata flowed through {fb_ioctls[0].detail} and {fb_ioctls[1].detail} before drawing began."
             )
-        elif ioctl_exits:
-            lines.append(f"framebuffer metadata flowed through {ioctl_exits[0].detail}.")
-        if mmap_exit is not None:
-            lines.append(f"pixel memory became writable through {mmap_exit.detail}.")
+        elif fb_ioctls:
+            lines.append(f"framebuffer metadata flowed through {fb_ioctls[0].detail}.")
+        if fb_map is not None:
+            lines.append(f"pixel memory became writable through {fb_map.detail}.")
         if page_faults:
             lines.append(
                 f"the first drawing touches faulted framebuffer pages into the process view ({len(page_faults)} visible page-fault event(s) kept in the teaching trace)."
             )
+        if display_flush is not None:
+            lines.append("the first framebuffer flush reached the display backend, so the scene was no longer only dirty userspace memory.")
         if "fb-lab" in transcript:
             lines.append(
                 "the helper printed `fb-lab ... checksum=...`, which means the color bands, boxed center panel, and simple glyphs were all written through the mapped framebuffer."
             )
+        screenshot = artifact_dir / "screen.ppm"
+        if screenshot.exists():
+            lines.append(f"the runner also captured `{screenshot}` so the teaching artifact includes the actual framebuffer image, not only the checksum.")
         if helper_reap is not None:
             lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
         if task_exit is not None:
@@ -3701,37 +3969,30 @@ def build_walkthrough(
         helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
         helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
         helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
-        open_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "openat"
-        ]
-        ioctl_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"
-        ]
-        read_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "read"
-        ]
+        input_opens = [view for view in helper_views if view.label == "InputOpen"]
+        input_reads = [view for view in helper_views if view.label == "InputRead"]
+        input_wakes = [view for view in helper_views if view.label == "InputPollWake"]
+        ioctl_exits = [view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"]
         poll_events = [view for view in helper_views if view.label in {"PollSleep", "PollWake"}]
         task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
         transcript = artifact_outputs.get("demo-step-1.txt", "")
         lines = [
             "the helper opened the keyboard and mouse evdev nodes, queried their metadata, then blocked in poll() until the runner injected deterministic keyboard and mouse activity through QEMU.",
         ]
-        if len(open_exits) >= 2:
-            lines.append(
-                f"the input nodes opened successfully through {open_exits[0].detail} and {open_exits[1].detail}."
-            )
+        if len(input_opens) >= 2:
+            lines.append(f"the input nodes opened successfully through {input_opens[0].detail} and {input_opens[1].detail}.")
         if ioctl_exits:
             lines.append(
                 f"device metadata flowed through {len(ioctl_exits)} successful ioctl call(s) before the event loop started."
             )
+        if input_wakes:
+            lines.append(f"readiness first surfaced as {', '.join(view.detail for view in input_wakes[:2])}.")
         if poll_events:
             lines.append(
                 f"the helper's poll path slept {sum(1 for view in poll_events if view.label == 'PollSleep')} time(s) and woke {sum(1 for view in poll_events if view.label == 'PollWake')} time(s) as events arrived."
             )
-        if read_exits:
-            lines.append(
-                f"event delivery then showed up as {len(read_exits)} successful read call(s) draining keyboard and mouse records."
-            )
+        if input_reads:
+            lines.append(f"event delivery then showed up as {', '.join(view.detail for view in input_reads[:3])}.")
         if "ev-lab" in transcript:
             lines.append(
                 "the helper printed `ev-lab ...`, confirming that EV_KEY for keyboard input and EV_REL plus button activity for the mouse were both observed from userspace."
@@ -3746,19 +4007,12 @@ def build_walkthrough(
         helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
         helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
         helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
-        open_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "openat"
-        ]
-        ioctl_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"
-        ]
-        mmap_exit = next(
-            (view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "mmap"),
-            None,
-        )
-        read_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "read"
-        ]
+        input_opens = [view for view in helper_views if view.label == "InputOpen"]
+        input_reads = [view for view in helper_views if view.label == "InputRead"]
+        input_wakes = [view for view in helper_views if view.label == "InputPollWake"]
+        fb_ioctls = [view for view in helper_views if view.label == "FbIoctl"]
+        fb_map = next((view for view in helper_views if view.label == "FbMap"), None)
+        display_flush = next((view for view in helper_views if view.label == "DisplayFlush"), None)
         poll_events = [view for view in helper_views if view.label in {"PollSleep", "PollWake"}]
         page_faults = [view for view in helper_views if view.label == "PageFault"]
         task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
@@ -3766,32 +4020,33 @@ def build_walkthrough(
         lines = [
             "the helper opened `/dev/fb0` plus the keyboard and mouse evdev nodes, mapped the framebuffer, and then redrew a tiny full-screen scene while consuming injected input.",
         ]
-        if len(open_exits) >= 3:
-            lines.append(
-                f"device bring-up opened the framebuffer and two input nodes through {open_exits[0].detail}, {open_exits[1].detail}, and {open_exits[2].detail}."
-            )
-        if ioctl_exits:
-            lines.append(
-                f"framebuffer and evdev metadata flowed through {len(ioctl_exits)} successful ioctl call(s) before the interaction loop."
-            )
-        if mmap_exit is not None:
-            lines.append(f"the framebuffer became writable through {mmap_exit.detail}.")
+        if fb_ioctls:
+            lines.append(f"framebuffer metadata flowed through {', '.join(view.detail for view in fb_ioctls[:2])}.")
+        if fb_map is not None:
+            lines.append(f"the framebuffer became writable through {fb_map.detail}.")
+        if len(input_opens) >= 2:
+            lines.append(f"the input side opened {input_opens[0].detail} and {input_opens[1].detail}.")
         if page_faults:
             lines.append(
                 f"the first redraws faulted framebuffer-backed pages into userspace ({len(page_faults)} visible page-fault event(s) kept in the teaching trace)."
             )
+        if display_flush is not None:
+            lines.append("the display backend flush became visible, so the drawn scene was actually scanned out.")
+        if input_wakes:
+            lines.append(f"input readiness surfaced as {', '.join(view.detail for view in input_wakes[:2])}.")
         if poll_events:
             lines.append(
                 f"the combined input loop slept {sum(1 for view in poll_events if view.label == 'PollSleep')} time(s) and woke {sum(1 for view in poll_events if view.label == 'PollWake')} time(s) while waiting for keyboard and mouse events."
             )
-        if read_exits:
-            lines.append(
-                f"input delivery then showed up as {len(read_exits)} successful read call(s) draining keyboard and mouse event records."
-            )
+        if input_reads:
+            lines.append(f"input delivery then showed up as {', '.join(view.detail for view in input_reads[:3])}.")
         if "gui-lab" in transcript:
             lines.append(
                 "the helper printed `gui-lab ...`, which means the box moved via keyboard input, the cursor moved via relative mouse input, and the left-button click flipped the box color before the final checksum was computed."
             )
+        screenshot = artifact_dir / "screen.ppm"
+        if screenshot.exists():
+            lines.append(f"the runner also captured `{screenshot}` so the final interactive scene is saved alongside the trace.")
         lines.extend(peer_notes)
         if helper_reap is not None:
             lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
@@ -3802,19 +4057,12 @@ def build_walkthrough(
         helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
         helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
         helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
-        open_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "openat"
-        ]
-        ioctl_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"
-        ]
-        mmap_exit = next(
-            (view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "mmap"),
-            None,
-        )
-        read_exits = [
-            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "read"
-        ]
+        input_opens = [view for view in helper_views if view.label == "InputOpen"]
+        input_reads = [view for view in helper_views if view.label == "InputRead"]
+        input_wakes = [view for view in helper_views if view.label == "InputPollWake"]
+        fb_ioctls = [view for view in helper_views if view.label == "FbIoctl"]
+        fb_map = next((view for view in helper_views if view.label == "FbMap"), None)
+        display_flush = next((view for view in helper_views if view.label == "DisplayFlush"), None)
         poll_events = [view for view in helper_views if view.label in {"PollSleep", "PollWake"}]
         page_faults = [view for view in helper_views if view.label == "PageFault"]
         task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
@@ -3822,32 +4070,33 @@ def build_walkthrough(
         lines = [
             "the helper opened `/dev/fb0` plus the keyboard evdev node, mapped the framebuffer, and ran a small snake game directly on fbdev + evdev without any window system.",
         ]
-        if len(open_exits) >= 2:
-            lines.append(
-                f"device bring-up opened the framebuffer and keyboard input through {open_exits[0].detail} and {open_exits[1].detail}."
-            )
-        if ioctl_exits:
-            lines.append(
-                f"framebuffer metadata flowed through {len(ioctl_exits)} successful ioctl call(s) before the game loop started."
-            )
-        if mmap_exit is not None:
-            lines.append(f"the framebuffer became writable through {mmap_exit.detail}.")
+        if fb_ioctls:
+            lines.append(f"framebuffer metadata flowed through {', '.join(view.detail for view in fb_ioctls[:2])} before the game loop started.")
+        if fb_map is not None:
+            lines.append(f"the framebuffer became writable through {fb_map.detail}.")
+        if input_opens:
+            lines.append(f"keyboard input opened through {input_opens[0].detail}.")
         if page_faults:
             lines.append(
                 f"the first redraws faulted framebuffer-backed pages into userspace ({len(page_faults)} visible page-fault event(s) kept in the teaching trace)."
             )
+        if display_flush is not None:
+            lines.append("the display backend flush became visible, so the snake board was actually scanned out rather than only updated in the mapping.")
+        if input_wakes:
+            lines.append(f"keyboard readiness surfaced as {', '.join(view.detail for view in input_wakes[:2])}.")
         if poll_events:
             lines.append(
                 f"the input loop slept {sum(1 for view in poll_events if view.label == 'PollSleep')} time(s) and woke {sum(1 for view in poll_events if view.label == 'PollWake')} time(s) while waiting for keyboard turns."
             )
-        if read_exits:
-            lines.append(
-                f"keyboard delivery then showed up as {len(read_exits)} successful read call(s) draining evdev key events."
-            )
+        if input_reads:
+            lines.append(f"keyboard delivery then showed up as {', '.join(view.detail for view in input_reads[:3])}.")
         if "snake-lab" in transcript:
             lines.append(
                 "the helper printed `snake-lab ...`, which means the scripted run ate food, changed direction through evdev key input, rendered the updated board through fbdev, and quit cleanly with a deterministic final checksum."
             )
+        screenshot = artifact_dir / "screen.ppm"
+        if screenshot.exists():
+            lines.append(f"the runner also captured `{screenshot}` so the final snake frame is saved alongside the trace.")
         lines.extend(peer_notes)
         if helper_reap is not None:
             lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
@@ -3857,18 +4106,22 @@ def build_walkthrough(
     if demo.name == "x11":
         if phase_results:
             phase_map = {phase.name: phase for phase in phase_results}
-            server_phase = phase_map.get("phase-1-server")
-            client_phase = phase_map.get("phase-2-client")
+            fb_phase = phase_map.get("phase-1-fb")
+            input_phase = phase_map.get("phase-2-input")
+            x11_phase = phase_map.get("phase-3-x11")
             lines = [
-                "the X11-lite demo is split into two focused phases so device bring-up and first-client rendering stay readable instead of collapsing into one huge mixed trace.",
+                "the X11-lite demo is split into three focused phases so the graphics stack stays teachable end to end: raw framebuffer first, raw evdev second, and the first real X client last.",
             ]
-            if server_phase is not None:
-                lines.append("phase 1 isolated `X -retro` over fbdev+evdev, including framebuffer mapping, local server bring-up, and the first poll loop.")
-                lines.extend(f"(phase 1) {line}" for line in server_phase.walkthrough[:3])
-            if client_phase is not None:
-                lines.append("phase 2 isolated the first real client, `xcalc`, including its connection to X and one captured GUI frame.")
-                lines.extend(f"(phase 2) {line}" for line in client_phase.walkthrough[:4])
-                screenshot = client_phase.out_dir / "screen.ppm"
+            if fb_phase is not None:
+                lines.append("phase 1 isolated raw framebuffer bring-up on `/dev/fb0` before X11 entered the picture.")
+                lines.extend(f"(phase 1) {line}" for line in fb_phase.walkthrough[:4])
+            if input_phase is not None:
+                lines.append("phase 2 isolated raw evdev input on `/dev/input/*` before X11 entered the picture.")
+                lines.extend(f"(phase 2) {line}" for line in input_phase.walkthrough[:4])
+            if x11_phase is not None:
+                lines.append("phase 3 isolated the first real X11 client, `xcalc`, after the lower graphics layers were already proven independently.")
+                lines.extend(f"(phase 3) {line}" for line in x11_phase.walkthrough[:4])
+                screenshot = x11_phase.out_dir / "screen.ppm"
                 if screenshot.exists():
                     lines.append(f"the runner also captured one framebuffer screenshot at `{screenshot}` as proof that the X client actually drew on screen.")
             transcript = artifact_outputs.get("demo-step-1.txt", "")
@@ -4127,7 +4380,7 @@ def create_summary(
     present = [kind for kind in demo.expected_events if counts[kind] > 0]
     missing = [kind for kind in demo.expected_events if counts[kind] == 0]
     stats = parse_tab_values(stats_text)
-    walkthrough = build_walkthrough(demo, event_views, key_views, artifact_outputs, peer_notes, phase_results)
+    walkthrough = build_walkthrough(demo, event_views, key_views, artifact_dir, artifact_outputs, peer_notes, phase_results)
     syscall_summary = summarize_syscalls(events)
     signal_summary = summarize_signals(events)
     focus_page_fault = None
@@ -4357,55 +4610,122 @@ def execute_run(
             install_command = x11_install_command()
             input_stream.append(install_command)
             session.run_command(install_command, max(command_timeout, 600.0))
-            x11_phase_specs = (
-                (
-                    "phase-1-server",
-                    "X server over fbdev+evdev",
-                    "echo 1 > /proc/starry/reset",
-                    x11_server_command(),
-                    "echo 1 > /proc/starry/off",
-                    (),
-                ),
-                (
-                    "phase-2-client",
-                    "First X client (`xcalc`)",
-                    "echo 1 > /proc/starry/reset",
-                    x11_client_command(),
-                    "echo 1 > /proc/starry/off",
-                    (),
-                ),
-            )
+            for command in X11_CONFIG_SETUP_COMMANDS:
+                input_stream.append(command)
+                session.run_command(command, command_timeout)
             try:
-                for phase_name, phase_title, phase_start, phase_command, phase_end, notes in x11_phase_specs:
-                    input_stream.append(f"{phase_start} [{phase_name}]")
-                    session.run_command(phase_start, command_timeout)
-                    input_stream.append(f"{phase_command} [{phase_name}]")
-                    transcript = clean_capture(session.run_command(phase_command, max(command_timeout, 60.0)), phase_command)
-                    phase_notes = list(notes)
-                    if phase_name == "phase-2-client":
-                        screenshot_path = out_dir / phase_name / "screen.ppm"
-                        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-                        qmp_screendump(screenshot_path)
-                        phase_notes.append(f"the runner captured one QMP screendump at `{screenshot_path}` after the client window appeared.")
-                        x11_peer_notes.append(f"{phase_name}: {phase_notes[-1]}")
-                    input_stream.append(f"{phase_end} [{phase_name}]")
-                    session.run_command(phase_end, command_timeout)
-                    phase_outputs = collect_trace_artifacts(session, command_timeout)
-                    phase_events = parse_trace(phase_outputs["starry_trace.txt"])
-                    phase_results_list.append(
-                        render_x11_phase_artifacts(
-                            out_dir / phase_name,
-                            phase_name,
-                            phase_title,
-                            phase_events,
-                            phase_outputs["starry_stats.txt"],
-                            phase_outputs["starry_last_fault.txt"],
-                            (phase_command,),
-                            transcript,
-                            tuple(phase_notes),
-                            raw,
-                        )
+                phase_reset = "echo 1 > /proc/starry/reset"
+                phase_off = "echo 1 > /proc/starry/off"
+                server_start = x11_server_start_command()
+                wait_ready = x11_wait_server_ready_command()
+                cleanup_command = x11_cleanup_command()
+
+                # Phase 1: isolate raw framebuffer bring-up before X.
+                input_stream.append(f"{phase_reset} [phase-1-fb]")
+                session.run_command(phase_reset, command_timeout)
+                phase1_command = FBDRAW_HELPER_GUEST
+                input_stream.append(f"{phase1_command} [phase-1-fb]")
+                phase1_transcript = clean_capture(
+                    session.run_command(phase1_command, max(command_timeout, 60.0)),
+                    phase1_command,
+                )
+                phase1_screenshot = out_dir / "phase-1-fb" / "screen.ppm"
+                phase1_screenshot.parent.mkdir(parents=True, exist_ok=True)
+                qmp_screendump(phase1_screenshot)
+                phase1_notes = (
+                    f"the runner captured one QMP screendump at `{phase1_screenshot}` after the raw framebuffer helper finished drawing.",
+                )
+                x11_peer_notes.append(f"phase-1-fb: {phase1_notes[0]}")
+                input_stream.append(f"{phase_off} [phase-1-fb]")
+                session.run_command(phase_off, command_timeout)
+                phase1_outputs = collect_trace_artifacts(session, command_timeout)
+                phase1_events = parse_trace(phase1_outputs["starry_trace.txt"])
+                phase_results_list.append(
+                    render_x11_phase_artifacts(
+                        out_dir / "phase-1-fb",
+                        "phase-1-fb",
+                        "Raw framebuffer on /dev/fb0",
+                        phase1_events,
+                        phase1_outputs["starry_stats.txt"],
+                        phase1_outputs["starry_last_fault.txt"],
+                        (phase1_command,),
+                        phase1_transcript,
+                        phase1_notes,
+                        raw,
                     )
+                )
+
+                # Phase 2: isolate raw evdev open/poll/read before X.
+                input_stream.append(f"{phase_reset} [phase-2-input]")
+                session.run_command(phase_reset, command_timeout)
+                phase2_command = EVWATCH_HELPER_GUEST
+                phase2_peer = start_input_peer()
+                input_stream.append(f"{phase2_command} [phase-2-input]")
+                phase2_transcript = clean_capture(
+                    session.run_command(phase2_command, max(command_timeout, 60.0)),
+                    phase2_command,
+                )
+                phase2_peer_result = phase2_peer.finish(max(command_timeout, 20.0))
+                phase2_notes = phase2_peer_result.notes
+                input_stream.append("HOST:QMP inject deterministic raw input [phase-2-input]")
+                input_stream.append(f"{phase_off} [phase-2-input]")
+                session.run_command(phase_off, command_timeout)
+                phase2_outputs = collect_trace_artifacts(session, command_timeout)
+                phase2_events = parse_trace(phase2_outputs["starry_trace.txt"])
+                phase_results_list.append(
+                    render_x11_phase_artifacts(
+                        out_dir / "phase-2-input",
+                        "phase-2-input",
+                        "Raw input on /dev/input/*",
+                        phase2_events,
+                        phase2_outputs["starry_stats.txt"],
+                        phase2_outputs["starry_last_fault.txt"],
+                        (phase2_command, "HOST:QMP inject deterministic raw input"),
+                        phase2_transcript,
+                        phase2_notes,
+                        raw,
+                    )
+                )
+                x11_peer_notes.extend(f"phase-2-input: {note}" for note in phase2_notes)
+
+                # Phase 3: bring X up after the raw layers are already proven, then isolate the first client.
+                input_stream.append(f"{server_start} [phase-3-x11 prep]")
+                session.run_command(server_start, max(command_timeout, 60.0))
+                input_stream.append(f"{wait_ready} [phase-3-x11 prep]")
+                session.run_command(wait_ready, max(command_timeout, 60.0))
+                input_stream.append(f"{phase_reset} [phase-3-x11]")
+                session.run_command(phase_reset, command_timeout)
+                client_command = x11_client_command()
+                input_stream.append(f"{client_command} [phase-3-x11]")
+                phase3_transcript = clean_capture(
+                    session.run_command(client_command, max(command_timeout, 60.0)),
+                    client_command,
+                )
+                screenshot_path = out_dir / "phase-3-x11" / "screen.ppm"
+                screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+                qmp_screendump(screenshot_path)
+                phase3_notes = (f"the runner captured one QMP screendump at `{screenshot_path}` after the client window appeared.",)
+                x11_peer_notes.append(f"phase-3-x11: {phase3_notes[0]}")
+                input_stream.append(f"{phase_off} [phase-3-x11]")
+                session.run_command(phase_off, command_timeout)
+                phase3_outputs = collect_trace_artifacts(session, command_timeout)
+                phase3_events = parse_trace(phase3_outputs["starry_trace.txt"])
+                phase_results_list.append(
+                    render_x11_phase_artifacts(
+                        out_dir / "phase-3-x11",
+                        "phase-3-x11",
+                        "First X11 client (`xcalc`)",
+                        phase3_events,
+                        phase3_outputs["starry_stats.txt"],
+                        phase3_outputs["starry_last_fault.txt"],
+                        (client_command,),
+                        phase3_transcript,
+                        phase3_notes,
+                        raw,
+                    )
+                )
+                input_stream.append(f"{cleanup_command} [phase-3-x11]")
+                session.run_command(cleanup_command, command_timeout)
             except Exception as exc:
                 apk_log = clean_capture(
                     session.run_command(f"cat {X11_APK_LOG_GUEST} 2>/dev/null || true", command_timeout),
@@ -4423,7 +4743,6 @@ def execute_run(
                     f"{exc}\napk log:\n{apk_log}\nX log:\n{x_log}\nxcalc log:\n{xcalc_log}"
                 ) from exc
             finally:
-                cleanup_command = x11_cleanup_command()
                 input_stream.append(cleanup_command)
                 session.run_command(cleanup_command, command_timeout)
             phase_results = tuple(phase_results_list)
@@ -4620,7 +4939,12 @@ def execute_run(
                 write_text(step_path, cleaned_output)
                 demo_outputs.append((step_path, cleaned_output))
             peer_result = peer.finish(command_timeout) if peer is not None else PeerResult(notes=())
-            peer_notes = peer_result.notes
+            peer_note_list = list(peer_result.notes)
+            if demo.name in {"fb", "gui", "snake"}:
+                screenshot_path = out_dir / "screen.ppm"
+                qmp_screendump(screenshot_path)
+                peer_note_list.append(f"the runner captured one QMP screendump at `{screenshot_path}` after the helper finished drawing.")
+            peer_notes = tuple(peer_note_list)
             if peer_result.transcript:
                 for step_path, cleaned_output in demo_outputs:
                     if cleaned_output.strip() and demo.name not in {"ssh-poll", "ssh-select"}:
@@ -4681,6 +5005,16 @@ def execute_run(
             for filename, guest_path in (
                 ("lab_dropbear.log", DROPBEAR_LOG_GUEST),
                 ("lab_dropbearkey.log", DROPBEARKEY_LOG_GUEST),
+            ):
+                command = f"cat {guest_path} 2>/dev/null || true"
+                output = session.run_command(command, command_timeout)
+                artifact_outputs[filename] = clean_capture(output, command)
+                write_text(out_dir / filename, artifact_outputs[filename])
+        if raw and demo.name == "x11":
+            for filename, guest_path in (
+                ("lab_x11_apk.log", X11_APK_LOG_GUEST),
+                ("lab_x11.log", X11_SERVER_LOG_GUEST),
+                ("lab_xcalc.log", X11_CLIENT_LOG_GUEST),
             ):
                 command = f"cat {guest_path} 2>/dev/null || true"
                 output = session.run_command(command, command_timeout)

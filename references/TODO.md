@@ -241,6 +241,19 @@ Exit condition:
 Exit condition:
 `make lab-x11` produces a real X server + client bring-up trace plus one framebuffer screenshot, and `make lab-repeat-x11` can compare repeated runs meaningfully.
 
+## M21: Graphics Stage 5, Teaching Output Layer
+
+- [x] Add graphics-specific lab events for framebuffer ioctls/maps, input open/read/poll wakeups, and the first display flush.
+- [x] Extend `/proc/starry/reset` so one fresh graphics phase can observe the first framebuffer flush again.
+- [x] Teach the runner to decode graphics-specific events into readable framebuffer and input descriptions.
+- [x] Capture deterministic screenshots for the framebuffer, GUI, snake, and X11 labs.
+- [x] Split the X11 lab into three true trace windows for framebuffer bring-up, evdev input, and first-client rendering.
+- [x] Rewrite graphics walkthroughs so `fb`, `ev`, `gui`, `snake`, and `x11` all explain their device path without raw-trace spelunking.
+- [x] Re-check repeatability for the upgraded graphics teaching surface.
+
+Exit condition:
+`make lab-fb`, `make lab-ev`, `make lab-gui`, `make lab-snake`, and `make lab-x11` all produce graphics-aware summaries/key traces, and the X11 path stays readable through separate framebuffer/input/client phase artifacts.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

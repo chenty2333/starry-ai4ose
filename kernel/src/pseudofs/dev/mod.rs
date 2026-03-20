@@ -29,6 +29,10 @@ pub(crate) fn new_devfs() -> Filesystem {
     SimpleFs::new_with("devfs".into(), 0x01021994, builder)
 }
 
+pub(crate) fn reset_lab_markers() {
+    fb::reset_lab_markers();
+}
+
 struct Null;
 
 impl DeviceOps for Null {

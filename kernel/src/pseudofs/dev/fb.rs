@@ -1,4 +1,8 @@
-use core::{any::Any, slice};
+use core::{
+    any::Any,
+    slice,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 #[allow(unused_imports)]
 use axdriver::prelude::DisplayDriverOps;
@@ -8,7 +12,10 @@ use axhal::mem::virt_to_phys;
 use memory_addr::{PhysAddrRange, VirtAddr};
 use starry_vm::VmMutPtr;
 
-use crate::pseudofs::{DeviceMmap, DeviceOps};
+use crate::{
+    lab::{self, EventKind},
+    pseudofs::{DeviceMmap, DeviceOps},
+};
 
 // Types from https://github.com/Tangzh33/asterinas
 
@@ -78,14 +85,26 @@ struct FixScreenInfo {
     pub reserved: [u16; 2], // Reserved for future compatibility
 }
 
+static FIRST_DISPLAY_FLUSH_RECORDED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn reset_lab_markers() {
+    FIRST_DISPLAY_FLUSH_RECORDED.store(false, Ordering::Relaxed);
+}
+
 async fn refresh_task() {
     let delay = core::time::Duration::from_secs_f32(1. / 60.);
     loop {
         if !axdisplay::framebuffer_flush() {
             warn!("Failed to refresh framebuffer");
+        } else if !FIRST_DISPLAY_FLUSH_RECORDED.swap(true, Ordering::Relaxed) {
+            lab::emit(EventKind::DisplayFlush, 1, 0);
         }
         axtask::future::sleep(delay).await;
     }
+}
+
+fn emit_fb_ioctl(cmd: u32, arg1: usize) {
+    lab::emit(EventKind::FbIoctl, cmd as usize, arg1);
 }
 
 pub struct FrameBuffer {
@@ -184,10 +203,14 @@ impl DeviceOps for FrameBuffer {
                     colorspace: 0,
                     reserved: [0; 4],
                 })?;
+                emit_fb_ioctl(cmd, ((info.width as usize) << 16) | info.height as usize);
                 Ok(0)
             }
             // FBIOPUT_VSCREENINFO
-            0x4601 => Ok(0),
+            0x4601 => {
+                emit_fb_ioctl(cmd, 0);
+                Ok(0)
+            }
             // FBIOGET_FSCREENINFO
             0x4602 => {
                 let info = axdisplay::framebuffer_info();
@@ -208,12 +231,19 @@ impl DeviceOps for FrameBuffer {
                     capabilities: 0,
                     reserved: [0; 2],
                 })?;
+                emit_fb_ioctl(cmd, (info.fb_size / info.height as usize) as usize);
                 Ok(0)
             }
             // FBIOGETCMAP
-            0x4604 => Ok(0),
+            0x4604 => {
+                emit_fb_ioctl(cmd, 0);
+                Ok(0)
+            }
             // FBIOPUTCMAP
-            0x4605 => Ok(0),
+            0x4605 => {
+                emit_fb_ioctl(cmd, 0);
+                Ok(0)
+            }
             // FBIOPAN_DISPLAY
             0x4606 => Err(AxError::InvalidInput),
             // FBIOBLANK
@@ -227,6 +257,7 @@ impl DeviceOps for FrameBuffer {
     }
 
     fn mmap(&self) -> DeviceMmap {
+        lab::emit(EventKind::FbMap, self.size, 0);
         DeviceMmap::Physical(PhysAddrRange::from_start_size(
             virt_to_phys(self.base),
             self.size,

@@ -23,6 +23,7 @@ use crate::{
     file::FD_TABLE,
     lab,
     pseudofs::{
+        dev,
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
     },
@@ -159,9 +160,13 @@ fn lab_control_text() -> String {
 
 fn handle_lab_action(action: &str) -> VfsResult<()> {
     match action {
-        "clear" => lab::clear(),
+        "clear" => {
+            lab::clear();
+            dev::reset_lab_markers();
+        }
         "reset" => {
             lab::clear();
+            dev::reset_lab_markers();
             lab::set_enabled(true);
         }
         "on" => lab::set_enabled(true),

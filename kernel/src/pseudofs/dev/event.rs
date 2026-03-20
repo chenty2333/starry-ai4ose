@@ -18,6 +18,7 @@ use linux_raw_sys::{
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
+    lab::{self, EventKind},
     mm::UserPtr,
     pseudofs::{Device, DeviceOps, DirMapping, SimpleFs},
 };
@@ -26,6 +27,7 @@ const KEY_CNT: usize = EventType::Key.bits_count();
 struct Inner {
     device: AxInputDevice,
     read_ahead: Option<(Duration, Event)>,
+    poll_announced: bool,
     key_state: Bitmap<KEY_CNT>,
 }
 impl Inner {
@@ -88,6 +90,7 @@ impl EventDev {
             inner: Mutex::new(Inner {
                 device,
                 read_ahead: None,
+                poll_announced: false,
                 key_state: Bitmap::new(),
             }),
             ev_bits,
@@ -162,6 +165,7 @@ impl DeviceOps for EventDev {
             return Err(AxError::InvalidInput);
         }
         let mut read = 0;
+        let mut first_event = None;
         let mut inner = self.inner.lock();
         for out in buf.chunks_exact_mut(size_of::<InputEvent>()) {
             if !inner.has_event() {
@@ -170,6 +174,10 @@ impl DeviceOps for EventDev {
             let Some((time, event)) = inner.read_ahead.take() else {
                 break;
             };
+            inner.poll_announced = false;
+            if first_event.is_none() {
+                first_event = Some(((event.event_type as usize) << 16) | event.code as usize);
+            }
             let input_event = InputEvent {
                 time: KernelTimeval {
                     tv_sec: time.as_secs() as _,
@@ -185,6 +193,7 @@ impl DeviceOps for EventDev {
         if read == 0 {
             Err(AxError::WouldBlock)
         } else {
+            lab::emit(EventKind::InputRead, read, first_event.unwrap_or(0));
             Ok(read)
         }
     }
@@ -310,7 +319,17 @@ impl DeviceOps for EventDev {
 impl Pollable for EventDev {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, self.inner.lock().has_event());
+        let mut inner = self.inner.lock();
+        let ready = inner.has_event();
+        if ready && !inner.poll_announced {
+            let first_event = inner
+                .read_ahead
+                .map(|(_, event)| ((event.event_type as usize) << 16) | event.code as usize)
+                .unwrap_or(0);
+            inner.poll_announced = true;
+            lab::emit(EventKind::InputPollWake, 1, first_event);
+        }
+        events.set(IoEvents::IN, ready);
         events
     }
 

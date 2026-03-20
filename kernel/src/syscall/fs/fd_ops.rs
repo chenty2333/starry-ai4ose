@@ -63,6 +63,8 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
 
 fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     let mut pty_number = None;
+    #[cfg(feature = "input")]
+    let mut input_node = None;
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             // /dev/xx handling
@@ -108,6 +110,14 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                 } else if let Some(pty) = inner.downcast_ref::<tty::PtyDriver>() {
                     pty_guard = Some(pty.open_guard());
                 }
+                #[cfg(feature = "input")]
+                {
+                    input_node = match file.location().name().as_ref() {
+                        "mice" => Some(lab::INPUT_NODE_MICE),
+                        name if name.starts_with("event") => Some(lab::INPUT_NODE_EVENT),
+                        _ => None,
+                    };
+                }
             }
             match pty_guard {
                 Some(guard) => Arc::new(tty::OpenedPtyFile::new(File::new(file), guard)),
@@ -122,6 +132,10 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     let fd = add_file_like(f, flags & O_CLOEXEC != 0)?;
     if let Some(number) = pty_number {
         lab::emit(EventKind::PtyOpen, fd as usize, number as usize);
+    }
+    #[cfg(feature = "input")]
+    if let Some(node) = input_node {
+        lab::emit(EventKind::InputOpen, fd as usize, node);
     }
     Ok(fd)
 }
