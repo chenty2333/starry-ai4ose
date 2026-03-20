@@ -95,6 +95,12 @@ lab-shm:
 lab-fb:
 	$(MAKE) --no-print-directory lab DEMO=fb LAB_RAW=$(LAB_RAW)
 
+lab-ev:
+	$(MAKE) --no-print-directory lab DEMO=ev LAB_RAW=$(LAB_RAW)
+
+lab-gui:
+	$(MAKE) --no-print-directory lab DEMO=gui LAB_RAW=$(LAB_RAW)
+
 lab-fd:
 	$(MAKE) --no-print-directory lab DEMO=fd LAB_RAW=$(LAB_RAW)
 
@@ -149,6 +155,12 @@ lab-repeat-shm:
 lab-repeat-fb:
 	$(MAKE) --no-print-directory lab-repeat DEMO=fb REPEAT=2 LAB_RAW=$(LAB_RAW)
 
+lab-repeat-ev:
+	$(MAKE) --no-print-directory lab-repeat DEMO=ev REPEAT=2 LAB_RAW=$(LAB_RAW)
+
+lab-repeat-gui:
+	$(MAKE) --no-print-directory lab-repeat DEMO=gui REPEAT=2 LAB_RAW=$(LAB_RAW)
+
 lab-repeat-fd:
 	$(MAKE) --no-print-directory lab-repeat DEMO=fd REPEAT=2 LAB_RAW=$(LAB_RAW)
 
@@ -192,4 +204,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean lab lab-run lab-pipe lab-wait lab-cow lab-filemap lab-shm lab-fb lab-fd lab-fault lab-udp lab-tcp lab-http lab-pty lab-jobctl lab-waitctl lab-ssh-poll lab-ssh-select lab-sshd lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-cow lab-repeat-filemap lab-repeat-shm lab-repeat-fb lab-repeat-fd lab-repeat-fault lab-repeat-udp lab-repeat-tcp lab-repeat-http lab-repeat-pty lab-repeat-jobctl lab-repeat-waitctl lab-repeat-ssh-poll lab-repeat-ssh-select lab-repeat-sshd
+.PHONY: build run justrun debug disasm clean lab lab-run lab-pipe lab-wait lab-cow lab-filemap lab-shm lab-fb lab-ev lab-gui lab-fd lab-fault lab-udp lab-tcp lab-http lab-pty lab-jobctl lab-waitctl lab-ssh-poll lab-ssh-select lab-sshd lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-cow lab-repeat-filemap lab-repeat-shm lab-repeat-fb lab-repeat-ev lab-repeat-gui lab-repeat-fd lab-repeat-fault lab-repeat-udp lab-repeat-tcp lab-repeat-http lab-repeat-pty lab-repeat-jobctl lab-repeat-waitctl lab-repeat-ssh-poll lab-repeat-ssh-select lab-repeat-sshd

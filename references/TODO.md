@@ -197,6 +197,28 @@ Exit condition:
 Exit condition:
 `make lab-repeat-fb` stays exact-match green, and the output makes it obvious that `/dev/fb0` was queried, mapped, and written successfully through a deterministic drawing workload.
 
+## M17: Graphics Stage 2, Raw Input
+
+- [x] Add a dedicated `ev` helper workload that opens the keyboard and mouse evdev nodes, queries basic metadata, and blocks in `poll/read`.
+- [x] Teach the runner to inject deterministic keyboard and mouse activity through QEMU so the input lab stays fully automated.
+- [x] Expose `make lab-ev` / `make lab-repeat-ev`.
+- [x] Teach the runner to summarize `openat -> ioctl -> poll -> read -> close` for the evdev path.
+- [x] Re-check repeatability for the raw input workload.
+
+Exit condition:
+`make lab-repeat-ev` stays exact-match green, and the output makes it obvious that userspace observed deterministic keyboard and mouse events through `/dev/input/*`.
+
+## M18: Graphics Stage 3, Minimal Interactive GUI
+
+- [x] Add a dedicated `gui` helper workload that opens `/dev/fb0` and `/dev/input/*`, then redraws a tiny scene in response to keyboard and mouse events.
+- [x] Teach the runner to inject a deterministic keyboard-and-mouse interaction script that moves the box, moves the cursor, and toggles a visual state.
+- [x] Expose `make lab-gui` / `make lab-repeat-gui`.
+- [x] Teach the runner to summarize `openat -> ioctl -> mmap -> poll/read -> redraw -> munmap` for the combined fbdev+evdev path.
+- [x] Re-check repeatability for the minimal interactive GUI workload.
+
+Exit condition:
+`make lab-repeat-gui` stays exact-match green, and the output makes it obvious that framebuffer drawing and evdev input were combined into one deterministic interactive userspace program.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

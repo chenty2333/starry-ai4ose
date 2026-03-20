@@ -6,6 +6,7 @@ import datetime as dt
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import pathlib
 import queue
@@ -23,6 +24,7 @@ from functools import lru_cache
 
 PROMPT = "starry:~#"
 SERIAL_PORT = 4444
+QMP_PORT = 4445
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 BASELINE_ARCH = "riscv64"
 BASELINE_APP_FEATURES = "qemu,lab"
@@ -48,6 +50,8 @@ COWCTL_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "cowctl.c"
 FILEMAP_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "filemapctl.c"
 SHMCHECK_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "shmcheck.c"
 FBDRAW_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "fbdraw.c"
+EVWATCH_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "evwatch.c"
+MINIGUI_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "minigui.c"
 PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
 WAITCTL_HELPER_GUEST = "/usr/bin/lab_waitctl"
 TTYSIG_HELPER_GUEST = "/usr/bin/lab_ttysig"
@@ -55,6 +59,8 @@ COWCTL_HELPER_GUEST = "/usr/bin/lab_cowctl"
 FILEMAP_HELPER_GUEST = "/usr/bin/lab_filemapctl"
 SHMCHECK_HELPER_GUEST = "/usr/bin/lab_shmcheck"
 FBDRAW_HELPER_GUEST = "/usr/bin/lab_fbdraw"
+EVWATCH_HELPER_GUEST = "/usr/bin/lab_evwatch"
+MINIGUI_HELPER_GUEST = "/usr/bin/lab_minigui"
 DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
@@ -363,6 +369,34 @@ DEMOS: dict[str, Demo] = {
         net="n",
         graphic="y",
         input="n",
+    ),
+    "ev": Demo(
+        name="ev",
+        goal="Show raw evdev input through /dev/input/event0 and /dev/input/mice using poll/read on injected keyboard and mouse activity.",
+        commands=(EVWATCH_HELPER_GUEST,),
+        expected_events=("SysEnter", "SysExit", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
+        focus_events=("PollSleep", "PollWake", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=("openat", "ioctl", "read", "close"),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+        graphic="y",
+        input="y",
+    ),
+    "gui": Demo(
+        name="gui",
+        goal="Show a tiny interactive userspace program that combines fbdev drawing with evdev-driven movement and clicks.",
+        commands=(MINIGUI_HELPER_GUEST,),
+        expected_events=("SysEnter", "SysExit", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
+        focus_events=("PageFault", "PollSleep", "PollWake", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=("openat", "ioctl", "mmap", "read", "munmap", "close"),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+        graphic="y",
+        input="y",
     ),
     "fd": Demo(
         name="fd",
@@ -852,7 +886,7 @@ def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
 
 
 def ensure_guest_helpers(demo: Demo, arch: str) -> None:
-    if demo.name not in {"cow", "filemap", "shm", "fb", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
+    if demo.name not in {"cow", "filemap", "shm", "fb", "ev", "gui", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
         return
     img = ensure_working_disk(arch)
     if demo.name == "cow":
@@ -867,6 +901,12 @@ def ensure_guest_helpers(demo: Demo, arch: str) -> None:
     if demo.name == "fb":
         helper = compile_helper(FBDRAW_HELPER_SOURCE, "fbdraw", arch)
         debugfs_write(img, helper, FBDRAW_HELPER_GUEST)
+    if demo.name == "ev":
+        helper = compile_helper(EVWATCH_HELPER_SOURCE, "evwatch", arch)
+        debugfs_write(img, helper, EVWATCH_HELPER_GUEST)
+    if demo.name == "gui":
+        helper = compile_helper(MINIGUI_HELPER_SOURCE, "minigui", arch)
+        debugfs_write(img, helper, MINIGUI_HELPER_GUEST)
     if demo.name in {"pty", "jobctl", "ssh-poll", "ssh-select"}:
         helper = compile_helper(PTY_HELPER_SOURCE, "pty-relay", arch)
         debugfs_write(img, helper, PTY_HELPER_GUEST)
@@ -891,6 +931,7 @@ def run_build(arch: str) -> None:
 
 
 def spawn_qemu(arch: str, net: str, graphic: str, input_devices: str) -> subprocess.Popen[str]:
+    qmp_args = f" -qmp tcp::{QMP_PORT},server=on,wait=off" if graphic == "y" or input_devices == "y" else ""
     return subprocess.Popen(
         [
             "make",
@@ -904,7 +945,7 @@ def spawn_qemu(arch: str, net: str, graphic: str, input_devices: str) -> subproc
             f"ICOUNT={BASELINE_ICOUNT}",
             f"SMP={BASELINE_SMP}",
             "justrun",
-            f"QEMU_ARGS=-snapshot -monitor none -serial tcp::{SERIAL_PORT},server=on",
+            f"QEMU_ARGS=-snapshot -monitor none -serial tcp::{SERIAL_PORT},server=on{qmp_args}",
         ],
         stderr=subprocess.PIPE,
         text=True,
@@ -1623,6 +1664,147 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                     if view.label == "SignalHandle" and view.event.arg0 != "0x11":
                         keep.discard(view.event.seq)
             selected_views = [view for view in views if view.event.seq in keep]
+    if demo.name == "ev":
+        helper_tid: int | None = None
+        input_fds: set[int] = set()
+        for view in reversed(selected_views):
+            if view.label == "WaitReap":
+                helper_tid = parse_usize(view.event.arg0)
+                break
+        if helper_tid is not None:
+            keep_syscalls = {"openat", "ioctl", "read", "close"}
+            keep_labels = {"PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep: set[int] = set()
+            pending_syscalls: dict[int, str] = {}
+            parent_tid = next(
+                (view.event.tid for view in views if view.label == "WaitReap" and parse_usize(view.event.arg0) == helper_tid),
+                None,
+            )
+            for view in views:
+                if view.event.tid == helper_tid:
+                    if (
+                        view.label == "SysExit"
+                        and syscall_name(view.event.arg0) == "openat"
+                        and parse_i64(view.event.arg1) >= 0
+                        and len(input_fds) < 2
+                    ):
+                        input_fds.add(parse_i64(view.event.arg1))
+                    if view.label in keep_labels:
+                        keep.add(view.event.seq)
+                        continue
+                    if view.label == "SysEnter":
+                        name = syscall_name(view.event.arg0)
+                        if name in keep_syscalls:
+                            if name in {"ioctl", "read", "close"} and parse_i64(view.event.arg1) not in input_fds:
+                                continue
+                            keep.add(view.event.seq)
+                            pending_syscalls[view.event.tid] = name
+                        continue
+                    if view.label == "SysExit":
+                        name = syscall_name(view.event.arg0)
+                        if pending_syscalls.get(view.event.tid) == name:
+                            keep.add(view.event.seq)
+                            pending_syscalls.pop(view.event.tid, None)
+                        continue
+                if parent_tid is not None and view.event.tid == parent_tid and view.label in {"WaitReap", "SignalSend", "SignalHandle"}:
+                    keep.add(view.event.seq)
+                    if view.label == "SignalHandle" and view.event.arg0 != "0x11":
+                        keep.discard(view.event.seq)
+            selected_views = [view for view in views if view.event.seq in keep]
+            collapsed: list[EventView] = []
+            previous_signature: tuple[str, str] | None = None
+            for view in selected_views:
+                if view.label in {"PollSleep", "PollWake"}:
+                    signature = (view.label, view.detail)
+                    if signature == previous_signature:
+                        continue
+                    previous_signature = signature
+                    collapsed.append(view)
+                    continue
+                previous_signature = None
+                collapsed.append(view)
+            selected_views = collapsed
+    if demo.name == "gui":
+        helper_tid: int | None = None
+        fb_fd: int | None = None
+        input_fds: set[int] = set()
+        mmap_exit_seq: int | None = None
+        page_fault_budget = 8
+        for view in reversed(selected_views):
+            if view.label == "WaitReap":
+                helper_tid = parse_usize(view.event.arg0)
+                break
+        if helper_tid is not None:
+            keep_syscalls = {"openat", "ioctl", "mmap", "read", "munmap", "close"}
+            keep_labels = {"PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep: set[int] = set()
+            pending_syscalls: dict[int, str] = {}
+            parent_tid = next(
+                (view.event.tid for view in views if view.label == "WaitReap" and parse_usize(view.event.arg0) == helper_tid),
+                None,
+            )
+            for view in views:
+                if view.event.tid == helper_tid:
+                    if (
+                        view.label == "SysExit"
+                        and syscall_name(view.event.arg0) == "openat"
+                        and parse_i64(view.event.arg1) >= 0
+                    ):
+                        fd = parse_i64(view.event.arg1)
+                        if fb_fd is None:
+                            fb_fd = fd
+                        else:
+                            input_fds.add(fd)
+                    if (
+                        view.label == "SysExit"
+                        and syscall_name(view.event.arg0) == "mmap"
+                        and parse_i64(view.event.arg1) > 0
+                        and mmap_exit_seq is None
+                    ):
+                        mmap_exit_seq = view.event.seq
+                    if view.label in keep_labels:
+                        if view.label == "PageFault":
+                            if mmap_exit_seq is None or view.event.seq <= mmap_exit_seq or page_fault_budget <= 0:
+                                continue
+                            page_fault_budget -= 1
+                        keep.add(view.event.seq)
+                        continue
+                    if view.label == "SysEnter":
+                        name = syscall_name(view.event.arg0)
+                        if name in keep_syscalls:
+                            fd_arg = parse_i64(view.event.arg1)
+                            if name in {"ioctl", "close"}:
+                                if fd_arg not in ({fb_fd} if fb_fd is not None else set()) | input_fds:
+                                    continue
+                            if name == "read" and fd_arg not in input_fds:
+                                continue
+                            keep.add(view.event.seq)
+                            pending_syscalls[view.event.tid] = name
+                        continue
+                    if view.label == "SysExit":
+                        name = syscall_name(view.event.arg0)
+                        if pending_syscalls.get(view.event.tid) == name:
+                            keep.add(view.event.seq)
+                            pending_syscalls.pop(view.event.tid, None)
+                        continue
+                if parent_tid is not None and view.event.tid == parent_tid and view.label in {"WaitReap", "SignalSend", "SignalHandle"}:
+                    keep.add(view.event.seq)
+                    if view.label == "SignalHandle" and view.event.arg0 != "0x11":
+                        keep.discard(view.event.seq)
+            selected_views = [view for view in views if view.event.seq in keep]
+            collapsed: list[EventView] = []
+            previous_signature: tuple[str, str] | None = None
+            for view in selected_views:
+                if view.label in {"PollSleep", "PollWake"}:
+                    signature = (view.label, view.detail)
+                    if signature == previous_signature:
+                        continue
+                    previous_signature = signature
+                    collapsed.append(view)
+                    continue
+                previous_signature = None
+                collapsed.append(view)
+            selected_views = collapsed
     if demo.name in {"ssh-poll", "ssh-select", "sshd"}:
         trimmed = []
         pending_io: dict[tuple[int, str], EventView] = {}
@@ -2421,6 +2603,160 @@ def start_http_peer() -> PeerController:
     return PeerController(thread=thread, results=results)
 
 
+def qmp_read_message(handle: "socket.SocketIO") -> dict[str, object]:
+    while True:
+        line = handle.readline()
+        if not line:
+            raise RuntimeError("qmp connection closed unexpectedly")
+        rendered = line.decode("utf-8", errors="replace").strip()
+        if not rendered:
+            continue
+        return json.loads(rendered)
+
+
+def qmp_execute(handle: "socket.SocketIO", execute: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {"execute": execute}
+    if arguments is not None:
+        payload["arguments"] = arguments
+    handle.write((json.dumps(payload) + "\r\n").encode("utf-8"))
+    handle.flush()
+    while True:
+        message = qmp_read_message(handle)
+        if "return" in message:
+            return message
+        if "error" in message:
+            raise RuntimeError(f"qmp {execute} failed: {message['error']}")
+
+
+def start_input_peer() -> PeerController:
+    results: "queue.Queue[PeerResult]" = queue.Queue()
+
+    def worker() -> None:
+        try:
+            wait_for_tcp_port("127.0.0.1", QMP_PORT, timeout=10.0)
+            time.sleep(1.0)
+            with socket.create_connection(("127.0.0.1", QMP_PORT), timeout=10) as sock:
+                handle = sock.makefile("rwb")
+                qmp_read_message(handle)
+                qmp_execute(handle, "qmp_capabilities")
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {
+                        "events": [
+                            {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
+                            {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
+                        ]
+                    },
+                )
+                time.sleep(0.1)
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {
+                        "events": [
+                            {"type": "rel", "data": {"axis": "x", "value": 12}},
+                            {"type": "rel", "data": {"axis": "y", "value": -7}},
+                        ]
+                    },
+                )
+                time.sleep(0.1)
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {"events": [{"type": "btn", "data": {"down": True, "button": "left"}}]},
+                )
+                time.sleep(0.05)
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {"events": [{"type": "btn", "data": {"down": False, "button": "left"}}]},
+                )
+            results.put(
+                PeerResult(
+                    notes=(
+                        "runner QMP peer injected keyboard `A` press/release, mouse relative move `(12,-7)`, and a left-button click.",
+                    )
+                )
+            )
+        except Exception as exc:
+            results.put(PeerResult(notes=(f"runner input peer error: {exc}",)))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return PeerController(thread=thread, results=results)
+
+
+def start_gui_peer() -> PeerController:
+    results: "queue.Queue[PeerResult]" = queue.Queue()
+
+    def worker() -> None:
+        try:
+            wait_for_tcp_port("127.0.0.1", QMP_PORT, timeout=10.0)
+            time.sleep(1.0)
+            with socket.create_connection(("127.0.0.1", QMP_PORT), timeout=10) as sock:
+                handle = sock.makefile("rwb")
+                qmp_read_message(handle)
+                qmp_execute(handle, "qmp_capabilities")
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {
+                        "events": [
+                            {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "d"}}},
+                            {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "d"}}},
+                        ]
+                    },
+                )
+                time.sleep(0.08)
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {
+                        "events": [
+                            {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "s"}}},
+                            {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "s"}}},
+                        ]
+                    },
+                )
+                time.sleep(0.08)
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {
+                        "events": [
+                            {"type": "rel", "data": {"axis": "x", "value": 14}},
+                            {"type": "rel", "data": {"axis": "y", "value": -9}},
+                        ]
+                    },
+                )
+                time.sleep(0.08)
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {"events": [{"type": "btn", "data": {"down": True, "button": "left"}}]},
+                )
+                time.sleep(0.04)
+                qmp_execute(
+                    handle,
+                    "input-send-event",
+                    {"events": [{"type": "btn", "data": {"down": False, "button": "left"}}]},
+                )
+            results.put(
+                PeerResult(
+                    notes=(
+                        "runner QMP peer injected keyboard `D`/`S`, mouse relative move `(14,-9)`, and a left-button click to drive the mini GUI.",
+                    )
+                )
+            )
+        except Exception as exc:
+            results.put(PeerResult(notes=(f"runner gui peer error: {exc}",)))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return PeerController(thread=thread, results=results)
+
+
 def start_shell_peer(port: int, label: str) -> PeerController:
     results: "queue.Queue[PeerResult]" = queue.Queue()
     script_lines = (r"printf${IFS}ssh-lab\\n", r"sleep${IFS}1&wait", "exit")
@@ -2648,6 +2984,10 @@ def start_demo_peer(demo: Demo) -> PeerController | None:
         return start_tcp_echo_peer()
     if demo.name == "http":
         return start_http_peer()
+    if demo.name == "ev":
+        return start_input_peer()
+    if demo.name == "gui":
+        return start_gui_peer()
     if demo.name == "ssh-poll":
         return start_shell_peer(SSH_POLL_PORT, "ssh-poll")
     if demo.name == "ssh-select":
@@ -2935,6 +3275,107 @@ def build_walkthrough(
             lines.append(
                 "the helper printed `fb-lab ... checksum=...`, which means the color bands, boxed center panel, and simple glyphs were all written through the mapped framebuffer."
             )
+        if helper_reap is not None:
+            lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
+        if task_exit is not None:
+            lines.append(f"the helper itself exited cleanly with {task_exit.detail}.")
+        return lines
+    if demo.name == "ev":
+        helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
+        helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
+        open_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "openat"
+        ]
+        ioctl_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"
+        ]
+        read_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "read"
+        ]
+        poll_events = [view for view in helper_views if view.label in {"PollSleep", "PollWake"}]
+        task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
+        transcript = artifact_outputs.get("demo-step-1.txt", "")
+        lines = [
+            "the helper opened the keyboard and mouse evdev nodes, queried their metadata, then blocked in poll() until the runner injected deterministic keyboard and mouse activity through QEMU.",
+        ]
+        if len(open_exits) >= 2:
+            lines.append(
+                f"the input nodes opened successfully through {open_exits[0].detail} and {open_exits[1].detail}."
+            )
+        if ioctl_exits:
+            lines.append(
+                f"device metadata flowed through {len(ioctl_exits)} successful ioctl call(s) before the event loop started."
+            )
+        if poll_events:
+            lines.append(
+                f"the helper's poll path slept {sum(1 for view in poll_events if view.label == 'PollSleep')} time(s) and woke {sum(1 for view in poll_events if view.label == 'PollWake')} time(s) as events arrived."
+            )
+        if read_exits:
+            lines.append(
+                f"event delivery then showed up as {len(read_exits)} successful read call(s) draining keyboard and mouse records."
+            )
+        if "ev-lab" in transcript:
+            lines.append(
+                "the helper printed `ev-lab ...`, confirming that EV_KEY for keyboard input and EV_REL plus button activity for the mouse were both observed from userspace."
+            )
+        lines.extend(peer_notes)
+        if helper_reap is not None:
+            lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
+        if task_exit is not None:
+            lines.append(f"the helper itself exited cleanly with {task_exit.detail}.")
+        return lines
+    if demo.name == "gui":
+        helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
+        helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
+        open_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "openat"
+        ]
+        ioctl_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"
+        ]
+        mmap_exit = next(
+            (view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "mmap"),
+            None,
+        )
+        read_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "read"
+        ]
+        poll_events = [view for view in helper_views if view.label in {"PollSleep", "PollWake"}]
+        page_faults = [view for view in helper_views if view.label == "PageFault"]
+        task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
+        transcript = artifact_outputs.get("demo-step-1.txt", "")
+        lines = [
+            "the helper opened `/dev/fb0` plus the keyboard and mouse evdev nodes, mapped the framebuffer, and then redrew a tiny full-screen scene while consuming injected input.",
+        ]
+        if len(open_exits) >= 3:
+            lines.append(
+                f"device bring-up opened the framebuffer and two input nodes through {open_exits[0].detail}, {open_exits[1].detail}, and {open_exits[2].detail}."
+            )
+        if ioctl_exits:
+            lines.append(
+                f"framebuffer and evdev metadata flowed through {len(ioctl_exits)} successful ioctl call(s) before the interaction loop."
+            )
+        if mmap_exit is not None:
+            lines.append(f"the framebuffer became writable through {mmap_exit.detail}.")
+        if page_faults:
+            lines.append(
+                f"the first redraws faulted framebuffer-backed pages into userspace ({len(page_faults)} visible page-fault event(s) kept in the teaching trace)."
+            )
+        if poll_events:
+            lines.append(
+                f"the combined input loop slept {sum(1 for view in poll_events if view.label == 'PollSleep')} time(s) and woke {sum(1 for view in poll_events if view.label == 'PollWake')} time(s) while waiting for keyboard and mouse events."
+            )
+        if read_exits:
+            lines.append(
+                f"input delivery then showed up as {len(read_exits)} successful read call(s) draining keyboard and mouse event records."
+            )
+        if "gui-lab" in transcript:
+            lines.append(
+                "the helper printed `gui-lab ...`, which means the box moved via keyboard input, the cursor moved via relative mouse input, and the left-button click flipped the box color before the final checksum was computed."
+            )
+        lines.extend(peer_notes)
         if helper_reap is not None:
             lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
         if task_exit is not None:
