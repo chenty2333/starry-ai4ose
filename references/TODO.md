@@ -107,6 +107,17 @@ The TCP stream demo is clean enough to teach, and the next SSH-oriented backlog 
 Exit condition:
 `make lab-sshd` produces one real SSH login trace and `make lab-repeat-sshd` can compare repeated runs meaningfully.
 
+## M9: SSH Teaching Trace Refinement
+
+- [x] Split the real SSH demo into phase-focused trace windows for connect, pty bootstrap, and interactive shell work.
+- [x] Add phase-specific `summary.txt` and `key_trace.txt` artifacts under the SSH demo output.
+- [x] Rewrite the top-level SSH summary as a teaching walkthrough over `accept -> pty -> setsid -> TIOCSCTTY/TIOCSPGRP -> SIGCHLD -> wait4 -> close`.
+- [x] Tighten the interactive SSH workload so `wait4` reaps a clean `status=0` child and `demo-step-1.txt` stays readable.
+- [x] Re-check repeatability for the refined SSH teaching path.
+
+Exit condition:
+`make lab-sshd` produces clean phase artifacts that explain the SSH path without raw-trace spelunking, and `make lab-repeat-sshd` still matches exactly.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

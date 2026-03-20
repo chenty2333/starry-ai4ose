@@ -54,7 +54,21 @@ DROPBEAR_LOG_GUEST = "/tmp/lab_dropbear.log"
 DROPBEARKEY_LOG_GUEST = "/tmp/lab_dropbearkey.log"
 DROPBEAR_HOSTKEY_GUEST = "/root/dropbear_ed25519_host_key"
 AUTHORIZED_KEYS_GUEST = "/root/.ssh/authorized_keys"
-SSHD_INPUT_LINES: tuple[str, ...] = ("PS1=", "export PS1", r"printf${IFS}sshd-lab\\n", r"sleep${IFS}1&wait", "exit")
+SSHD_PHASE1_TOKEN = "__LAB_SSH_PHASE1_CONNECTED__"
+SSHD_PHASE2_TOKEN = "__LAB_SSH_PHASE2_PTY__"
+SSHD_PHASE3_TOKEN = "sshd-lab"
+SSHD_PHASE2_LINES: tuple[str, ...] = (
+    "PS1=",
+    "export PS1",
+    f"printf '{SSHD_PHASE2_TOKEN}\\n'",
+    "exit",
+)
+SSHD_PHASE3_LINES: tuple[str, ...] = (
+    "PS1=",
+    "export PS1",
+    f"sh -c 'sleep 1 & wait $!; printf \"{SSHD_PHASE3_TOKEN}\\\\n\"'",
+    "exit",
+)
 
 TTY_CTL_NAMES: dict[int, str] = {
     1: "TIOCSCTTY",
@@ -140,12 +154,29 @@ class RunResult:
     input_stream: tuple[str, ...]
     net: str
     peer_notes: tuple[str, ...]
+    phase_results: tuple["PhaseResult", ...] = ()
+
+
+@dataclass(frozen=True)
+class PhaseResult:
+    name: str
+    title: str
+    out_dir: pathlib.Path
+    events: list[TraceEvent]
+    event_views: list[EventView]
+    key_events: list[TraceEvent]
+    key_views: list[EventView]
+    stats_text: str
+    last_fault_text: str
+    input_stream: tuple[str, ...]
+    walkthrough: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class PeerResult:
     notes: tuple[str, ...]
     transcript: str = ""
+    returncode: int = 0
 
 
 @dataclass(frozen=True)
@@ -719,10 +750,16 @@ def normalize_demo_output(demo: Demo, text: str) -> str:
         "echo ssh-lab",
         "PS1=",
         "export PS1",
+        f"printf '{SSHD_PHASE2_TOKEN}\\n'",
         r"printf${IFS}sshd-lab\\n",
         r"printf${IFS}ssh-lab\\n",
+        f"sh -c 'sleep 1 & wait $!; printf \"{SSHD_PHASE3_TOKEN}\\\\n\"'",
         "sleep 1 & wait",
         r"sleep${IFS}1&wait",
+        "sleep 1 &",
+        r"sleep${IFS}1&",
+        "wait $!",
+        r"wait${IFS}$!",
         "exit",
         "Connection to 127.0.0.1 closed.",
         "Welcome to Alpine!",
@@ -1194,6 +1231,271 @@ def render_key_trace(path: pathlib.Path, demo: Demo, views: list[EventView]) -> 
     return selected
 
 
+def select_sshd_phase_views(phase_name: str, views: list[EventView]) -> list[EventView]:
+    if phase_name == "phase-1-connect":
+        focus_syscalls = {"accept", "accept4", "close", "read", "write"}
+        network_tids: set[int] = set()
+        for view in views:
+            if view.label != "SysEnter":
+                continue
+            name = syscall_name(view.event.arg0)
+            if name in {"accept", "accept4"}:
+                network_tids.add(view.event.tid)
+        keep: set[int] = set()
+        pending_syscalls: dict[int, str] = {}
+        for view in views:
+            if network_tids and view.event.tid not in network_tids and view.label in {"SysEnter", "SysExit", "PollSleep", "PollWake", "TaskExit"}:
+                continue
+            if view.label == "SysEnter":
+                name = syscall_name(view.event.arg0)
+                if name in focus_syscalls:
+                    if name == "close" and parse_usize(view.event.arg0) >= (1 << 63):
+                        continue
+                    if name in {"read", "write"} and parse_i64(view.event.arg1) in {0, 1, 2}:
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls[view.event.tid] = name
+                continue
+            if view.label == "SysExit":
+                name = syscall_name(view.event.arg0)
+                if pending_syscalls.get(view.event.tid) == name:
+                    if name == "close" and parse_i64(view.event.arg1) == -9:
+                        pending_syscalls.pop(view.event.tid, None)
+                        continue
+                    if name in {"read", "write"} and abs(parse_i64(view.event.arg1)) == 1:
+                        pending_syscalls.pop(view.event.tid, None)
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls.pop(view.event.tid, None)
+                continue
+            if view.label in {"PollSleep", "PollWake", "TaskExit"}:
+                keep.add(view.event.seq)
+        return [
+            view
+            for view in views
+            if view.event.seq in keep and "18446744073709551615" not in view.detail
+        ]
+
+    if phase_name == "phase-2-pty":
+        keep_labels = {"PtyOpen", "SessionCreate", "TtyCtl", "ProcessGroupSet", "TaskExit"}
+        return [view for view in views if view.label in keep_labels]
+
+    if phase_name == "phase-3-shell":
+        keep_labels = {"ProcessGroupSet", "WaitReap", "SignalSend", "SignalHandle", "PollSleep", "PollWake", "TaskExit"}
+        focus_syscalls = {"read", "write", "wait4", "close"}
+        keep: set[int] = {view.event.seq for view in views if view.label in keep_labels}
+        pending_syscalls: dict[int, str] = {}
+        for view in views:
+            if view.label == "SysEnter":
+                name = syscall_name(view.event.arg0)
+                if name in focus_syscalls:
+                    if name in {"read", "write"} and parse_i64(view.event.arg1) in {0, 1, 2}:
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls[view.event.tid] = name
+                continue
+            if view.label == "SysExit":
+                name = syscall_name(view.event.arg0)
+                if pending_syscalls.get(view.event.tid) == name:
+                    if name in {"read", "write"} and abs(parse_i64(view.event.arg1)) == 1:
+                        pending_syscalls.pop(view.event.tid, None)
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls.pop(view.event.tid, None)
+        selected = [view for view in views if view.event.seq in keep]
+        collapsed: list[EventView] = []
+        burst_signatures: set[tuple[int, str, str]] = set()
+        for view in selected:
+            if view.label in {"PollSleep", "PollWake"}:
+                signature = (view.event.tid, view.label, view.detail)
+                if signature in burst_signatures:
+                    continue
+                burst_signatures.add(signature)
+                collapsed.append(view)
+                continue
+            burst_signatures.clear()
+            collapsed.append(view)
+        return collapsed
+
+    return views
+
+
+def render_event_table(views: list[EventView]) -> str:
+    rows = [
+        (str(view.event.seq), str(view.event.tid), view.label, view.detail)
+        for view in views
+    ]
+    return render_aligned_table(
+        ("seq", "tid", "event", "detail"),
+        rows,
+        aligns=(">", ">", "<", "<"),
+    )
+
+
+def build_sshd_phase_walkthrough(
+    phase_name: str,
+    key_views: list[EventView],
+    transcript: str,
+) -> tuple[str, ...]:
+    counts = collections.Counter(view.label for view in key_views)
+    if phase_name == "phase-1-connect":
+        accept_exit = next(
+            (
+                view
+                for view in key_views
+                if view.label == "SysExit" and syscall_name(view.event.arg0) in {"accept", "accept4"}
+            ),
+            None,
+        )
+        lines = [
+            "this phase isolates the network half of SSH bring-up: server socket setup, accept, and the first authenticated session handoff.",
+        ]
+        if accept_exit is not None:
+            lines.append(f"the server-side accept path completed as {accept_exit.detail}.")
+        if transcript.strip():
+            lines.append("the host-side remote command returned a success marker, which confirms the SSH transport and authentication path succeeded.")
+        return tuple(lines)
+
+    if phase_name == "phase-2-pty":
+        pty_open = next((view for view in key_views if view.label == "PtyOpen"), None)
+        session_create = next((view for view in key_views if view.label == "SessionCreate"), None)
+        tty_ctls = [view for view in key_views if view.label == "TtyCtl"]
+        pg_set = next((view for view in key_views if view.label == "ProcessGroupSet"), None)
+        lines = [
+            "this phase isolates the interactive shell bootstrap: pty allocation, new session creation, and controlling-terminal setup.",
+        ]
+        if pty_open is not None:
+            lines.append(f"dropbear allocated the terminal side via {pty_open.detail}.")
+        if session_create is not None:
+            lines.append(f"the login shell created a new session with {session_create.detail}.")
+        if tty_ctls:
+            rendered = ", ".join(view.detail for view in tty_ctls[:3])
+            lines.append(f"tty job-control setup flowed through {rendered}.")
+        if pg_set is not None:
+            lines.append(f"the foreground/background group path was visible as {pg_set.detail}.")
+        return tuple(lines)
+
+    if phase_name == "phase-3-shell":
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        task_exit = next((view for view in key_views if view.label == "TaskExit"), None)
+        lines = [
+            "this phase isolates the interactive shell workload: a background `sleep`, SIGCHLD delivery, `wait4` reaping, and session teardown.",
+        ]
+        if counts["SignalSend"] or counts["SignalHandle"]:
+            lines.append(
+                f"signal flow stayed visible with send={counts['SignalSend']} and handle={counts['SignalHandle']} event(s)."
+            )
+        if wait_reap is not None:
+            lines.append(f"the shell-side wait path completed through {wait_reap.detail}.")
+        if transcript.strip():
+            lines.append("the remote transcript printed `sshd-lab`, so the interactive command stream crossed ssh socket -> pty -> shell -> pty -> ssh socket end to end.")
+        if task_exit is not None:
+            lines.append(f"the phase closed with {task_exit.detail}.")
+        return tuple(lines)
+
+    return ()
+
+
+def create_phase_summary(
+    path: pathlib.Path,
+    title: str,
+    input_stream: tuple[str, ...],
+    events: list[TraceEvent],
+    key_views: list[EventView],
+    stats_text: str,
+    walkthrough: tuple[str, ...],
+) -> None:
+    counts = collections.Counter(event.kind for event in events)
+    stats = parse_tab_values(stats_text)
+    lines = [
+        f"title: {title}",
+        f"trace_events: {len(events)}",
+        "",
+        "input stream:",
+    ]
+    lines.extend(f"- {cmd}" for cmd in input_stream)
+    lines.append("")
+    lines.append("walkthrough:")
+    lines.extend(f"- {line}" for line in walkthrough or ("none",))
+    lines.append("")
+    lines.append("trace buffer:")
+    for key in ("enabled", "emitted", "overwritten", "buffered"):
+        if key in stats:
+            lines.append(f"- {key}: {stats[key]}")
+    lines.append("")
+    lines.append("key trace preview:")
+    if key_views:
+        for view in key_views[:8]:
+            lines.append(f"- seq={view.event.seq} tid={view.event.tid} {view.label}: {view.detail}")
+    else:
+        lines.append("- none")
+    lines.append("")
+    lines.append("event counts:")
+    for kind, count in sorted(counts.items()):
+        lines.append(f"- {kind}: {count}")
+    write_text(path, "\n".join(lines) + "\n")
+
+
+def render_sshd_phase_artifacts(
+    phase_dir: pathlib.Path,
+    phase_name: str,
+    title: str,
+    events: list[TraceEvent],
+    stats_text: str,
+    last_fault_text: str,
+    input_stream: tuple[str, ...],
+    transcript: str,
+    raw: bool,
+) -> PhaseResult:
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    event_views = build_event_views(events)
+    key_views = select_sshd_phase_views(phase_name, event_views)
+    write_text(phase_dir / "key_trace.txt", render_event_table(key_views))
+    walkthrough = build_sshd_phase_walkthrough(phase_name, key_views, transcript)
+    create_phase_summary(
+        phase_dir / "summary.txt",
+        title,
+        input_stream,
+        events,
+        key_views,
+        stats_text,
+        walkthrough,
+    )
+    if raw:
+        trace_lines = [
+            f"{event.seq}\t{event.time_ns}\t{event.tid}\t{event.kind}\t{event.arg0}\t{event.arg1}"
+            for event in events
+        ]
+        write_text(phase_dir / "starry_trace.txt", "\n".join(trace_lines) + ("\n" if trace_lines else ""))
+        write_text(phase_dir / "starry_stats.txt", stats_text)
+        write_text(phase_dir / "starry_last_fault.txt", last_fault_text)
+    return PhaseResult(
+        name=phase_name,
+        title=title,
+        out_dir=phase_dir,
+        events=events,
+        event_views=event_views,
+        key_events=[view.event for view in key_views],
+        key_views=key_views,
+        stats_text=stats_text,
+        last_fault_text=last_fault_text,
+        input_stream=input_stream,
+        walkthrough=walkthrough,
+    )
+
+
+def render_sshd_key_trace(path: pathlib.Path, phase_results: tuple[PhaseResult, ...]) -> list[EventView]:
+    sections: list[str] = []
+    combined: list[EventView] = []
+    for phase in phase_results:
+        sections.append(f"== {phase.name}: {phase.title} ==")
+        sections.append(render_event_table(phase.key_views))
+        sections.append("")
+        combined.extend(phase.key_views)
+    write_text(path, "\n".join(section for section in sections if section is not None).rstrip() + "\n")
+    return combined
+
+
 def normalize_events(events: list[TraceEvent]) -> list[str]:
     tid_map: dict[int, str] = {}
     lines: list[str] = []
@@ -1423,10 +1725,9 @@ def sshd_setup_commands(public_key: str) -> tuple[str, ...]:
     )
 
 
-def run_host_ssh_demo(private_key: pathlib.Path, timeout: float) -> PeerResult:
-    command = [
+def ssh_common_command(private_key: pathlib.Path) -> list[str]:
+    return [
         "ssh",
-        "-tt",
         "-p",
         str(SSHD_PORT),
         "-i",
@@ -1445,8 +1746,44 @@ def run_host_ssh_demo(private_key: pathlib.Path, timeout: float) -> PeerResult:
         "PreferredAuthentications=publickey",
         "-o",
         "ConnectTimeout=10",
-        "root@127.0.0.1",
     ]
+
+
+def run_host_ssh_command(
+    private_key: pathlib.Path,
+    remote_command: str,
+    timeout: float,
+    success_token: str,
+) -> PeerResult:
+    command = ssh_common_command(private_key) + ["root@127.0.0.1", remote_command]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    rendered = clean_remote_shell_transcript((completed.stdout or "") + (completed.stderr or ""))
+    if completed.returncode != 0 and success_token not in rendered:
+        detail = rendered or f"ssh exited with status {completed.returncode}"
+        raise RuntimeError(f"host ssh command failed: {detail}")
+    notes = [
+        "host OpenSSH authenticated with a temporary ed25519 key over the forwarded SSH port.",
+        f"the host-side command transcript captured {len([line for line in rendered.splitlines() if line.strip()])} non-empty line(s).",
+    ]
+    if completed.returncode != 0:
+        notes.append(
+            f"the host ssh client exited with status {completed.returncode} after the remote command transcript completed."
+        )
+    return PeerResult(notes=tuple(notes), transcript=rendered, returncode=completed.returncode)
+
+
+def run_host_ssh_demo(
+    private_key: pathlib.Path,
+    timeout: float,
+    input_lines: tuple[str, ...],
+    success_token: str,
+) -> PeerResult:
+    command = ssh_common_command(private_key) + ["-tt", "root@127.0.0.1"]
     master_fd, slave_fd = os.openpty()
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -1461,7 +1798,7 @@ def run_host_ssh_demo(private_key: pathlib.Path, timeout: float) -> PeerResult:
     os.close(slave_fd)
 
     transcript = bytearray()
-    lines = [line + "\r" for line in SSHD_INPUT_LINES]
+    lines = [line + "\r" for line in input_lines]
     line_index = 0
     char_index = 0
     next_send_at = time.monotonic() + 1.0
@@ -1509,11 +1846,19 @@ def run_host_ssh_demo(private_key: pathlib.Path, timeout: float) -> PeerResult:
             proc.terminate()
             raise TimeoutError("host ssh demo timed out")
     finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
         os.close(master_fd)
 
-    proc.wait(timeout=1)
+    if proc.poll() is None:
+        proc.wait(timeout=1)
     rendered = clean_remote_shell_transcript(transcript.decode("utf-8", errors="ignore"))
-    if proc.returncode != 0 and "sshd-lab" not in rendered:
+    if proc.returncode != 0 and success_token not in rendered:
         detail = rendered or f"ssh exited with status {proc.returncode}"
         raise RuntimeError(f"host ssh login failed: {detail}")
     notes = [
@@ -1522,7 +1867,7 @@ def run_host_ssh_demo(private_key: pathlib.Path, timeout: float) -> PeerResult:
     ]
     if proc.returncode != 0:
         notes.append(f"the host ssh client exited with status {proc.returncode} after the remote transcript completed.")
-    return PeerResult(notes=tuple(notes), transcript=rendered)
+    return PeerResult(notes=tuple(notes), transcript=rendered, returncode=proc.returncode)
 
 
 def start_demo_peer(demo: Demo) -> PeerController | None:
@@ -1591,6 +1936,7 @@ def build_walkthrough(
     key_views: list[EventView],
     artifact_outputs: dict[str, str],
     peer_notes: tuple[str, ...],
+    phase_results: tuple[PhaseResult, ...] = (),
 ) -> list[str]:
     counts = collections.Counter(view.label for view in key_views)
     task_exits = [view for view in key_views if view.label == "TaskExit"]
@@ -1781,27 +2127,22 @@ def build_walkthrough(
         lines.extend(peer_notes)
         return lines
     if demo.name == "sshd":
-        pty_open = next((view for view in key_views if view.label == "PtyOpen"), None)
-        session_create = next((view for view in key_views if view.label == "SessionCreate"), None)
-        tty_ctls = [view for view in key_views if view.label == "TtyCtl"]
-        pg_set = next((view for view in key_views if view.label == "ProcessGroupSet"), None)
-        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
-        task_exit = next((view for view in key_views if view.label == "TaskExit"), None)
         transcript = artifact_outputs.get("demo-step-1.txt", "").strip()
+        phase_map = {phase.name: phase for phase in phase_results}
+        connect_phase = phase_map.get("phase-1-connect")
+        pty_phase = phase_map.get("phase-2-pty")
+        shell_phase = phase_map.get("phase-3-shell")
         lines: list[str] = [
-            f"the guest ran a real Dropbear SSH server on port {SSHD_PORT}, and the host OpenSSH client logged in over QEMU user-net forwarding.",
+            f"the guest ran a real Dropbear SSH server on port {SSHD_PORT}, and the host OpenSSH client logged in over QEMU user-net forwarding through three focused trace windows.",
         ]
-        if pty_open is not None:
-            lines.append(f"dropbear allocated the session pty via {pty_open.detail}.")
-        if session_create is not None:
-            lines.append(f"the login shell created a new session with {session_create.detail}.")
-        if tty_ctls:
-            rendered = ", ".join(view.detail for view in tty_ctls[:3])
-            lines.append(f"controlling-tty setup flowed through {rendered}.")
-        if pg_set is not None:
-            lines.append(f"job-control setup included {pg_set.detail}.")
-        if wait_reap is not None:
-            lines.append(f"the explicit `sleep 1 & wait` path finished through {wait_reap.detail}.")
+        if connect_phase is not None:
+            lines.append("phase 1 isolated socket accept/authentication, so the network half of SSH is visible without later pty noise.")
+        if pty_phase is not None:
+            lines.append("phase 2 isolated pty/session/job-control bootstrap, so the shell login path reads like a standalone terminal bring-up.")
+            lines.extend(f"(phase 2) {line}" for line in pty_phase.walkthrough[:3])
+        if shell_phase is not None:
+            lines.append("phase 3 isolated the interactive shell workload, including the background child, SIGCHLD, wait4, and session teardown.")
+            lines.extend(f"(phase 3) {line}" for line in shell_phase.walkthrough[:4])
         if transcript:
             lines.append(
                 "the real SSH transcript printed `sshd-lab`, which confirms the path guest sshd -> pty -> shell -> pty -> encrypted socket -> host ssh client end to end."
@@ -1810,8 +2151,6 @@ def build_walkthrough(
             lines.append(
                 f"the combined socket/tty path slept {counts['PollSleep']} time(s) and woke {counts['PollWake']} time(s)."
             )
-        if task_exit is not None:
-            lines.append(f"the session closed out with {task_exit.detail}.")
         lines.extend(peer_notes)
         return lines
     return [view.detail for view in key_views[:5]]
@@ -1829,12 +2168,13 @@ def create_summary(
     input_stream: tuple[str, ...],
     artifact_outputs: dict[str, str],
     peer_notes: tuple[str, ...],
+    phase_results: tuple[PhaseResult, ...] = (),
 ) -> None:
     counts = collections.Counter(event.kind for event in events)
     present = [kind for kind in demo.expected_events if counts[kind] > 0]
     missing = [kind for kind in demo.expected_events if counts[kind] == 0]
     stats = parse_tab_values(stats_text)
-    walkthrough = build_walkthrough(demo, event_views, key_views, artifact_outputs, peer_notes)
+    walkthrough = build_walkthrough(demo, event_views, key_views, artifact_outputs, peer_notes, phase_results)
     syscall_summary = summarize_syscalls(events)
     signal_summary = summarize_signals(events)
     focus_page_fault = None
@@ -1935,6 +2275,13 @@ def create_summary(
         lines.append("")
         lines.append("runner observations:")
         lines.extend(f"- {line}" for line in peer_notes)
+    if phase_results:
+        lines.append("")
+        lines.append("ssh phases:")
+        for phase in phase_results:
+            lines.append(f"- {phase.name}: {phase.title}")
+            for line in phase.walkthrough[:3]:
+                lines.append(f"  {line}")
     lines.append("")
     lines.append("key trace preview:")
     if key_views:
@@ -1953,6 +2300,14 @@ def create_summary(
     for child in sorted(artifact_dir.iterdir()):
         lines.append(f"- {child.name}")
     write_text(path, "\n".join(lines) + "\n")
+
+
+def collect_trace_artifacts(session: "Session", command_timeout: float) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    for name, command in ARTIFACT_COMMANDS:
+        output = session.run_command(command, command_timeout)
+        outputs[name] = clean_capture(output, command)
+    return outputs
 
 
 def parse_args() -> argparse.Namespace:
@@ -1983,6 +2338,7 @@ def execute_run(
         session = Session(sock)
         session.wait_for_prompt(boot_timeout)
         input_stream: list[str] = []
+        phase_results: tuple[PhaseResult, ...] = ()
         for command in demo.setup_commands:
             input_stream.append(command)
             session.run_command(command, command_timeout)
@@ -1994,15 +2350,77 @@ def execute_run(
                 input_stream.append(command)
                 session.run_command(command, command_timeout)
             wait_for_tcp_port("127.0.0.1", SSHD_PORT, timeout=min(command_timeout, 10.0))
-            input_stream.append("echo 1 > /proc/starry/reset")
-            session.run_command(input_stream[-1], command_timeout)
-            host_command = (
-                f"HOST:ssh -tt -p {SSHD_PORT} -i {private_key} "
-                "root@127.0.0.1"
+            ssh_phase_specs = (
+                (
+                    "phase-1-connect",
+                    "SSH accept/connect",
+                    ("echo 1 > /proc/starry/reset",),
+                    f"HOST:ssh -p {SSHD_PORT} -i {private_key} root@127.0.0.1 printf '{SSHD_PHASE1_TOKEN}\\n'",
+                    "echo 1 > /proc/starry/off",
+                    lambda: run_host_ssh_command(
+                        private_key,
+                        f"printf '{SSHD_PHASE1_TOKEN}\\n'",
+                        command_timeout,
+                        SSHD_PHASE1_TOKEN,
+                    ),
+                ),
+                (
+                    "phase-2-pty",
+                    "SSH pty/session/job-control bootstrap",
+                    ("echo 1 > /proc/starry/reset",),
+                    f"HOST:ssh -tt -p {SSHD_PORT} -i {private_key} root@127.0.0.1 [phase-2]",
+                    "echo 1 > /proc/starry/off",
+                    lambda: run_host_ssh_demo(
+                        private_key,
+                        command_timeout,
+                        SSHD_PHASE2_LINES,
+                        SSHD_PHASE2_TOKEN,
+                    ),
+                ),
+                (
+                    "phase-3-shell",
+                    "SSH interactive shell + wait4",
+                    ("echo 1 > /proc/starry/reset",),
+                    f"HOST:ssh -tt -p {SSHD_PORT} -i {private_key} root@127.0.0.1 [phase-3]",
+                    "echo 1 > /proc/starry/off",
+                    lambda: run_host_ssh_demo(
+                        private_key,
+                        command_timeout,
+                        SSHD_PHASE3_LINES,
+                        SSHD_PHASE3_TOKEN,
+                    ),
+                ),
             )
-            input_stream.append(host_command)
+            phase_results_list: list[PhaseResult] = []
+            ssh_peer_notes: list[str] = []
+            phase3_peer_result: PeerResult | None = None
             try:
-                peer_result = run_host_ssh_demo(private_key, command_timeout)
+                for phase_name, phase_title, phase_start, host_command, phase_end, runner in ssh_phase_specs:
+                    for command in phase_start:
+                        input_stream.append(f"{command} [{phase_name}]")
+                        session.run_command(command, command_timeout)
+                    input_stream.append(host_command)
+                    phase_peer_result = runner()
+                    for note in phase_peer_result.notes:
+                        ssh_peer_notes.append(f"{phase_name}: {note}")
+                    input_stream.append(f"{phase_end} [{phase_name}]")
+                    session.run_command(phase_end, command_timeout)
+                    phase_outputs = collect_trace_artifacts(session, command_timeout)
+                    phase_events = parse_trace(phase_outputs["starry_trace.txt"])
+                    phase_result = render_sshd_phase_artifacts(
+                        out_dir / phase_name,
+                        phase_name,
+                        phase_title,
+                        phase_events,
+                        phase_outputs["starry_stats.txt"],
+                        phase_outputs["starry_last_fault.txt"],
+                        (host_command,),
+                        phase_peer_result.transcript,
+                        raw,
+                    )
+                    phase_results_list.append(phase_result)
+                    if phase_name == "phase-3-shell":
+                        phase3_peer_result = phase_peer_result
             except Exception as exc:
                 auth_keys = clean_capture(
                     session.run_command(f"cat {AUTHORIZED_KEYS_GUEST} 2>/dev/null || true", command_timeout),
@@ -2031,8 +2449,12 @@ def execute_run(
                         f"guest dropbear log:\n{dropbear_log}"
                     ) from exc
                 raise
-            peer_notes = peer_result.notes
-            cleaned_output = normalize_demo_output(demo, peer_result.transcript)
+            phase_results = tuple(phase_results_list)
+            peer_notes = tuple(ssh_peer_notes)
+            cleaned_output = normalize_demo_output(
+                demo,
+                "" if phase3_peer_result is None else phase3_peer_result.transcript,
+            )
             step_path = out_dir / "demo-step-1.txt"
             write_text(step_path, cleaned_output)
             demo_outputs.append((step_path, cleaned_output))
@@ -2065,17 +2487,44 @@ def execute_run(
                     write_text(step_path, "\n".join(fallback) + "\n")
                     break
 
-        input_stream.append("echo 1 > /proc/starry/off")
-        session.run_command(input_stream[-1], command_timeout)
-
         artifact_outputs: dict[str, str] = {
             path.name: path.read_text(encoding="utf-8") for path, _cleaned in demo_outputs
         }
-        for name, command in ARTIFACT_COMMANDS:
-            output = session.run_command(command, command_timeout)
-            artifact_outputs[name] = clean_capture(output, command)
-            if raw:
-                write_text(out_dir / name, artifact_outputs[name])
+        if demo.name == "sshd":
+            total_emitted = 0
+            total_overwritten = 0
+            total_buffered = 0
+            for phase in phase_results:
+                stats = parse_tab_values(phase.stats_text)
+                total_emitted += int(stats.get("emitted", "0"))
+                total_overwritten += int(stats.get("overwritten", "0"))
+                total_buffered += int(stats.get("buffered", "0"))
+            stats_text = (
+                f"enabled\t0\nemitted\t{total_emitted}\noverwritten\t{total_overwritten}\n"
+                f"buffered\t{total_buffered}\n"
+            )
+            last_fault_text = phase_results[-1].last_fault_text if phase_results else "none\n"
+            events = [event for phase in phase_results for event in phase.events]
+            event_views = [view for phase in phase_results for view in phase.event_views]
+            key_views = render_sshd_key_trace(out_dir / "key_trace.txt", phase_results)
+            key_events = [view.event for view in key_views]
+            artifact_outputs["starry_stats.txt"] = stats_text
+            artifact_outputs["starry_last_fault.txt"] = last_fault_text
+        else:
+            input_stream.append("echo 1 > /proc/starry/off")
+            session.run_command(input_stream[-1], command_timeout)
+            for name, command in ARTIFACT_COMMANDS:
+                output = session.run_command(command, command_timeout)
+                artifact_outputs[name] = clean_capture(output, command)
+                if raw:
+                    write_text(out_dir / name, artifact_outputs[name])
+            trace_text = artifact_outputs["starry_trace.txt"]
+            stats_text = artifact_outputs["starry_stats.txt"]
+            last_fault_text = artifact_outputs["starry_last_fault.txt"]
+            events = parse_trace(trace_text)
+            event_views = build_event_views(events)
+            key_views = render_key_trace(out_dir / "key_trace.txt", demo, event_views)
+            key_events = [view.event for view in key_views]
         if raw and demo.name == "sshd":
             for filename, guest_path in (
                 ("lab_dropbear.log", DROPBEAR_LOG_GUEST),
@@ -2086,13 +2535,6 @@ def execute_run(
                 artifact_outputs[filename] = clean_capture(output, command)
                 write_text(out_dir / filename, artifact_outputs[filename])
 
-        trace_text = artifact_outputs["starry_trace.txt"]
-        stats_text = artifact_outputs["starry_stats.txt"]
-        last_fault_text = artifact_outputs["starry_last_fault.txt"]
-        events = parse_trace(trace_text)
-        event_views = build_event_views(events)
-        key_views = render_key_trace(out_dir / "key_trace.txt", demo, event_views)
-        key_events = [view.event for view in key_views]
         if raw:
             write_text(out_dir / "session.log", session.log)
         create_summary(
@@ -2107,6 +2549,7 @@ def execute_run(
             tuple(input_stream),
             artifact_outputs,
             peer_notes,
+            phase_results,
         )
 
         sock.sendall(b"exit\r\n")
@@ -2121,6 +2564,7 @@ def execute_run(
             input_stream=tuple(input_stream),
             net=demo.net,
             peer_notes=peer_notes,
+            phase_results=phase_results,
         )
     finally:
         try:
