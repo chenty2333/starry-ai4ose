@@ -6,6 +6,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
     AsThread, TimerState, check_signals, raise_signal_fatal, set_timer_state, unblock_next_signal,
+    wait_if_stopped,
 };
 use crate::{lab, syscall::handle_syscall};
 
@@ -23,6 +24,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
 
             let thr = curr.as_thread();
             while !thr.pending_exit() {
+                wait_if_stopped(thr, &mut uctx);
+                if thr.pending_exit() {
+                    break;
+                }
+
                 let reason = uctx.run();
 
                 set_timer_state(&curr, TimerState::Kernel);

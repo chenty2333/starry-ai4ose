@@ -15,7 +15,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     lab::{self, EventKind},
-    task::AsThread,
+    task::{AsThread, get_process_data},
 };
 
 bitflags! {
@@ -65,9 +65,6 @@ impl WaitPid {
 
 pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
     let options = WaitOptions::from_bits(options).ok_or(AxError::InvalidInput)?;
-    if options.intersects(WaitOptions::WUNTRACED | WaitOptions::WCONTINUED) {
-        return Err(AxError::InvalidInput);
-    }
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
     let curr = current();
@@ -109,10 +106,42 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
                 child.free();
             }
             Ok(Some(child.pid() as _))
-        } else if options.contains(WaitOptions::WNOHANG) {
-            Ok(Some(0))
         } else {
-            Ok(None)
+            for child in &children {
+                let Ok(child_data) = get_process_data(child.pid()) else {
+                    continue;
+                };
+                if options.contains(WaitOptions::WUNTRACED)
+                    && let Some(status) =
+                        child_data.take_wait_stop(!options.contains(WaitOptions::WNOWAIT))
+                {
+                    if let Some(exit_code) = exit_code.nullable() {
+                        exit_code.vm_write(status)?;
+                    }
+                    lab::emit(EventKind::WaitStop, child.pid() as usize, status as usize);
+                    return Ok(Some(child.pid() as _));
+                }
+                if options.contains(WaitOptions::WCONTINUED)
+                    && let Some(status) =
+                        child_data.take_wait_continue(!options.contains(WaitOptions::WNOWAIT))
+                {
+                    if let Some(exit_code) = exit_code.nullable() {
+                        exit_code.vm_write(status)?;
+                    }
+                    lab::emit(
+                        EventKind::WaitContinue,
+                        child.pid() as usize,
+                        status as usize,
+                    );
+                    return Ok(Some(child.pid() as _));
+                }
+            }
+
+            if options.contains(WaitOptions::WNOHANG) {
+                Ok(Some(0))
+            } else {
+                Ok(None)
+            }
         }
     };
 

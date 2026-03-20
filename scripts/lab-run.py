@@ -42,7 +42,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKING_DISK_IMG = REPO_ROOT / "make" / "disk.img"
 LAB_BIN_DIR = REPO_ROOT / ".lab-bin"
 PTY_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "pty_relay.c"
+WAITCTL_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "waitctl.c"
 PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
+WAITCTL_HELPER_GUEST = "/usr/bin/lab_waitctl"
 DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
@@ -100,6 +102,11 @@ PTY_SCRIPT_LINES: tuple[str, ...] = (
     f"{PTY_HELPER_GUEST} -n /bin/sh -c 'echo pty-lab'",
 )
 
+JOBCTL_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    f"{PTY_HELPER_GUEST} -j /bin/sh -i",
+)
+
 SSH_POLL_SCRIPT_LINES: tuple[str, ...] = (
     "#!/bin/sh",
     f"{PTY_HELPER_GUEST} -t {RUNNER_HOST}:{SSH_POLL_PORT} /bin/sh",
@@ -108,6 +115,11 @@ SSH_POLL_SCRIPT_LINES: tuple[str, ...] = (
 SSH_SELECT_SCRIPT_LINES: tuple[str, ...] = (
     "#!/bin/sh",
     f"{PTY_HELPER_GUEST} -s -t {RUNNER_HOST}:{SSH_SELECT_PORT} /bin/sh",
+)
+
+WAITCTL_SCRIPT_LINES: tuple[str, ...] = (
+    "#!/bin/sh",
+    f"{WAITCTL_HELPER_GUEST}",
 )
 
 
@@ -210,10 +222,12 @@ UDP_SETUP_COMMANDS = build_script_setup("/tmp/lab_udp_demo.sh", UDP_SCRIPT_LINES
 TCP_SETUP_COMMANDS = build_script_setup("/tmp/lab_tcp_echo.sh", TCP_SCRIPT_LINES)
 HTTP_SETUP_COMMANDS = build_script_setup("/tmp/lab_http_once.sh", HTTP_SCRIPT_LINES)
 PTY_SETUP_COMMANDS = build_script_setup("/tmp/lab_pty_demo.sh", PTY_SCRIPT_LINES)
+JOBCTL_SETUP_COMMANDS = build_script_setup("/tmp/lab_jobctl_demo.sh", JOBCTL_SCRIPT_LINES)
 SSH_POLL_SETUP_COMMANDS = build_script_setup("/tmp/lab_ssh_poll_demo.sh", SSH_POLL_SCRIPT_LINES)
 SSH_SELECT_SETUP_COMMANDS = build_script_setup(
     "/tmp/lab_ssh_select_demo.sh", SSH_SELECT_SCRIPT_LINES
 )
+WAITCTL_SETUP_COMMANDS = build_script_setup("/tmp/lab_waitctl_demo.sh", WAITCTL_SCRIPT_LINES)
 
 
 DEMOS: dict[str, Demo] = {
@@ -309,6 +323,52 @@ DEMOS: dict[str, Demo] = {
         focus_events=("PtyOpen", "SessionCreate", "TtyCtl", "ProcessGroupSet", "PollSleep", "PollWake", "TaskExit"),
         focus_syscalls=(),
         setup_commands=PTY_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+    ),
+    "jobctl": Demo(
+        name="jobctl",
+        goal="Drive an interactive shell over a pty and exercise Ctrl-Z/fg/Ctrl-C job-control paths.",
+        commands=("sh /tmp/lab_jobctl_demo.sh 2>/dev/null || true",),
+        expected_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "SignalSend",
+            "SignalHandle",
+            "WaitStop",
+            "WaitReap",
+            "TaskExit",
+        ),
+        focus_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "SignalSend",
+            "SignalHandle",
+            "WaitStop",
+            "WaitReap",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        ),
+        focus_syscalls=("wait4", "read", "write", "ioctl", "close"),
+        setup_commands=JOBCTL_SETUP_COMMANDS,
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+    ),
+    "waitctl": Demo(
+        name="waitctl",
+        goal="Exercise explicit wait4 stopped/continued/reap semantics with a tiny helper process tree.",
+        commands=("sh /tmp/lab_waitctl_demo.sh 2>/dev/null || true",),
+        expected_events=("SignalSend", "SignalHandle", "WaitContinue", "WaitReap", "TaskExit"),
+        focus_events=("SignalSend", "SignalHandle", "WaitContinue", "WaitReap", "TaskExit"),
+        focus_syscalls=("wait4", "kill", "close"),
+        setup_commands=WAITCTL_SETUP_COMMANDS,
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
         net="n",
@@ -530,9 +590,9 @@ def ensure_working_disk(arch: str) -> pathlib.Path:
     return WORKING_DISK_IMG
 
 
-def compile_pty_helper(arch: str) -> pathlib.Path:
+def compile_helper(source: pathlib.Path, output_name: str, arch: str) -> pathlib.Path:
     LAB_BIN_DIR.mkdir(parents=True, exist_ok=True)
-    output = LAB_BIN_DIR / f"pty-relay-{arch}"
+    output = LAB_BIN_DIR / f"{output_name}-{arch}"
     compiler = f"{arch}-linux-musl-gcc"
     subprocess.run(
         [
@@ -544,7 +604,7 @@ def compile_pty_helper(arch: str) -> pathlib.Path:
             "-s",
             "-o",
             str(output),
-            str(PTY_HELPER_SOURCE),
+            str(source),
         ],
         check=True,
     )
@@ -670,12 +730,15 @@ def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
 
 
 def ensure_guest_helpers(demo: Demo, arch: str) -> None:
-    if demo.name not in {"pty", "ssh-poll", "ssh-select", "sshd"}:
+    if demo.name not in {"pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
         return
     img = ensure_working_disk(arch)
-    if demo.name in {"pty", "ssh-poll", "ssh-select"}:
-        helper = compile_pty_helper(arch)
+    if demo.name in {"pty", "jobctl", "ssh-poll", "ssh-select"}:
+        helper = compile_helper(PTY_HELPER_SOURCE, "pty-relay", arch)
         debugfs_write(img, helper, PTY_HELPER_GUEST)
+    if demo.name == "waitctl":
+        helper = compile_helper(WAITCTL_HELPER_SOURCE, "waitctl", arch)
+        debugfs_write(img, helper, WAITCTL_HELPER_GUEST)
     if demo.name == "sshd":
         dropbear, dropbearkey, libcrypt = prepare_dropbear_assets(arch)
         debugfs_mkdir(img, DROPBEAR_LIB_GUEST_DIR)
@@ -743,10 +806,14 @@ def clean_capture(text: str, command: str | None = None) -> str:
 
 
 def normalize_demo_output(demo: Demo, text: str) -> str:
-    if demo.name not in {"pty", "ssh-poll", "ssh-select", "sshd"}:
+    if demo.name not in {"pty", "jobctl", "ssh-poll", "ssh-select", "sshd"}:
         return text
     drop = {
         "echo pty-lab",
+        "sleep 30",
+        "jobs",
+        "fg",
+        "echo jobctl-lab",
         "echo ssh-lab",
         "PS1=",
         "export PS1",
@@ -783,6 +850,18 @@ def normalize_demo_output(demo: Demo, text: str) -> str:
         kept.pop(0)
     while kept and not kept[-1].strip():
         kept.pop()
+    if demo.name == "jobctl":
+        normalized: list[str] = []
+        saw_stopped = False
+        for line in kept:
+            candidate = line
+            if "Stopped" in candidate:
+                if saw_stopped:
+                    continue
+                saw_stopped = True
+                candidate = "[1]+  Stopped                    sleep 30"
+            normalized.append(candidate)
+        kept = normalized
     return "\n".join(kept) + ("\n" if kept else "")
 
 
@@ -1018,6 +1097,14 @@ def describe_wait_reap(event: TraceEvent) -> str:
     return f"wait4 reaped pid={format_small_int(event.arg0)} status={format_exit_status(event.arg1)}"
 
 
+def describe_wait_stop(event: TraceEvent) -> str:
+    return f"wait4 observed stop pid={format_small_int(event.arg0)} status={format_exit_status(event.arg1)}"
+
+
+def describe_wait_continue(event: TraceEvent) -> str:
+    return f"wait4 observed continue pid={format_small_int(event.arg0)} status={format_exit_status(event.arg1)}"
+
+
 def describe_pty_open(event: TraceEvent) -> str:
     return f"open /dev/ptmx -> fd={format_fd(event.arg0)} pty={format_small_int(event.arg1)}"
 
@@ -1057,6 +1144,10 @@ def build_event_views(events: list[TraceEvent]) -> list[EventView]:
             detail = describe_process_group_set(event)
         elif event.kind == "WaitReap":
             detail = describe_wait_reap(event)
+        elif event.kind == "WaitStop":
+            detail = describe_wait_stop(event)
+        elif event.kind == "WaitContinue":
+            detail = describe_wait_continue(event)
         elif event.kind == "PtyOpen":
             detail = describe_pty_open(event)
         elif event.kind == "TtyCtl":
@@ -1281,7 +1372,17 @@ def select_sshd_phase_views(phase_name: str, views: list[EventView]) -> list[Eve
         return [view for view in views if view.label in keep_labels]
 
     if phase_name == "phase-3-shell":
-        keep_labels = {"ProcessGroupSet", "WaitReap", "SignalSend", "SignalHandle", "PollSleep", "PollWake", "TaskExit"}
+        keep_labels = {
+            "ProcessGroupSet",
+            "WaitStop",
+            "WaitContinue",
+            "WaitReap",
+            "SignalSend",
+            "SignalHandle",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        }
         focus_syscalls = {"read", "write", "wait4", "close"}
         keep: set[int] = {view.event.seq for view in views if view.label in keep_labels}
         pending_syscalls: dict[int, str] = {}
@@ -1376,6 +1477,8 @@ def build_sshd_phase_walkthrough(
         return tuple(lines)
 
     if phase_name == "phase-3-shell":
+        wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
+        wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
         wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
         task_exit = next((view for view in key_views if view.label == "TaskExit"), None)
         lines = [
@@ -1385,6 +1488,10 @@ def build_sshd_phase_walkthrough(
             lines.append(
                 f"signal flow stayed visible with send={counts['SignalSend']} and handle={counts['SignalHandle']} event(s)."
             )
+        if wait_stop is not None:
+            lines.append(f"job-control stop handling surfaced through {wait_stop.detail}.")
+        if wait_continue is not None:
+            lines.append(f"job-control resume handling surfaced through {wait_continue.detail}.")
         if wait_reap is not None:
             lines.append(f"the shell-side wait path completed through {wait_reap.detail}.")
         if transcript.strip():
@@ -2050,6 +2157,22 @@ def build_walkthrough(
         if task_exit is not None:
             lines.append(f"the crashing task ended with {task_exit.detail}.")
         return lines
+    if demo.name == "waitctl":
+        wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
+        wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        lines = [
+            "the helper forked one child, stopped it with SIGTSTP, resumed it with SIGCONT, and then terminated it with SIGINT.",
+        ]
+        if wait_stop is not None:
+            lines.append(f"`wait4(..., WUNTRACED)` surfaced the stop through {wait_stop.detail}.")
+        if wait_continue is not None:
+            lines.append(f"`wait4(..., WCONTINUED)` surfaced the resume through {wait_continue.detail}.")
+        if wait_reap is not None:
+            lines.append(f"the final blocking wait reaped the child through {wait_reap.detail}.")
+        if "waitctl-lab" in artifact_outputs.get("demo-step-1.txt", ""):
+            lines.append("the helper printed `waitctl-lab`, so all three wait-status phases completed end to end.")
+        return lines
     if demo.name == "udp":
         lines = [
             f"the guest sent one datagram to the runner-side UDP echo peer at {RUNNER_HOST}:{UDP_PORT}.",
@@ -2090,6 +2213,47 @@ def build_walkthrough(
         if artifact_outputs.get("demo-step-1.txt", "").strip():
             lines.append("the pty-backed `/bin/sh -c 'echo pty-lab'` path printed `pty-lab`, which confirms the shell output crossed the slave/master boundary end to end.")
         lines.append("the relay returned without an outer timeout, so the master side observed the slave close and finished through the kernel's pty EOF/HUP path.")
+        return lines
+    if demo.name == "jobctl":
+        pty_open = next((view for view in key_views if view.label == "PtyOpen"), None)
+        session_create = next((view for view in key_views if view.label == "SessionCreate"), None)
+        tty_ctls = [view for view in key_views if view.label == "TtyCtl"]
+        wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
+        wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        sigtstp = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGTSTP")),
+            None,
+        )
+        sigcont = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGCONT")),
+            None,
+        )
+        sigint = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGINT")),
+            None,
+        )
+        lines: list[str] = []
+        if pty_open is not None:
+            lines.append(f"the helper opened a fresh pseudo-terminal pair via {pty_open.detail}.")
+        if session_create is not None:
+            lines.append(f"the interactive shell established its own session with {session_create.detail}.")
+        if tty_ctls:
+            rendered = ", ".join(view.detail for view in tty_ctls[:3])
+            lines.append(f"controlling-tty setup flowed through {rendered}.")
+        if sigtstp is not None:
+            lines.append("typing Ctrl-Z on the pty generated SIGTSTP for the foreground job.")
+        if wait_stop is not None:
+            lines.append(f"the shell's wait4 path reported the stop through {wait_stop.detail}.")
+        if sigcont is not None or wait_continue is not None:
+            detail = wait_continue.detail if wait_continue is not None else "a SIGCONT-driven foreground resume"
+            lines.append(f"`fg` resumed the stopped job, and the continue path showed up as {detail}.")
+        if sigint is not None:
+            lines.append("typing Ctrl-C after `fg` generated SIGINT for the resumed foreground job.")
+        if wait_reap is not None:
+            lines.append(f"the final child collection completed through {wait_reap.detail}.")
+        if "jobctl-lab" in artifact_outputs.get("demo-step-1.txt", ""):
+            lines.append("the shell printed `jobctl-lab` after the Ctrl-C/fg cycle, so the interactive job-control path really returned control to the shell.")
         return lines
     if demo.name in {"ssh-poll", "ssh-select"}:
         relay_name = "pselect6" if demo.name == "ssh-select" else "ppoll"
@@ -2463,10 +2627,14 @@ def execute_run(
             session.run_command(input_stream[-1], command_timeout)
 
             peer = start_demo_peer(demo)
+            last_index = len(demo.commands)
             for index, command in enumerate(demo.commands, start=1):
-                input_stream.append(command)
-                output = session.run_command(command, command_timeout)
-                cleaned_output = normalize_demo_output(demo, clean_capture(output, command))
+                command_to_run = command
+                if index == last_index:
+                    command_to_run = f"{command}; echo 1 > /proc/starry/off"
+                input_stream.append(command_to_run)
+                output = session.run_command(command_to_run, command_timeout)
+                cleaned_output = normalize_demo_output(demo, clean_capture(output, command_to_run))
                 step_path = out_dir / f"demo-step-{index}.txt"
                 write_text(step_path, cleaned_output)
                 demo_outputs.append((step_path, cleaned_output))
@@ -2511,8 +2679,6 @@ def execute_run(
             artifact_outputs["starry_stats.txt"] = stats_text
             artifact_outputs["starry_last_fault.txt"] = last_fault_text
         else:
-            input_stream.append("echo 1 > /proc/starry/off")
-            session.run_command(input_stream[-1], command_timeout)
             for name, command in ARTIFACT_COMMANDS:
                 output = session.run_command(command, command_timeout)
                 artifact_outputs[name] = clean_capture(output, command)

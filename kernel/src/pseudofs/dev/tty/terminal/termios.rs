@@ -6,7 +6,7 @@ use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
     B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ICANON, ICRNL, IEXTEN, ISIG, IXON,
     ONLCR, OPOST, VDISCARD, VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL, VLNEXT, VQUIT, VREPRINT,
-    VWERASE, speed_t, tcflag_t,
+    VSUSP, VWERASE, speed_t, tcflag_t,
 };
 use starry_signal::Signo;
 
@@ -44,6 +44,7 @@ impl Default for Termios {
             (VEOL, b'\0'),
             (VREPRINT, ctl(b'R')),
             (VDISCARD, ctl(b'O')),
+            (VSUSP, ctl(b'Z')),
             (VWERASE, ctl(b'W')),
             (VLNEXT, ctl(b'V')),
             (VEOL2, b'\0'),
@@ -104,6 +105,7 @@ impl Termios {
         Some(match ch {
             ch if ch == self.special_char(VINTR) => Signo::SIGINT,
             ch if ch == self.special_char(VQUIT) => Signo::SIGQUIT,
+            ch if ch == self.special_char(VSUSP) => Signo::SIGTSTP,
             _ => return None,
         })
     }

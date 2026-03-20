@@ -29,6 +29,8 @@ mod imp {
         SessionCreate,
         ProcessGroupSet,
         WaitReap,
+        WaitStop,
+        WaitContinue,
         PtyOpen,
         TtyCtl,
     }
@@ -198,6 +200,8 @@ mod imp {
         SessionCreate,
         ProcessGroupSet,
         WaitReap,
+        WaitStop,
+        WaitContinue,
         PtyOpen,
         TtyCtl,
     }
@@ -269,6 +273,8 @@ impl EventKind {
             EventKind::SessionCreate => "SessionCreate",
             EventKind::ProcessGroupSet => "ProcessGroupSet",
             EventKind::WaitReap => "WaitReap",
+            EventKind::WaitStop => "WaitStop",
+            EventKind::WaitContinue => "WaitContinue",
             EventKind::PtyOpen => "PtyOpen",
             EventKind::TtyCtl => "TtyCtl",
         }

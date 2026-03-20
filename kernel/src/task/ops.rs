@@ -9,7 +9,7 @@ use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
 use spin::RwLock;
-use starry_process::{Pid, ProcessGroup, Session};
+use starry_process::{Pid, Process, ProcessGroup, Session};
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
@@ -114,6 +114,14 @@ pub fn register_process_group(group: &Arc<ProcessGroup>) {
 
 pub fn register_session(session: &Arc<Session>) {
     register_session_inner(session);
+}
+
+pub fn interrupt_process_threads(proc: &Process) {
+    for tid in proc.threads() {
+        if let Ok(task) = get_task(tid) {
+            task.interrupt();
+        }
+    }
 }
 
 /// Poll the timer

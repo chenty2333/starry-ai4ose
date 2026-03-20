@@ -1,12 +1,22 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    future::poll_fn,
+    sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
+};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
-use axtask::{TaskInner, current};
+use axtask::{
+    TaskInner, current,
+    future::{block_on, interruptible},
+};
 use starry_process::Pid;
-use starry_signal::{SignalInfo, SignalOSAction, SignalSet};
+use starry_signal::{SignalInfo, SignalOSAction, SignalSet, Signo};
 
-use super::{AsThread, Thread, do_exit, get_process_data, get_process_group, get_task};
+use super::{
+    AsThread, Thread, do_exit, get_process_data, get_process_group, get_task,
+    interrupt_process_threads,
+};
 use crate::lab::{self, EventKind};
 
 fn signal_action_code(action: SignalOSAction) -> usize {
@@ -16,6 +26,36 @@ fn signal_action_code(action: SignalOSAction) -> usize {
         SignalOSAction::Stop => 3,
         SignalOSAction::Continue => 4,
         SignalOSAction::Handler => 5,
+    }
+}
+
+fn notify_parent_of_child_state_change(thr: &Thread) {
+    let proc = &thr.proc_data.proc;
+    let Some(parent) = proc.parent() else {
+        return;
+    };
+
+    let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(Signo::SIGCHLD)));
+    if let Ok(parent_data) = get_process_data(parent.pid()) {
+        parent_data.child_exit_event.wake();
+    }
+}
+
+fn stop_current_process(thr: &Thread, signo: Signo) {
+    let changed = thr.proc_data.record_stop(signo);
+    thr.proc_data.stop_event.wake();
+    interrupt_process_threads(&thr.proc_data.proc);
+    if changed {
+        notify_parent_of_child_state_change(thr);
+    }
+}
+
+fn continue_current_process(thr: &Thread) {
+    let changed = thr.proc_data.record_continue();
+    thr.proc_data.stop_event.wake();
+    interrupt_process_threads(&thr.proc_data.proc);
+    if changed {
+        notify_parent_of_child_state_change(thr);
     }
 }
 
@@ -34,6 +74,9 @@ pub fn check_signals(
         signo as usize,
         signal_action_code(os_action),
     );
+    if signo == Signo::SIGCONT {
+        continue_current_process(thr);
+    }
     match os_action {
         SignalOSAction::Terminate => {
             do_exit(signo as i32, true);
@@ -43,11 +86,11 @@ pub fn check_signals(
             do_exit(128 + signo as i32, true);
         }
         SignalOSAction::Stop => {
-            // TODO: implement stop
-            do_exit(1, true);
+            stop_current_process(thr, signo);
         }
         SignalOSAction::Continue => {
-            // TODO: implement continue
+            // `SIGCONT` has already resumed the process above. Any user
+            // handler frame has been prepared by `starry-signal`.
         }
         SignalOSAction::Handler => {
             // do nothing
@@ -64,6 +107,22 @@ pub fn block_next_signal() {
 
 pub fn unblock_next_signal() -> bool {
     BLOCK_NEXT_SIGNAL_CHECK.swap(false, Ordering::SeqCst)
+}
+
+pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
+    while thr.proc_data.is_stopped() && !thr.pending_exit() {
+        if check_signals(thr, uctx, None) {
+            continue;
+        }
+
+        let _ = block_on(interruptible(poll_fn(|cx| {
+            if !thr.proc_data.is_stopped() || thr.pending_exit() {
+                return Poll::Ready(());
+            }
+            thr.proc_data.stop_event.register(cx.waker());
+            Poll::Pending
+        })));
+    }
 }
 
 pub fn with_blocked_signals<R>(

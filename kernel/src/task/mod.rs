@@ -184,6 +184,13 @@ impl AsThread for TaskInner {
     }
 }
 
+#[derive(Debug, Default)]
+struct JobState {
+    stopped: bool,
+    stop_wait_status: Option<i32>,
+    continue_wait_pending: bool,
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -207,6 +214,8 @@ pub struct ProcessData {
     pub child_exit_event: Arc<PollSet>,
     /// Self exit event
     pub exit_event: Arc<PollSet>,
+    /// Process stop/continue wait event
+    pub stop_event: Arc<PollSet>,
     /// The exit signal of the thread
     pub exit_signal: Option<Signo>,
 
@@ -218,6 +227,9 @@ pub struct ProcessData {
 
     /// The default mask for file permissions.
     umask: AtomicU32,
+
+    /// Job-control visible stop/continue state for wait4/stat.
+    job_state: SpinNoIrq<JobState>,
 }
 
 impl ProcessData {
@@ -242,6 +254,7 @@ impl ProcessData {
 
             child_exit_event: Arc::default(),
             exit_event: Arc::default(),
+            stop_event: Arc::default(),
             exit_signal,
 
             signal: Arc::new(ProcessSignalManager::new(
@@ -252,6 +265,7 @@ impl ProcessData {
             futex_table: Arc::new(FutexTable::new()),
 
             umask: AtomicU32::new(0o022),
+            job_state: SpinNoIrq::default(),
         })
     }
 
@@ -284,5 +298,59 @@ impl ProcessData {
     /// Set the umask and return the old value.
     pub fn replace_umask(&self, umask: u32) -> u32 {
         self.umask.swap(umask, Ordering::SeqCst)
+    }
+
+    /// Returns whether the process is currently job-control stopped.
+    pub fn is_stopped(&self) -> bool {
+        self.job_state.lock().stopped
+    }
+
+    /// Records a process stop visible to wait4/WUNTRACED.
+    ///
+    /// Returns `true` when this changed the externally visible stop state.
+    pub fn record_stop(&self, signo: Signo) -> bool {
+        let mut state = self.job_state.lock();
+        let status = ((signo as i32) << 8) | 0x7f;
+        let changed = !state.stopped || state.stop_wait_status != Some(status);
+        state.stopped = true;
+        state.stop_wait_status = Some(status);
+        state.continue_wait_pending = false;
+        changed
+    }
+
+    /// Records that the process continued from a job-control stop.
+    ///
+    /// Returns `true` when the process was actually resumed.
+    pub fn record_continue(&self) -> bool {
+        let mut state = self.job_state.lock();
+        if !state.stopped {
+            return false;
+        }
+        state.stopped = false;
+        state.stop_wait_status = None;
+        state.continue_wait_pending = true;
+        true
+    }
+
+    /// Takes or peeks the pending stopped wait status.
+    pub fn take_wait_stop(&self, consume: bool) -> Option<i32> {
+        let mut state = self.job_state.lock();
+        let status = state.stop_wait_status?;
+        if consume {
+            state.stop_wait_status = None;
+        }
+        Some(status)
+    }
+
+    /// Takes or peeks the pending continued wait status.
+    pub fn take_wait_continue(&self, consume: bool) -> Option<i32> {
+        let mut state = self.job_state.lock();
+        if !state.continue_wait_pending {
+            return None;
+        }
+        if consume {
+            state.continue_wait_pending = false;
+        }
+        Some(0xffff)
     }
 }

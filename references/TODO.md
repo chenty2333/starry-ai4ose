@@ -130,6 +130,20 @@ Exit condition:
 Exit condition:
 `make lab-repeat-tcp`, `make lab-repeat-pty`, and `make lab-repeat-sshd` all stay green after the semantic tightening pass.
 
+## M11: Interactive Job Control and Wait Semantics
+
+- [x] Add a dedicated `jobctl` workload that drives `Ctrl-Z`, `fg`, and `Ctrl-C` through a real pty-backed shell.
+- [x] Add a dedicated `waitctl` helper that exercises `wait4(..., WUNTRACED)`, `wait4(..., WCONTINUED)`, and final reap semantics explicitly.
+- [x] Teach the tty line discipline to emit `SIGTSTP` on `Ctrl-Z`.
+- [x] Surface stopped tasks as `T` in `/proc/[pid]/stat`.
+- [x] Record process stop/continue state so `wait4` can report `WaitStop` and `WaitContinue`.
+- [x] Block stopped tasks in the user loop until a later `SIGCONT` resumes them.
+- [x] Add `WaitStop` and `WaitContinue` to the lab event vocabulary and teaching output.
+- [x] Add `make lab-jobctl`, `make lab-waitctl`, `make lab-repeat-jobctl`, and `make lab-repeat-waitctl`.
+
+Exit condition:
+`make lab-repeat-jobctl` and `make lab-repeat-waitctl` both stay green, with stop semantics visible in the pty job-control demo and continued/reap semantics visible in the explicit wait helper demo.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

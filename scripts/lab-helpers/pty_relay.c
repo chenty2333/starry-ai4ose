@@ -294,6 +294,53 @@ static int write_script(int master_fd, const char *buf, size_t len) {
     return 0;
 }
 
+static int write_step(int master_fd, const char *text, useconds_t per_char_delay) {
+    size_t len = strlen(text);
+    for (size_t i = 0; i < len; i++) {
+        char ch = text[i] == '\n' ? '\r' : text[i];
+        if (write_all(master_fd, &ch, 1) < 0) {
+            return -1;
+        }
+        usleep(per_char_delay);
+    }
+    return 0;
+}
+
+static int write_jobctl_script(int master_fd) {
+    const char ctrl_z = 0x1a;
+    const char ctrl_c = 0x03;
+
+    usleep(800000);
+    if (write_step(master_fd, "sleep 30\n", 20000) < 0) {
+        return -1;
+    }
+    usleep(800000);
+    if (write_all(master_fd, &ctrl_z, 1) < 0) {
+        return -1;
+    }
+    usleep(800000);
+    if (write_step(master_fd, "jobs\n", 20000) < 0) {
+        return -1;
+    }
+    usleep(400000);
+    if (write_step(master_fd, "fg\n", 20000) < 0) {
+        return -1;
+    }
+    usleep(2000000);
+    if (write_all(master_fd, &ctrl_c, 1) < 0) {
+        return -1;
+    }
+    usleep(600000);
+    if (write_step(master_fd, "echo jobctl-lab\n", 20000) < 0) {
+        return -1;
+    }
+    usleep(200000);
+    if (write_step(master_fd, "exit\n", 20000) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     static char *default_argv[] = {"/bin/sh", "-i", NULL};
     char *slave_name = NULL;
@@ -301,6 +348,7 @@ int main(int argc, char **argv) {
     const char *script_path = NULL;
     char *script_buf = NULL;
     size_t script_len = 0;
+    int jobctl_mode = 0;
     int no_input = 0;
     int use_select = 0;
     int master_fd = -1;
@@ -325,6 +373,11 @@ int main(int argc, char **argv) {
         if (strcmp(argv[argi], "-f") == 0 && argi + 1 < argc) {
             script_path = argv[argi + 1];
             argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "-j") == 0) {
+            jobctl_mode = 1;
+            argi++;
             continue;
         }
         if (strcmp(argv[argi], "-n") == 0) {
@@ -407,7 +460,14 @@ int main(int argc, char **argv) {
         _exit(127);
     }
 
-    if (script_path != NULL) {
+    if (jobctl_mode) {
+        if (write_jobctl_script(master_fd) < 0) {
+            perror("write jobctl script");
+            close(master_fd);
+            return 1;
+        }
+        status = relay_loop(master_fd, -1, STDOUT_FILENO, 0, use_select);
+    } else if (script_path != NULL) {
         script_buf = load_script(script_path, &script_len);
         if (script_buf == NULL) {
             perror("load_script");
