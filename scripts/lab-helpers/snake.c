@@ -39,6 +39,10 @@ struct game_state {
     struct point scripted_foods[3];
 };
 
+struct input_state {
+    int ctrl_down;
+};
+
 static void die(const char *what) {
     perror(what);
     exit(1);
@@ -158,6 +162,11 @@ static void init_game(struct game_state *state, int width, int height, int scrip
     place_food(state);
 }
 
+static void reset_game(struct game_state *state, int width, int height) {
+    int scripted = state->scripted;
+    init_game(state, width, height, scripted);
+}
+
 static void render_scene(
     uint8_t *fb,
     size_t map_len,
@@ -253,13 +262,45 @@ static int apply_direction(struct game_state *state, uint16_t code) {
     return 1;
 }
 
+static void mark_game_over(struct game_state *state) {
+    state->alive = 0;
+    if (state->scripted) {
+        state->quit = 1;
+    }
+}
+
+static int handle_key_press(
+    struct game_state *state,
+    struct input_state *input,
+    uint16_t code,
+    int width,
+    int height
+) {
+    if ((code == KEY_C) && input->ctrl_down) {
+        state->quit = 1;
+        return 0;
+    }
+
+    if (!state->alive) {
+        if (code == KEY_ENTER || code == KEY_KPENTER) {
+            reset_game(state, width, height);
+            return 1;
+        }
+        if (code == KEY_Q || code == KEY_ESC) {
+            state->quit = 1;
+        }
+        return 0;
+    }
+
+    return apply_direction(state, code);
+}
+
 static void step_game(struct game_state *state) {
     struct point head = state->snake[state->snake_len - 1];
     struct point next = {.x = head.x + state->dir_x, .y = head.y + state->dir_y};
 
     if (next.x < 0 || next.x >= state->grid_w || next.y < 0 || next.y >= state->grid_h) {
-        state->alive = 0;
-        state->quit = 1;
+        mark_game_over(state);
         return;
     }
 
@@ -267,8 +308,7 @@ static void step_game(struct game_state *state) {
     int occupied_len = state->snake_len - (will_grow ? 0 : 1);
     for (int i = 0; i < occupied_len; i++) {
         if (point_eq(state->snake[i], next)) {
-            state->alive = 0;
-            state->quit = 1;
+            mark_game_over(state);
             return;
         }
     }
@@ -320,11 +360,12 @@ int main(int argc, char **argv) {
     int key_fd = open_keyboard();
     struct pollfd pfd = {.fd = key_fd, .events = POLLIN};
     struct game_state state;
+    struct input_state input = {0};
     init_game(&state, (int)var.xres, (int)var.yres, scripted);
     render_scene(fb, map_len, &fix, &state);
 
     while (!state.quit) {
-        int timeout_ms = scripted ? -1 : 140;
+        int timeout_ms = scripted ? -1 : (state.alive ? 220 : -1);
         int ready = poll(&pfd, 1, timeout_ms);
         if (ready < 0) {
             if (errno == EINTR) {
@@ -344,19 +385,26 @@ int main(int argc, char **argv) {
             }
             size_t count = (size_t)n / sizeof(struct input_event);
             for (size_t i = 0; i < count; i++) {
-                if (events[i].type == EV_KEY && events[i].value == 1) {
-                    int changed = apply_direction(&state, events[i].code);
+                if (events[i].type != EV_KEY) {
+                    continue;
+                }
+                if (events[i].code == KEY_LEFTCTRL || events[i].code == KEY_RIGHTCTRL) {
+                    input.ctrl_down = events[i].value != 0;
+                    continue;
+                }
+                if (events[i].value == 1) {
+                    int changed = handle_key_press(&state, &input, events[i].code, (int)var.xres, (int)var.yres);
                     if (state.quit) {
                         break;
                     }
-                    if (scripted && changed) {
+                    if (scripted && changed && state.alive) {
                         step_game(&state);
                         stepped = 1;
                     }
                 }
             }
         }
-        if (!state.quit && !scripted && !stepped) {
+        if (!state.quit && !scripted && !stepped && state.alive) {
             step_game(&state);
         }
         render_scene(fb, map_len, &fix, &state);
