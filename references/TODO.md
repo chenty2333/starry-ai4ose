@@ -155,6 +155,37 @@ Exit condition:
 Exit condition:
 `make lab-repeat-waitctl` stays exact-match green, and `make lab-sshd` clearly shows `Ctrl-Z/Ctrl-C`, `SIGTTOU`, and `SIGTTIN` in its phase summaries and SSH transcript.
 
+## M13: MM + FS Stage 1, Anonymous Memory and COW
+
+- [x] Add a dedicated `cow` helper workload that exercises anonymous `mmap`, `mprotect`, `fork`, COW write faults, `wait4`, and `munmap`.
+- [x] Stage the helper into the lab rootfs and expose `make lab-cow` / `make lab-repeat-cow`.
+- [x] Teach the runner to summarize anonymous private mapping bring-up, permission flips, and parent/child divergence after the COW write.
+- [x] Re-check repeatability for the new anonymous-memory workload.
+
+Exit condition:
+`make lab-repeat-cow` stays exact-match green, and the output makes it obvious that the parent kept `parent-page` while the child successfully wrote its private `child-copy`.
+
+## M14: MM + FS Stage 2, File Mappings and Page Cache
+
+- [x] Add a dedicated `filemap` helper workload that exercises `open/ftruncate`, `MAP_SHARED`, `MAP_PRIVATE`, `pread/pwrite`, and `munmap`.
+- [x] Stage the helper into the lab rootfs and expose `make lab-filemap` / `make lab-repeat-filemap`.
+- [x] Teach the runner to explain shared-map coherence and private-map isolation in one readable summary.
+- [x] Re-check repeatability for the file-backed mapping workload.
+
+Exit condition:
+`make lab-repeat-filemap` stays exact-match green, and the output makes it obvious that shared-map writes round-trip through file I/O while private-map writes stay isolated from the backing file.
+
+## M15: MM + FS Stage 3, SysV Shared Memory
+
+- [x] Add a dedicated `shm` helper workload that exercises `shmget`, `shmat`, fork inheritance, child-side `shmdt`, `IPC_RMID`, and final detach/removal.
+- [x] Stage the helper into the lab rootfs and expose `make lab-shm` / `make lab-repeat-shm`.
+- [x] Fix fork-time SysV shm bookkeeping so inherited attachments can detach and clean up correctly from the child process.
+- [x] Make `shmat` fail cleanly instead of panicking when a removed segment is no longer present.
+- [x] Re-check repeatability for the SysV shm workload.
+
+Exit condition:
+`make lab-repeat-shm` stays exact-match green, and the output makes it obvious that the child inherited the segment, detached successfully, and the segment stopped being attachable after `IPC_RMID` plus the last detach.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

@@ -273,6 +273,12 @@ impl CloneArgs {
         }
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
+        if !flags.contains(CloneFlags::THREAD) {
+            crate::syscall::SHM_MANAGER
+                .lock()
+                .clone_proc_shm(old_proc_data.proc.pid(), new_proc_data.proc.pid());
+        }
+
         let task = spawn_task(new_task);
         add_task_to_table(&task);
 

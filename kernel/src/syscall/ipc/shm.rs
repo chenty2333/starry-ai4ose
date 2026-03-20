@@ -366,6 +366,25 @@ impl ShmManager {
         }
         self.remove_pid(pid);
     }
+
+    pub fn clone_proc_shm(&mut self, parent: Pid, child: Pid) {
+        let Some(entries) = self.pid_shmid_vaddr.get(&parent).cloned() else {
+            return;
+        };
+        for (shmid, vaddr) in entries.forward {
+            let Some(shm_inner) = self.get_inner_by_shmid(shmid) else {
+                continue;
+            };
+            let mut shm_inner = shm_inner.lock();
+            let Some(va_range) = shm_inner.get_addr_range(parent) else {
+                continue;
+            };
+            if shm_inner.get_addr_range(child).is_none() {
+                shm_inner.attach_process(child, va_range);
+            }
+            self.insert_shmid_vaddr(child, shmid, vaddr);
+        }
+    }
 }
 
 /// Global shared memory manager.
@@ -420,7 +439,9 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
 pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let shm_inner = {
         let shm_manager = SHM_MANAGER.lock();
-        shm_manager.get_inner_by_shmid(shmid).unwrap()
+        shm_manager
+            .get_inner_by_shmid(shmid)
+            .ok_or(AxError::InvalidInput)?
     };
     let mut shm_inner = shm_inner.lock();
     let mut mapping_flags = shm_inner.mapping_flags;

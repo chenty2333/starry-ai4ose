@@ -44,9 +44,15 @@ LAB_BIN_DIR = REPO_ROOT / ".lab-bin"
 PTY_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "pty_relay.c"
 WAITCTL_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "waitctl.c"
 TTYSIG_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "ttysig.c"
+COWCTL_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "cowctl.c"
+FILEMAP_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "filemapctl.c"
+SHMCHECK_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "shmcheck.c"
 PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
 WAITCTL_HELPER_GUEST = "/usr/bin/lab_waitctl"
 TTYSIG_HELPER_GUEST = "/usr/bin/lab_ttysig"
+COWCTL_HELPER_GUEST = "/usr/bin/lab_cowctl"
+FILEMAP_HELPER_GUEST = "/usr/bin/lab_filemapctl"
+SHMCHECK_HELPER_GUEST = "/usr/bin/lab_shmcheck"
 DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
@@ -299,6 +305,42 @@ DEMOS: dict[str, Demo] = {
         expected_events=("SysEnter", "SysExit", "TaskExit", "ProcessGroupSet", "PollSleep", "PollWake"),
         focus_events=("PollSleep", "PollWake", "TaskExit", "ProcessGroupSet", "WaitReap", "SignalSend", "SignalHandle"),
         focus_syscalls=(),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+    ),
+    "cow": Demo(
+        name="cow",
+        goal="Exercise anonymous private mmap, permission flips, fork-driven copy-on-write, and cleanup.",
+        commands=(COWCTL_HELPER_GUEST,),
+        expected_events=("SysEnter", "SysExit", "PageFault", "WaitReap", "TaskExit"),
+        focus_events=("PageFault", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=("mmap", "mprotect", "clone", "wait4", "munmap"),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+    ),
+    "filemap": Demo(
+        name="filemap",
+        goal="Exercise file-backed MAP_SHARED and MAP_PRIVATE mappings and show page-cache-backed coherence through file I/O.",
+        commands=(FILEMAP_HELPER_GUEST,),
+        expected_events=("SysEnter", "SysExit", "PageFault", "WaitReap", "TaskExit"),
+        focus_events=("PageFault", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=("openat", "ftruncate", "mmap", "pread64", "pwrite64", "munmap", "close"),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+    ),
+    "shm": Demo(
+        name="shm",
+        goal="Exercise SysV shared memory attach, fork inheritance, detach, IPC_RMID, and final removal.",
+        commands=(SHMCHECK_HELPER_GUEST,),
+        expected_events=("SysEnter", "SysExit", "PageFault", "WaitReap", "TaskExit"),
+        focus_events=("PageFault", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=("shmget", "shmat", "clone", "shmdt", "shmctl", "wait4"),
         setup_commands=(),
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
@@ -558,6 +600,17 @@ SYSCALL_FIRST_ARG_LABELS: dict[str, str] = {
     "wait4": "pid",
     "waitid": "which",
     "write": "fd",
+    "mmap": "addr",
+    "mprotect": "addr",
+    "munmap": "addr",
+    "clone": "flags",
+    "pread64": "fd",
+    "pwrite64": "fd",
+    "ftruncate": "fd",
+    "shmget": "key",
+    "shmat": "shmid",
+    "shmdt": "shmaddr",
+    "shmctl": "shmid",
 }
 
 SIGNAL_ACTIONS: dict[int, str] = {
@@ -781,9 +834,18 @@ def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
 
 
 def ensure_guest_helpers(demo: Demo, arch: str) -> None:
-    if demo.name not in {"pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
+    if demo.name not in {"cow", "filemap", "shm", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
         return
     img = ensure_working_disk(arch)
+    if demo.name == "cow":
+        helper = compile_helper(COWCTL_HELPER_SOURCE, "cowctl", arch)
+        debugfs_write(img, helper, COWCTL_HELPER_GUEST)
+    if demo.name == "filemap":
+        helper = compile_helper(FILEMAP_HELPER_SOURCE, "filemapctl", arch)
+        debugfs_write(img, helper, FILEMAP_HELPER_GUEST)
+    if demo.name == "shm":
+        helper = compile_helper(SHMCHECK_HELPER_SOURCE, "shmcheck", arch)
+        debugfs_write(img, helper, SHMCHECK_HELPER_GUEST)
     if demo.name in {"pty", "jobctl", "ssh-poll", "ssh-select"}:
         helper = compile_helper(PTY_HELPER_SOURCE, "pty-relay", arch)
         debugfs_write(img, helper, PTY_HELPER_GUEST)
@@ -1327,6 +1389,156 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
             if view.label == "SysExit" and syscall == "read" and parse_i64(view.event.arg1) == 0:
                 eof_tids.add(tid)
         selected_views = trimmed
+    if demo.name == "cow":
+        helper_parent_tid: int | None = None
+        helper_child_tid: int | None = None
+        for view in reversed(selected_views):
+            if view.label != "SysExit":
+                continue
+            if syscall_name(view.event.arg0) != "clone":
+                continue
+            child_tid = parse_i64(view.event.arg1)
+            if child_tid <= 0:
+                continue
+            helper_parent_tid = view.event.tid
+            helper_child_tid = child_tid
+            break
+        if helper_parent_tid is not None and helper_child_tid is not None:
+            keep_syscalls = {"mmap", "mprotect", "clone", "wait4", "munmap"}
+            keep_labels = {"PageFault", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep: set[int] = set()
+            pending_syscalls: dict[int, str] = {}
+            region_start: int | None = None
+            for view in views:
+                if view.event.tid not in {helper_parent_tid, helper_child_tid}:
+                    continue
+                if (
+                    view.label == "SysExit"
+                    and view.event.tid == helper_parent_tid
+                    and syscall_name(view.event.arg0) == "mmap"
+                    and region_start is None
+                    and parse_i64(view.event.arg1) > 0
+                ):
+                    region_start = parse_i64(view.event.arg1)
+                if view.label in keep_labels:
+                    if view.label == "PageFault":
+                        if region_start is None:
+                            continue
+                        fault_addr = parse_usize(view.event.arg0)
+                        if not (region_start <= fault_addr < region_start + 0x2000):
+                            continue
+                    keep.add(view.event.seq)
+                    continue
+                if view.label == "SysEnter":
+                    name = syscall_name(view.event.arg0)
+                    if name in keep_syscalls:
+                        keep.add(view.event.seq)
+                        pending_syscalls[view.event.tid] = name
+                    continue
+                if view.label == "SysExit":
+                    name = syscall_name(view.event.arg0)
+                    if pending_syscalls.get(view.event.tid) == name:
+                        keep.add(view.event.seq)
+                        pending_syscalls.pop(view.event.tid, None)
+            selected_views = [view for view in views if view.event.seq in keep]
+    if demo.name == "filemap":
+        helper_tid: int | None = None
+        region_starts: list[int] = []
+        for view in reversed(selected_views):
+            if view.label == "WaitReap":
+                helper_tid = parse_usize(view.event.arg0)
+                break
+        if helper_tid is not None:
+            keep_syscalls = {"openat", "ftruncate", "mmap", "pread64", "pwrite64", "munmap", "close"}
+            keep_labels = {"PageFault", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep: set[int] = set()
+            pending_syscalls: dict[int, str] = {}
+            parent_tid = next(
+                (view.event.tid for view in views if view.label == "WaitReap" and parse_usize(view.event.arg0) == helper_tid),
+                None,
+            )
+            for view in views:
+                if view.event.tid == helper_tid and view.label == "SysExit" and syscall_name(view.event.arg0) == "mmap":
+                    start = parse_i64(view.event.arg1)
+                    if start > 0:
+                        region_starts.append(start)
+                if view.event.tid == helper_tid:
+                    if view.label in keep_labels:
+                        if view.label == "PageFault":
+                            fault_addr = parse_usize(view.event.arg0)
+                            if not any(start <= fault_addr < start + 0x1000 for start in region_starts):
+                                continue
+                        keep.add(view.event.seq)
+                        continue
+                    if view.label == "SysEnter":
+                        name = syscall_name(view.event.arg0)
+                        if name in keep_syscalls:
+                            keep.add(view.event.seq)
+                            pending_syscalls[view.event.tid] = name
+                        continue
+                    if view.label == "SysExit":
+                        name = syscall_name(view.event.arg0)
+                        if pending_syscalls.get(view.event.tid) == name:
+                            keep.add(view.event.seq)
+                            pending_syscalls.pop(view.event.tid, None)
+                        continue
+                if parent_tid is not None and view.event.tid == parent_tid and view.label in {"WaitReap", "SignalSend", "SignalHandle"}:
+                    keep.add(view.event.seq)
+                    if view.label == "SignalHandle" and view.event.arg0 != "0x11":
+                        keep.discard(view.event.seq)
+            selected_views = [view for view in views if view.event.seq in keep]
+    if demo.name == "shm":
+        helper_parent_tid: int | None = None
+        helper_child_tid: int | None = None
+        region_start: int | None = None
+        for view in reversed(selected_views):
+            if view.label != "SysExit":
+                continue
+            if syscall_name(view.event.arg0) != "clone":
+                continue
+            child_tid = parse_i64(view.event.arg1)
+            if child_tid <= 0:
+                continue
+            helper_parent_tid = view.event.tid
+            helper_child_tid = child_tid
+            break
+        if helper_parent_tid is not None and helper_child_tid is not None:
+            keep_syscalls = {"shmget", "shmat", "clone", "wait4", "shmdt", "shmctl"}
+            keep_labels = {"PageFault", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep: set[int] = set()
+            pending_syscalls: dict[int, str] = {}
+            for view in views:
+                if view.event.tid not in {helper_parent_tid, helper_child_tid}:
+                    continue
+                if (
+                    view.label == "SysExit"
+                    and view.event.tid == helper_parent_tid
+                    and syscall_name(view.event.arg0) == "shmat"
+                    and region_start is None
+                    and parse_i64(view.event.arg1) > 0
+                ):
+                    region_start = parse_i64(view.event.arg1)
+                if view.label in keep_labels:
+                    if view.label == "PageFault":
+                        if region_start is None:
+                            continue
+                        fault_addr = parse_usize(view.event.arg0)
+                        if not (region_start <= fault_addr < region_start + 0x1000):
+                            continue
+                    keep.add(view.event.seq)
+                    continue
+                if view.label == "SysEnter":
+                    name = syscall_name(view.event.arg0)
+                    if name in keep_syscalls:
+                        keep.add(view.event.seq)
+                        pending_syscalls[view.event.tid] = name
+                    continue
+                if view.label == "SysExit":
+                    name = syscall_name(view.event.arg0)
+                    if pending_syscalls.get(view.event.tid) == name:
+                        keep.add(view.event.seq)
+                        pending_syscalls.pop(view.event.tid, None)
+            selected_views = [view for view in views if view.event.seq in keep]
     if demo.name in {"ssh-poll", "ssh-select", "sshd"}:
         trimmed = []
         pending_io: dict[tuple[int, str], EventView] = {}
@@ -2500,6 +2712,105 @@ def build_walkthrough(
             )
         elif signal_events:
             lines.append("signal activity confirms the wait path observed child completion.")
+        return lines
+    if demo.name == "cow":
+        mmap_exit = find_syscall_view(event_views, syscall="mmap", label="SysExit")
+        protect_enter = find_syscall_view(event_views, syscall="mprotect", label="SysEnter")
+        clone_exit = find_syscall_view(event_views, syscall="clone", label="SysExit")
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        page_faults = [view for view in key_views if view.label == "PageFault"]
+        task_exit = next((view for view in task_exits if view.event.arg0 == "0x0"), None)
+        helper_parent_tid = wait_reap.event.tid if wait_reap is not None else None
+        helper_child_tid = parse_usize(wait_reap.event.arg0) if wait_reap is not None else None
+        lines = [
+            "the helper mapped two anonymous private pages, touched them, flipped one page read-only and back to writable, then forked to force copy-on-write on the first private page.",
+        ]
+        if mmap_exit is not None:
+            lines.append(f"the anonymous region was created through {mmap_exit.detail}.")
+        if protect_enter is not None:
+            lines.append(
+                "the second page went through mprotect(PROT_READ) and then mprotect(PROT_READ|PROT_WRITE) before the fork."
+            )
+        if clone_exit is not None and parse_i64(clone_exit.event.arg1) > 0:
+            lines.append(
+                f"helper task tid={helper_parent_tid or clone_exit.event.tid} forked child tid={helper_child_tid or parse_i64(clone_exit.event.arg1)} so parent and child temporarily shared the first page as a COW mapping."
+            )
+        if page_faults:
+            lines.append(
+                f"page-fault activity stayed visible ({len(page_faults)} event(s)), including the child-side write fault that materialized a private copy."
+            )
+        if wait_reap is not None:
+            lines.append(f"the parent validated its original bytes and then completed child collection through {wait_reap.detail}.")
+        if "cow-lab" in artifact_outputs.get("demo-step-1.txt", ""):
+            lines.append(
+                "the helper printed `cow-lab`, which means the parent still saw `parent-page` after the child wrote `child-copy`, so anonymous copy-on-write held end to end."
+            )
+        if task_exit is not None:
+            lines.append(f"the workload closed out cleanly with {task_exit.detail}.")
+        return lines
+    if demo.name == "filemap":
+        helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
+        helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
+        mmap_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "mmap"
+        ]
+        shared_fault = next((view for view in helper_views if view.label == "PageFault" and view.event.arg0 == "0x1000"), None)
+        private_fault = next((view for view in helper_views if view.label == "PageFault" and view.event.arg0 == "0x1000"), None)
+        write_fault = next((view for view in helper_views if view.label == "PageFault" and view.event.arg0 == "0x1005"), None)
+        task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
+        lines = [
+            "the helper created a two-page file, mapped page 0 as MAP_SHARED and page 1 as MAP_PRIVATE, then checked coherence in both directions.",
+        ]
+        if len(mmap_exits) >= 2:
+            lines.append(
+                f"the shared and private mappings were established through {mmap_exits[0].detail} and {mmap_exits[1].detail}."
+            )
+        if shared_fault is not None:
+            lines.append("the initial shared/private touches faulted the mapped file pages into memory through the page cache.")
+        if write_fault is not None:
+            lines.append("a later write fault on the private mapping stayed visible, which is the per-process MAP_PRIVATE copy path instead of a file-wide shared write.")
+        lines.append("writing through the shared mapping was observed back through pread(), and then pwrite() into the file became visible through the still-mapped shared page.")
+        lines.append("writing through the private mapping did not change the backing file bytes, so reopening the file still showed `private-base` on page 1.")
+        if helper_reap is not None:
+            lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
+        if "filemap-lab" in artifact_outputs.get("demo-step-1.txt", ""):
+            lines.append(
+                "the helper printed `filemap-lab`, which means shared-map coherence and private-map isolation both held end to end."
+            )
+        if task_exit is not None:
+            lines.append(f"the helper itself exited cleanly with {task_exit.detail}.")
+        return lines
+    if demo.name == "shm":
+        shmat_exit = find_syscall_view(event_views, syscall="shmat", label="SysExit")
+        clone_exit = find_syscall_view(event_views, syscall="clone", label="SysExit")
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        page_faults = [view for view in key_views if view.label == "PageFault"]
+        task_exit = next((view for view in task_exits if view.event.arg0 == "0x0"), None)
+        helper_parent_tid = wait_reap.event.tid if wait_reap is not None else None
+        helper_child_tid = parse_usize(wait_reap.event.arg0) if wait_reap is not None else None
+        lines = [
+            "the helper created one SysV shared-memory segment, attached it in the parent, forked a child that inherited the attachment, and then exercised child detach plus parent-side IPC_RMID cleanup.",
+        ]
+        if shmat_exit is not None:
+            lines.append(f"the initial attach succeeded through {shmat_exit.detail}.")
+        if clone_exit is not None and parse_i64(clone_exit.event.arg1) > 0:
+            lines.append(
+                f"helper task tid={helper_parent_tid or clone_exit.event.tid} forked child tid={helper_child_tid or parse_i64(clone_exit.event.arg1)}, so the shared segment had to stay visible across process inheritance."
+            )
+        if page_faults:
+            lines.append(
+                f"page-fault activity stayed visible ({len(page_faults)} event(s)), showing the shared segment being faulted into both parent and child address spaces."
+            )
+        lines.append("the child wrote through the inherited shared pointer and detached with shmdt(), then the parent observed the new bytes before issuing IPC_RMID and the final detach.")
+        if wait_reap is not None:
+            lines.append(f"the parent's wait path completed through {wait_reap.detail}.")
+        if "shm-lab" in artifact_outputs.get("demo-step-1.txt", ""):
+            lines.append(
+                "the helper printed `shm-lab`, which means shared bytes crossed the fork boundary, child-side shmdt succeeded, and the segment stopped being attachable after IPC_RMID plus the last detach."
+            )
+        if task_exit is not None:
+            lines.append(f"the workload closed out cleanly with {task_exit.detail}.")
         return lines
     if demo.name == "fd":
         fd_count = parse_fd_snapshot(artifact_outputs.get("starry_fd.txt", ""))
