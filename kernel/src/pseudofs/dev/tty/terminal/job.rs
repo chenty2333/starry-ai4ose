@@ -73,7 +73,7 @@ impl JobControl {
 
     pub fn set_session(&self, session: &Arc<Session>) {
         let mut guard = self.session.lock();
-        assert!(guard.upgrade().is_none());
+        assert!(guard.upgrade().is_none_or(|current| Arc::ptr_eq(&current, session)));
         *guard = Arc::downgrade(session);
     }
 

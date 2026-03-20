@@ -61,6 +61,14 @@ fn do_poll(
                 let mut res = 0usize;
                 for ((fd, events), revents) in fds.0.iter().zip(revents.iter_mut()) {
                     let mut result = fd.poll();
+                    if result.intersects(IoEvents::HUP | IoEvents::RDHUP) {
+                        // Treat stream EOF as readable so plain POLLIN users
+                        // still wake up on peer shutdown.
+                        result |= IoEvents::IN;
+                    }
+                    if result.contains(IoEvents::RDHUP) {
+                        result |= IoEvents::HUP;
+                    }
                     if result.contains(IoEvents::IN) {
                         result |= IoEvents::RDNORM;
                     }

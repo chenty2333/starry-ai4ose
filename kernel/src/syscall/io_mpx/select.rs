@@ -115,7 +115,12 @@ fn do_select(
             poll_io(&observed, IoEvents::empty(), false, || {
                 let mut res = 0usize;
                 for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
-                    let events = fd.poll() & *interested;
+                    let mut events = fd.poll();
+                    if events.intersects(IoEvents::HUP | IoEvents::RDHUP) {
+                        // select(2) callers commonly wait on readfds for EOF.
+                        events |= IoEvents::IN;
+                    }
+                    events &= *interested;
                     if events.contains(IoEvents::IN)
                         && let Some(set) = readfds.as_deref_mut()
                     {

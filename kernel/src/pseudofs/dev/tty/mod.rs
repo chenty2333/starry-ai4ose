@@ -69,15 +69,27 @@ impl<R: TtyRead, W: TtyWrite + Clone> Tty<R, W> {
 impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
     pub fn bind_to(self: &Arc<Self>, proc: &Process) -> AxResult<()> {
         let pg = proc.group();
-        if pg.session().sid() != proc.pid() {
+        let session = pg.session();
+        if session.sid() != proc.pid() {
             return Err(AxError::OperationNotPermitted);
         }
-        assert!(pg.session().set_terminal_with(|| {
-            self.terminal.job_control.set_session(&pg.session());
-            self.clone()
-        }));
-
-        self.terminal.job_control.set_foreground(&pg).unwrap();
+        let term: Arc<dyn Any + Send + Sync> = self.clone();
+        if let Some(existing) = session.terminal() {
+            if !Arc::ptr_eq(&existing, &term) {
+                return Err(AxError::OperationNotPermitted);
+            }
+        } else {
+            if let Some(owner) = self.terminal.job_control.session()
+                && !Arc::ptr_eq(&owner, &session)
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
+            if !session.set_terminal_with(|| term.clone()) {
+                return Err(AxError::OperationNotPermitted);
+            }
+        }
+        self.terminal.job_control.set_session(&session);
+        self.terminal.job_control.set_foreground(&pg)?;
         Ok(())
     }
 
@@ -176,6 +188,11 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             TIOCSCTTY => {
                 let curr = current();
                 let proc = &curr.as_thread().proc_data.proc;
+                if let Some(owner) = self.terminal.job_control.session()
+                    && !Arc::ptr_eq(&owner, &proc.group().session())
+                {
+                    return Err(AxError::OperationNotPermitted);
+                }
                 self.this.upgrade().unwrap().bind_to(proc)?;
                 lab::emit(
                     EventKind::TtyCtl,
@@ -206,8 +223,6 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                             Some(SignalInfo::new_kernel(Signo::SIGCONT)),
                         );
                     }
-                } else {
-                    warn!("Failed to unset terminal");
                 }
             }
             _ => return Err(AxError::NotATty),

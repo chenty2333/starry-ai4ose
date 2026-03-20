@@ -65,6 +65,9 @@ impl WaitPid {
 
 pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
     let options = WaitOptions::from_bits(options).ok_or(AxError::InvalidInput)?;
+    if options.intersects(WaitOptions::WUNTRACED | WaitOptions::WCONTINUED) {
+        return Err(AxError::InvalidInput);
+    }
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
     let curr = current();
@@ -94,16 +97,16 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
 
     let check_children = || {
         if let Some(child) = children.iter().find(|child| child.is_zombie()) {
-            lab::emit(
-                EventKind::WaitReap,
-                child.pid() as usize,
-                child.exit_code() as usize,
-            );
-            if !options.contains(WaitOptions::WNOWAIT) {
-                child.free();
-            }
             if let Some(exit_code) = exit_code.nullable() {
                 exit_code.vm_write(child.exit_code())?;
+            }
+            if !options.contains(WaitOptions::WNOWAIT) {
+                lab::emit(
+                    EventKind::WaitReap,
+                    child.pid() as usize,
+                    child.exit_code() as usize,
+                );
+                child.free();
             }
             Ok(Some(child.pid() as _))
         } else if options.contains(WaitOptions::WNOHANG) {

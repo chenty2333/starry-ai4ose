@@ -369,6 +369,9 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             Processor::External(_) => {}
             Processor::None(reader, _) => reader.register_close_waker(waker),
         }
+        if self.eof.load(Ordering::Acquire) {
+            waker.wake_by_ref();
+        }
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {

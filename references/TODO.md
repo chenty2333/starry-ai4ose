@@ -118,6 +118,18 @@ Exit condition:
 Exit condition:
 `make lab-sshd` produces clean phase artifacts that explain the SSH path without raw-trace spelunking, and `make lab-repeat-sshd` still matches exactly.
 
+## M10: SSH Semantics Hardening
+
+- [x] Surface socket peer shutdown as readable hangup in `poll/select` so plain EOF waiters wake reliably.
+- [x] Wake late PTY pollers immediately once EOF/HUP has already been observed.
+- [x] Make `TIOCSCTTY` idempotent for the owning session and reject cross-session controlling-tty rebinding cleanly.
+- [x] Make `TIOCNOTTY` detach quietly when the tty is not actually owned by the caller session.
+- [x] Stop reporting a fake `WaitReap` event for `WNOWAIT`.
+- [x] Reject `WUNTRACED/WCONTINUED` until stop/continue reporting is implemented instead of silently lying.
+
+Exit condition:
+`make lab-repeat-tcp`, `make lab-repeat-pty`, and `make lab-repeat-sshd` all stay green after the semantic tightening pass.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion
