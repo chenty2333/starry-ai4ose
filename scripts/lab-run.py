@@ -4,10 +4,13 @@ import argparse
 import collections
 import datetime as dt
 import errno
+import fcntl
 import hashlib
+import os
 import pathlib
 import queue
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -34,11 +37,24 @@ TCP_PORT = 34568
 HTTP_PORT = 34569
 SSH_POLL_PORT = 34570
 SSH_SELECT_PORT = 34571
+SSHD_PORT = 5555
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKING_DISK_IMG = REPO_ROOT / "make" / "disk.img"
 LAB_BIN_DIR = REPO_ROOT / ".lab-bin"
 PTY_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "pty_relay.c"
 PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
+DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
+DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
+SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
+DROPBEAR_GUEST = "/usr/bin/lab_dropbear"
+DROPBEARKEY_GUEST = "/usr/bin/lab_dropbearkey"
+DROPBEAR_LIB_GUEST_DIR = "/usr/lib/ssh-lab"
+DROPBEAR_LIBCRYPT_GUEST = f"{DROPBEAR_LIB_GUEST_DIR}/libcrypt.so.2"
+DROPBEAR_LOG_GUEST = "/tmp/lab_dropbear.log"
+DROPBEARKEY_LOG_GUEST = "/tmp/lab_dropbearkey.log"
+DROPBEAR_HOSTKEY_GUEST = "/root/dropbear_ed25519_host_key"
+AUTHORIZED_KEYS_GUEST = "/root/.ssh/authorized_keys"
+SSHD_INPUT_LINES: tuple[str, ...] = ("PS1=", "export PS1", r"printf${IFS}sshd-lab\\n", r"sleep${IFS}1&wait", "exit")
 
 TTY_CTL_NAMES: dict[int, str] = {
     1: "TIOCSCTTY",
@@ -330,6 +346,38 @@ DEMOS: dict[str, Demo] = {
         focus_signal_arg0=None,
         net="y",
     ),
+    "sshd": Demo(
+        name="sshd",
+        goal="Bring up a real Dropbear SSH server in the guest and log in from the host with an interactive pty-backed shell.",
+        commands=(),
+        expected_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "WaitReap",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        ),
+        focus_events=(
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "WaitReap",
+            "SignalSend",
+            "SignalHandle",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        ),
+        focus_syscalls=("socket", "bind", "listen", "accept", "accept4", "read", "write", "wait4", "close"),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="y",
+    ),
 }
 
 ARTIFACT_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -473,26 +521,136 @@ def compile_pty_helper(arch: str) -> pathlib.Path:
     return output
 
 
-def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
-    subprocess.run(
-        ["debugfs", "-w", "-R", f"rm {guest}", str(img)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["debugfs", "-w", "-R", f"write {local} {guest}", str(img)],
+def nix_build_output(attr: str) -> pathlib.Path:
+    completed = subprocess.run(
+        ["nix", "build", "--no-link", "--print-out-paths", attr],
         check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError(f"nix build did not return an output path for {attr}")
+    return pathlib.Path(lines[-1])
+
+
+def read_rpath(binary: pathlib.Path) -> tuple[str, ...]:
+    completed = subprocess.run(
+        ["patchelf", "--print-rpath", str(binary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rendered = completed.stdout.strip()
+    if not rendered:
+        return ()
+    return tuple(part for part in rendered.split(":") if part)
+
+
+def prepare_dropbear_assets(arch: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    if arch != BASELINE_ARCH:
+        raise RuntimeError(f"unsupported arch for dropbear assets: {arch}")
+
+    package = nix_build_output(DROPBEAR_ATTR)
+    dropbear_src = package / "bin" / "dropbear"
+    dropbearkey_src = package / "bin" / "dropbearkey"
+    rpath = read_rpath(dropbear_src)
+    libcrypt_dir = next((pathlib.Path(part) for part in rpath if "libxcrypt" in part), None)
+    if libcrypt_dir is None:
+        raise RuntimeError("failed to locate libxcrypt directory in dropbear RUNPATH")
+    libcrypt_src = libcrypt_dir / "libcrypt.so.2"
+
+    stage_dir = DROPBEAR_STAGE_DIR / arch
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    dropbear_dst = stage_dir / "lab_dropbear"
+    dropbearkey_dst = stage_dir / "lab_dropbearkey"
+    libcrypt_dst = stage_dir / "libcrypt.so.2"
+
+    for path in (dropbear_dst, dropbearkey_dst, libcrypt_dst):
+        if path.exists():
+            path.chmod(0o755)
+            path.unlink()
+
+    shutil.copy2(dropbear_src, dropbear_dst)
+    shutil.copy2(dropbearkey_src, dropbearkey_dst)
+    shutil.copy2(libcrypt_src, libcrypt_dst)
+
+    for binary in (dropbear_dst, dropbearkey_dst):
+        binary.chmod(0o755)
+        subprocess.run(
+            [
+                "patchelf",
+                "--set-interpreter",
+                "/lib/ld-musl-riscv64.so.1",
+                "--set-rpath",
+                f"{DROPBEAR_LIB_GUEST_DIR}:/usr/lib:/lib",
+                str(binary),
+            ],
+            check=True,
+        )
+    libcrypt_dst.chmod(0o644)
+    return dropbear_dst, dropbearkey_dst, libcrypt_dst
+
+
+def ensure_ssh_client_key() -> tuple[pathlib.Path, str]:
+    SSH_KEY_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    private_key = SSH_KEY_STAGE_DIR / "client_ed25519"
+    public_key = SSH_KEY_STAGE_DIR / "client_ed25519.pub"
+    if not private_key.exists() or not public_key.exists():
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "starry-lab",
+                "-f",
+                str(private_key),
+            ],
+            check=True,
+        )
+    return private_key, public_key.read_text(encoding="utf-8").strip()
+
+
+def debugfs_run(img: pathlib.Path, command: str, *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["debugfs", "-w", "-R", command, str(img)],
+        check=check,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        text=True,
     )
+
+
+def debugfs_mkdir(img: pathlib.Path, guest_dir: str) -> None:
+    parts = [part for part in guest_dir.split("/") if part]
+    current = ""
+    for part in parts:
+        current += "/" + part
+        debugfs_run(img, f"mkdir {current}")
+
+
+def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
+    debugfs_run(img, f"rm {guest}")
+    debugfs_run(img, f"write {local} {guest}", check=True)
 
 
 def ensure_guest_helpers(demo: Demo, arch: str) -> None:
-    if demo.name not in {"pty", "ssh-poll", "ssh-select"}:
+    if demo.name not in {"pty", "ssh-poll", "ssh-select", "sshd"}:
         return
     img = ensure_working_disk(arch)
-    helper = compile_pty_helper(arch)
-    debugfs_write(img, helper, PTY_HELPER_GUEST)
+    if demo.name in {"pty", "ssh-poll", "ssh-select"}:
+        helper = compile_pty_helper(arch)
+        debugfs_write(img, helper, PTY_HELPER_GUEST)
+    if demo.name == "sshd":
+        dropbear, dropbearkey, libcrypt = prepare_dropbear_assets(arch)
+        debugfs_mkdir(img, DROPBEAR_LIB_GUEST_DIR)
+        debugfs_write(img, dropbear, DROPBEAR_GUEST)
+        debugfs_write(img, dropbearkey, DROPBEARKEY_GUEST)
+        debugfs_write(img, libcrypt, DROPBEAR_LIBCRYPT_GUEST)
 
 
 def run_build(arch: str) -> None:
@@ -554,10 +712,36 @@ def clean_capture(text: str, command: str | None = None) -> str:
 
 
 def normalize_demo_output(demo: Demo, text: str) -> str:
-    if demo.name not in {"pty", "ssh-poll", "ssh-select"}:
+    if demo.name not in {"pty", "ssh-poll", "ssh-select", "sshd"}:
         return text
-    drop = {"echo pty-lab", "echo ssh-lab", "sleep 1 & wait", "exit"}
-    kept = [line for line in text.splitlines() if line.strip() not in drop]
+    drop = {
+        "echo pty-lab",
+        "echo ssh-lab",
+        "PS1=",
+        "export PS1",
+        r"printf${IFS}sshd-lab\\n",
+        r"printf${IFS}ssh-lab\\n",
+        "sleep 1 & wait",
+        r"sleep${IFS}1&wait",
+        "exit",
+        "Connection to 127.0.0.1 closed.",
+        "Welcome to Alpine!",
+        "The Alpine Wiki contains a large amount of how-to guides a general",
+        "information about administrating Alpine systems.",
+        "See <https://wiki.alnelinux.org/>.",
+        "You can setup the system with the command: setup-alpine",
+        "You change this message by editing /etc/motd.",
+    }
+    kept = []
+    for line in text.splitlines():
+        candidate = line.strip()
+        if candidate.startswith(PROMPT):
+            candidate = candidate.split(PROMPT, 1)[1].strip()
+        if not candidate:
+            continue
+        if candidate in drop:
+            continue
+        kept.append(candidate)
     while kept and not kept[0].strip():
         kept.pop(0)
     while kept and not kept[-1].strip():
@@ -953,7 +1137,7 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
             if view.label == "SysExit" and syscall == "read" and parse_i64(view.event.arg1) == 0:
                 eof_tids.add(tid)
         selected_views = trimmed
-    if demo.name in {"ssh-poll", "ssh-select"}:
+    if demo.name in {"ssh-poll", "ssh-select", "sshd"}:
         trimmed = []
         pending_io: dict[tuple[int, str], EventView] = {}
         for view in selected_views:
@@ -1211,6 +1395,136 @@ def start_shell_peer(port: int, label: str) -> PeerController:
     return PeerController(thread=thread, results=results)
 
 
+def wait_for_tcp_port(host: str, port: int, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.1)
+    raise TimeoutError(f"timed out waiting for {host}:{port}: {last_error}")
+
+
+def sshd_setup_commands(public_key: str) -> tuple[str, ...]:
+    return (
+        "mkdir /root/.ssh 2>/dev/null || true",
+        "chmod 700 /root",
+        "chmod 700 /root/.ssh",
+        f"printf '%s\\n' {shell_quote(public_key)} > {AUTHORIZED_KEYS_GUEST}",
+        f"chmod 600 {AUTHORIZED_KEYS_GUEST}",
+        f"rm -f {DROPBEAR_LOG_GUEST} {DROPBEARKEY_LOG_GUEST} {DROPBEAR_HOSTKEY_GUEST}",
+        f"{DROPBEARKEY_GUEST} -t ed25519 -f {DROPBEAR_HOSTKEY_GUEST} >{DROPBEARKEY_LOG_GUEST} 2>&1",
+        f"chmod 600 {DROPBEAR_HOSTKEY_GUEST}",
+        f"{DROPBEAR_GUEST} -E -F -s -p {SSHD_PORT} -r {DROPBEAR_HOSTKEY_GUEST} >{DROPBEAR_LOG_GUEST} 2>&1 &",
+        "sleep 1",
+    )
+
+
+def run_host_ssh_demo(private_key: pathlib.Path, timeout: float) -> PeerResult:
+    command = [
+        "ssh",
+        "-tt",
+        "-p",
+        str(SSHD_PORT),
+        "-i",
+        str(private_key),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "ConnectTimeout=10",
+        "root@127.0.0.1",
+    ]
+    master_fd, slave_fd = os.openpty()
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    proc = subprocess.Popen(
+        command,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        start_new_session=True,
+    )
+    os.close(slave_fd)
+
+    transcript = bytearray()
+    lines = [line + "\r" for line in SSHD_INPUT_LINES]
+    line_index = 0
+    char_index = 0
+    next_send_at = time.monotonic() + 1.0
+    delay_between_chars = 0.01
+    delay_between_lines = 0.2
+    deadline = time.monotonic() + timeout
+
+    try:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if line_index < len(lines) and now >= next_send_at:
+                line = lines[line_index]
+                os.write(master_fd, line[char_index].encode("utf-8"))
+                char_index += 1
+                if char_index == len(line):
+                    line_index += 1
+                    char_index = 0
+                    next_send_at = now + delay_between_lines
+                else:
+                    next_send_at = now + delay_between_chars
+
+            readable, _, _ = select.select([master_fd], [], [], 0.05)
+            if master_fd in readable:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        chunk = b""
+                    else:
+                        raise
+                if chunk:
+                    transcript.extend(chunk)
+
+            if proc.poll() is not None and line_index >= len(lines):
+                try:
+                    chunk = os.read(master_fd, 4096)
+                    if chunk:
+                        transcript.extend(chunk)
+                        continue
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                break
+        else:
+            proc.terminate()
+            raise TimeoutError("host ssh demo timed out")
+    finally:
+        os.close(master_fd)
+
+    proc.wait(timeout=1)
+    rendered = clean_remote_shell_transcript(transcript.decode("utf-8", errors="ignore"))
+    if proc.returncode != 0 and "sshd-lab" not in rendered:
+        detail = rendered or f"ssh exited with status {proc.returncode}"
+        raise RuntimeError(f"host ssh login failed: {detail}")
+    notes = [
+        "host OpenSSH authenticated with a temporary ed25519 key and opened a real remote pty-backed shell.",
+        f"the host-side ssh transcript captured {len([line for line in rendered.splitlines() if line.strip()])} non-empty line(s).",
+    ]
+    if proc.returncode != 0:
+        notes.append(f"the host ssh client exited with status {proc.returncode} after the remote transcript completed.")
+    return PeerResult(notes=tuple(notes), transcript=rendered)
+
+
 def start_demo_peer(demo: Demo) -> PeerController | None:
     if demo.name == "udp":
         return start_udp_echo_peer()
@@ -1466,6 +1780,40 @@ def build_walkthrough(
             lines.append(f"the relay and shell closed out with {task_exit.detail}.")
         lines.extend(peer_notes)
         return lines
+    if demo.name == "sshd":
+        pty_open = next((view for view in key_views if view.label == "PtyOpen"), None)
+        session_create = next((view for view in key_views if view.label == "SessionCreate"), None)
+        tty_ctls = [view for view in key_views if view.label == "TtyCtl"]
+        pg_set = next((view for view in key_views if view.label == "ProcessGroupSet"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        task_exit = next((view for view in key_views if view.label == "TaskExit"), None)
+        transcript = artifact_outputs.get("demo-step-1.txt", "").strip()
+        lines: list[str] = [
+            f"the guest ran a real Dropbear SSH server on port {SSHD_PORT}, and the host OpenSSH client logged in over QEMU user-net forwarding.",
+        ]
+        if pty_open is not None:
+            lines.append(f"dropbear allocated the session pty via {pty_open.detail}.")
+        if session_create is not None:
+            lines.append(f"the login shell created a new session with {session_create.detail}.")
+        if tty_ctls:
+            rendered = ", ".join(view.detail for view in tty_ctls[:3])
+            lines.append(f"controlling-tty setup flowed through {rendered}.")
+        if pg_set is not None:
+            lines.append(f"job-control setup included {pg_set.detail}.")
+        if wait_reap is not None:
+            lines.append(f"the explicit `sleep 1 & wait` path finished through {wait_reap.detail}.")
+        if transcript:
+            lines.append(
+                "the real SSH transcript printed `sshd-lab`, which confirms the path guest sshd -> pty -> shell -> pty -> encrypted socket -> host ssh client end to end."
+            )
+        if counts["PollSleep"] or counts["PollWake"]:
+            lines.append(
+                f"the combined socket/tty path slept {counts['PollSleep']} time(s) and woke {counts['PollWake']} time(s)."
+            )
+        if task_exit is not None:
+            lines.append(f"the session closed out with {task_exit.detail}.")
+        lines.extend(peer_notes)
+        return lines
     return [view.detail for view in key_views[:5]]
 
 
@@ -1634,36 +1982,88 @@ def execute_run(
         sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=boot_timeout)
         session = Session(sock)
         session.wait_for_prompt(boot_timeout)
+        input_stream: list[str] = []
         for command in demo.setup_commands:
-            session.run_command(command, command_timeout)
-        input_stream = ["echo 1 > /proc/starry/reset"]
-        session.run_command(input_stream[0], command_timeout)
-
-        peer = start_demo_peer(demo)
-        demo_outputs: list[tuple[pathlib.Path, str]] = []
-        for index, command in enumerate(demo.commands, start=1):
             input_stream.append(command)
-            output = session.run_command(command, command_timeout)
-            cleaned_output = normalize_demo_output(demo, clean_capture(output, command))
-            step_path = out_dir / f"demo-step-{index}.txt"
+            session.run_command(command, command_timeout)
+        demo_outputs: list[tuple[pathlib.Path, str]] = []
+        peer_notes: tuple[str, ...] = ()
+        if demo.name == "sshd":
+            private_key, public_key = ensure_ssh_client_key()
+            for command in sshd_setup_commands(public_key):
+                input_stream.append(command)
+                session.run_command(command, command_timeout)
+            wait_for_tcp_port("127.0.0.1", SSHD_PORT, timeout=min(command_timeout, 10.0))
+            input_stream.append("echo 1 > /proc/starry/reset")
+            session.run_command(input_stream[-1], command_timeout)
+            host_command = (
+                f"HOST:ssh -tt -p {SSHD_PORT} -i {private_key} "
+                "root@127.0.0.1"
+            )
+            input_stream.append(host_command)
+            try:
+                peer_result = run_host_ssh_demo(private_key, command_timeout)
+            except Exception as exc:
+                auth_keys = clean_capture(
+                    session.run_command(f"cat {AUTHORIZED_KEYS_GUEST} 2>/dev/null || true", command_timeout),
+                    f"cat {AUTHORIZED_KEYS_GUEST} 2>/dev/null || true",
+                )
+                auth_perms = clean_capture(
+                    session.run_command("ls -ld /root /root/.ssh /root/.ssh/authorized_keys 2>/dev/null || true", command_timeout),
+                    "ls -ld /root /root/.ssh /root/.ssh/authorized_keys 2>/dev/null || true",
+                )
+                dropbearkey_log = clean_capture(
+                    session.run_command(f"cat {DROPBEARKEY_LOG_GUEST} 2>/dev/null || true", command_timeout),
+                    f"cat {DROPBEARKEY_LOG_GUEST} 2>/dev/null || true",
+                )
+                dropbear_log = clean_capture(
+                    session.run_command(f"cat {DROPBEAR_LOG_GUEST} 2>/dev/null || true", command_timeout),
+                    f"cat {DROPBEAR_LOG_GUEST} 2>/dev/null || true",
+                )
+                if dropbearkey_log:
+                    raise RuntimeError(
+                        f"{exc}\nguest authorized_keys:\n{auth_keys}\nguest auth perms:\n{auth_perms}\n"
+                        f"guest dropbearkey log:\n{dropbearkey_log}\nguest dropbear log:\n{dropbear_log}"
+                    ) from exc
+                if dropbear_log:
+                    raise RuntimeError(
+                        f"{exc}\nguest authorized_keys:\n{auth_keys}\nguest auth perms:\n{auth_perms}\n"
+                        f"guest dropbear log:\n{dropbear_log}"
+                    ) from exc
+                raise
+            peer_notes = peer_result.notes
+            cleaned_output = normalize_demo_output(demo, peer_result.transcript)
+            step_path = out_dir / "demo-step-1.txt"
             write_text(step_path, cleaned_output)
             demo_outputs.append((step_path, cleaned_output))
-        peer_result = peer.finish(command_timeout) if peer is not None else PeerResult(notes=())
-        peer_notes = peer_result.notes
-        if peer_result.transcript:
-            for step_path, cleaned_output in demo_outputs:
-                if cleaned_output.strip() and demo.name not in {"ssh-poll", "ssh-select"}:
-                    continue
-                write_text(step_path, peer_result.transcript)
-                break
-        elif peer_notes:
-            for step_path, cleaned_output in demo_outputs:
-                if cleaned_output.strip():
-                    continue
-                fallback = ["(no guest stdout captured)"]
-                fallback.extend(peer_notes)
-                write_text(step_path, "\n".join(fallback) + "\n")
-                break
+        else:
+            input_stream.append("echo 1 > /proc/starry/reset")
+            session.run_command(input_stream[-1], command_timeout)
+
+            peer = start_demo_peer(demo)
+            for index, command in enumerate(demo.commands, start=1):
+                input_stream.append(command)
+                output = session.run_command(command, command_timeout)
+                cleaned_output = normalize_demo_output(demo, clean_capture(output, command))
+                step_path = out_dir / f"demo-step-{index}.txt"
+                write_text(step_path, cleaned_output)
+                demo_outputs.append((step_path, cleaned_output))
+            peer_result = peer.finish(command_timeout) if peer is not None else PeerResult(notes=())
+            peer_notes = peer_result.notes
+            if peer_result.transcript:
+                for step_path, cleaned_output in demo_outputs:
+                    if cleaned_output.strip() and demo.name not in {"ssh-poll", "ssh-select"}:
+                        continue
+                    write_text(step_path, peer_result.transcript)
+                    break
+            elif peer_notes:
+                for step_path, cleaned_output in demo_outputs:
+                    if cleaned_output.strip():
+                        continue
+                    fallback = ["(no guest stdout captured)"]
+                    fallback.extend(peer_notes)
+                    write_text(step_path, "\n".join(fallback) + "\n")
+                    break
 
         input_stream.append("echo 1 > /proc/starry/off")
         session.run_command(input_stream[-1], command_timeout)
@@ -1676,6 +2076,15 @@ def execute_run(
             artifact_outputs[name] = clean_capture(output, command)
             if raw:
                 write_text(out_dir / name, artifact_outputs[name])
+        if raw and demo.name == "sshd":
+            for filename, guest_path in (
+                ("lab_dropbear.log", DROPBEAR_LOG_GUEST),
+                ("lab_dropbearkey.log", DROPBEARKEY_LOG_GUEST),
+            ):
+                command = f"cat {guest_path} 2>/dev/null || true"
+                output = session.run_command(command, command_timeout)
+                artifact_outputs[filename] = clean_capture(output, command)
+                write_text(out_dir / filename, artifact_outputs[filename])
 
         trace_text = artifact_outputs["starry_trace.txt"]
         stats_text = artifact_outputs["starry_stats.txt"]

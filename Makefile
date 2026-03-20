@@ -107,6 +107,9 @@ lab-ssh-poll:
 lab-ssh-select:
 	$(MAKE) --no-print-directory lab DEMO=ssh-select LAB_RAW=$(LAB_RAW)
 
+lab-sshd:
+	$(MAKE) --no-print-directory lab DEMO=sshd LAB_RAW=$(LAB_RAW)
+
 lab-repeat:
 	python3 ./scripts/lab-run.py $(DEMO) $(LAB_RAW_FLAG) $(LAB_REPEAT_DEFAULT_FLAG)
 
@@ -140,6 +143,9 @@ lab-repeat-ssh-poll:
 lab-repeat-ssh-select:
 	$(MAKE) --no-print-directory lab-repeat DEMO=ssh-select REPEAT=2 LAB_RAW=$(LAB_RAW)
 
+lab-repeat-sshd:
+	$(MAKE) --no-print-directory lab-repeat DEMO=sshd REPEAT=2 LAB_RAW=$(LAB_RAW)
+
 # Aliases
 rv:
 	$(MAKE) ARCH=riscv64 run
@@ -150,4 +156,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean lab lab-run lab-pipe lab-wait lab-fd lab-fault lab-udp lab-tcp lab-http lab-pty lab-ssh-poll lab-ssh-select lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-fd lab-repeat-fault lab-repeat-udp lab-repeat-tcp lab-repeat-http lab-repeat-pty lab-repeat-ssh-poll lab-repeat-ssh-select
+.PHONY: build run justrun debug disasm clean lab lab-run lab-pipe lab-wait lab-fd lab-fault lab-udp lab-tcp lab-http lab-pty lab-ssh-poll lab-ssh-select lab-sshd lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-fd lab-repeat-fault lab-repeat-udp lab-repeat-tcp lab-repeat-http lab-repeat-pty lab-repeat-ssh-poll lab-repeat-ssh-select lab-repeat-sshd

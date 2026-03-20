@@ -96,6 +96,17 @@ Running the same demo twice produces traces that are close enough to compare mea
 Exit condition:
 The TCP stream demo is clean enough to teach, and the next SSH-oriented backlog is explicit.
 
+## M8: Real SSH Bring-up
+
+- [x] Stage a guest-runnable SSH server binary in the lab rootfs.
+- [x] Log in from the host with key-based auth over QEMU user-net forwarding.
+- [x] Route the SSH login into a real pty-backed interactive shell.
+- [x] Capture the SSH teaching path in `summary.txt` and `key_trace.txt`.
+- [x] Check repeatability for the first real SSH demo.
+
+Exit condition:
+`make lab-sshd` produces one real SSH login trace and `make lab-repeat-sshd` can compare repeated runs meaningfully.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

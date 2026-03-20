@@ -5,44 +5,34 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::current;
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 use starry_vm::vm_load_until_nul;
 
 use crate::{
     config::USER_HEAP_BASE,
-    file::FD_TABLE,
+    file::{FD_TABLE, resolve_at},
     mm::{load_user_app, vm_load_string},
     task::AsThread,
 };
 
-pub fn sys_execve(
+fn collect_string_array(ptr: *const *const c_char) -> AxResult<Vec<alloc::string::String>> {
+    if ptr.is_null() {
+        Ok(Vec::new())
+    } else {
+        vm_load_until_nul(ptr)?
+            .into_iter()
+            .map(vm_load_string)
+            .collect()
+    }
+}
+
+fn execve_common(
     uctx: &mut UserContext,
-    path: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
+    path: alloc::string::String,
+    args: Vec<alloc::string::String>,
+    envs: Vec<alloc::string::String>,
 ) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
-
-    let args = if argv.is_null() {
-        // Handle NULL argv (treat as empty array)
-        Vec::new()
-    } else {
-        vm_load_until_nul(argv)?
-            .into_iter()
-            .map(vm_load_string)
-            .collect::<Result<Vec<_>, _>>()?
-    };
-
-    let envs = if envp.is_null() {
-        // Handle NULL envp (treat as empty array)
-        Vec::new()
-    } else {
-        vm_load_until_nul(envp)?
-            .into_iter()
-            .map(vm_load_string)
-            .collect::<Result<Vec<_>, _>>()?
-    };
-
-    debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
+    debug!("execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
@@ -85,4 +75,49 @@ pub fn sys_execve(
     uctx.set_ip(entry_point.as_usize());
     uctx.set_sp(user_stack_base.as_usize());
     Ok(0)
+}
+
+pub fn sys_execve(
+    uctx: &mut UserContext,
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> AxResult<isize> {
+    execve_common(
+        uctx,
+        vm_load_string(path)?,
+        collect_string_array(argv)?,
+        collect_string_array(envp)?,
+    )
+}
+
+pub fn sys_execveat(
+    uctx: &mut UserContext,
+    dirfd: i32,
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    flags: i32,
+) -> AxResult<isize> {
+    let allowed_flags = (AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) as i32;
+    if flags & !allowed_flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let path = if path.is_null() {
+        None
+    } else {
+        Some(vm_load_string(path)?)
+    };
+    let resolved = resolve_at(dirfd, path.as_deref(), flags as u32)?
+        .into_file()
+        .ok_or(AxError::BadFileDescriptor)?;
+    let path = resolved.absolute_path()?.to_string();
+
+    execve_common(
+        uctx,
+        path,
+        collect_string_array(argv)?,
+        collect_string_array(envp)?,
+    )
 }
