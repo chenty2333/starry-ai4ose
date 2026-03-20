@@ -230,6 +230,17 @@ Exit condition:
 Exit condition:
 `make lab-repeat-snake` stays exact-match green, and the output makes it obvious that a real fbdev+evdev game loop ran, consumed keyboard turns, grew the snake, and rendered a deterministic final frame.
 
+## M20: Graphics Stage 4, X11-lite
+
+- [x] Add a first `x11` lab path that installs `xorg-server`, `xf86-video-fbdev`, `xf86-input-evdev`, and `xcalc` inside the guest.
+- [x] Split the X11 lab into phase-focused traces for X server bring-up and first-client rendering.
+- [x] Capture one host-side QMP screendump after the first X client appears.
+- [x] Expose `make lab-x11` / `make lab-repeat-x11`.
+- [x] Teach the runner to summarize `X -retro -> xcalc -> screendump` in one readable X11-lite walkthrough.
+
+Exit condition:
+`make lab-x11` produces a real X server + client bring-up trace plus one framebuffer screenshot, and `make lab-repeat-x11` can compare repeated runs meaningfully.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

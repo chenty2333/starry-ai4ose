@@ -31,6 +31,7 @@
 #     - `QEMU_LOG`: Enable QEMU logging (log file is "qemu.log")
 #     - `NET_DUMP`: Enable network packet dump (log file is "netdump.pcap")
 #     - `NET_DEV`: QEMU netdev backend types: user, tap, bridge
+#     - `HOSTFWD`: Enable the default QEMU user-net host forwarding rules on port 5555
 #     - `VFIO_PCI`: PCI device address in the format "bus:dev.func" to passthrough
 #     - `VHOST`: Enable vhost-net for tap backend (only for `NET_DEV=tap`)
 # * Network options:
@@ -76,6 +77,7 @@ DISK_IMG ?= disk.img
 QEMU_LOG ?= n
 NET_DUMP ?= n
 NET_DEV ?= user
+HOSTFWD ?= y
 VFIO_PCI ?=
 VHOST ?= n
 

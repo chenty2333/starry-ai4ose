@@ -107,6 +107,9 @@ lab-gui:
 lab-snake:
 	$(MAKE) --no-print-directory lab DEMO=snake LAB_RAW=$(LAB_RAW)
 
+lab-x11:
+	python3 ./scripts/lab-run.py x11 --boot-timeout 120 --command-timeout 600 $(LAB_RAW_FLAG)
+
 lab-stage-snake:
 	$(MAKE) --no-print-directory lab-stage DEMO=snake
 
@@ -173,6 +176,9 @@ lab-repeat-gui:
 lab-repeat-snake:
 	$(MAKE) --no-print-directory lab-repeat DEMO=snake REPEAT=2 LAB_RAW=$(LAB_RAW)
 
+lab-repeat-x11:
+	python3 ./scripts/lab-run.py x11 --boot-timeout 120 --command-timeout 600 $(LAB_RAW_FLAG) --repeat 2
+
 lab-repeat-fd:
 	$(MAKE) --no-print-directory lab-repeat DEMO=fd REPEAT=2 LAB_RAW=$(LAB_RAW)
 
@@ -216,4 +222,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean lab lab-stage lab-run lab-pipe lab-wait lab-cow lab-filemap lab-shm lab-fb lab-ev lab-gui lab-snake lab-stage-snake lab-fd lab-fault lab-udp lab-tcp lab-http lab-pty lab-jobctl lab-waitctl lab-ssh-poll lab-ssh-select lab-sshd lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-cow lab-repeat-filemap lab-repeat-shm lab-repeat-fb lab-repeat-ev lab-repeat-gui lab-repeat-snake lab-repeat-fd lab-repeat-fault lab-repeat-udp lab-repeat-tcp lab-repeat-http lab-repeat-pty lab-repeat-jobctl lab-repeat-waitctl lab-repeat-ssh-poll lab-repeat-ssh-select lab-repeat-sshd
+.PHONY: build run justrun debug disasm clean lab lab-stage lab-run lab-pipe lab-wait lab-cow lab-filemap lab-shm lab-fb lab-ev lab-gui lab-snake lab-x11 lab-stage-snake lab-fd lab-fault lab-udp lab-tcp lab-http lab-pty lab-jobctl lab-waitctl lab-ssh-poll lab-ssh-select lab-sshd lab-repeat lab-repeat-pipe lab-repeat-wait lab-repeat-cow lab-repeat-filemap lab-repeat-shm lab-repeat-fb lab-repeat-ev lab-repeat-gui lab-repeat-snake lab-repeat-x11 lab-repeat-fd lab-repeat-fault lab-repeat-udp lab-repeat-tcp lab-repeat-http lab-repeat-pty lab-repeat-jobctl lab-repeat-waitctl lab-repeat-ssh-poll lab-repeat-ssh-select lab-repeat-sshd

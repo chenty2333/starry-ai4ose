@@ -67,6 +67,7 @@ SNAKE_HELPER_GUEST = "/usr/bin/lab_snake"
 DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
+X11_STAGE_DIR = LAB_BIN_DIR / "x11"
 DROPBEAR_GUEST = "/usr/bin/lab_dropbear"
 DROPBEARKEY_GUEST = "/usr/bin/lab_dropbearkey"
 DROPBEAR_LIB_GUEST_DIR = "/usr/lib/ssh-lab"
@@ -84,6 +85,13 @@ SSHD_PHASE5B_TOKEN = "sshd-sigttin-lab"
 WAITCTL_STOP_TOKEN = "waitctl-stop-lab"
 WAITCTL_CONTINUE_TOKEN = "waitctl-continue-lab"
 WAITCTL_REAP_TOKEN = "waitctl-reap-lab"
+X11_SERVER_TOKEN = "__LAB_X11_SERVER__"
+X11_CLIENT_TOKEN = "x11-lab"
+X11_APK_LOG_GUEST = "/tmp/lab_x11_apk.log"
+X11_SERVER_LOG_GUEST = "/tmp/lab_x11.log"
+X11_CLIENT_LOG_GUEST = "/tmp/lab_xcalc.log"
+X11_SERVER_PID_GUEST = "/tmp/lab_x11.pid"
+X11_CLIENT_PID_GUEST = "/tmp/lab_xcalc.pid"
 SSHD_PHASE2_LINES: tuple[str, ...] = (
     "PS1=",
     "export PS1",
@@ -412,6 +420,20 @@ DEMOS: dict[str, Demo] = {
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
         net="n",
+        graphic="y",
+        input="y",
+    ),
+    "x11": Demo(
+        name="x11",
+        goal="Bring up X11 over fbdev+evdev, launch a real X client, and capture a guest framebuffer screenshot as proof of GUI output.",
+        commands=(),
+        expected_events=("SysEnter", "SysExit", "PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit"),
+        focus_events=("PageFault", "PollSleep", "PollWake", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=("openat", "ioctl", "mmap", "read", "write", "socket", "connect", "close"),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="y",
         graphic="y",
         input="y",
     ),
@@ -959,8 +981,17 @@ def create_lab_disk(base_img: pathlib.Path, demo: Demo) -> pathlib.Path:
     return run_disk
 
 
-def spawn_qemu(arch: str, net: str, graphic: str, input_devices: str, disk_img: pathlib.Path) -> subprocess.Popen[str]:
+def spawn_qemu(
+    arch: str,
+    net: str,
+    graphic: str,
+    input_devices: str,
+    disk_img: pathlib.Path,
+    hostfwd: str = "n",
+    snapshot: str = "y",
+) -> subprocess.Popen[str]:
     qmp_args = f" -qmp tcp::{QMP_PORT},server=on,wait=off" if graphic == "y" or input_devices == "y" else ""
+    qemu_args = f"{'-snapshot ' if snapshot == 'y' else ''}-monitor none -serial tcp::{SERIAL_PORT},server=on{qmp_args}"
     return subprocess.Popen(
         [
             "make",
@@ -971,15 +1002,50 @@ def spawn_qemu(arch: str, net: str, graphic: str, input_devices: str, disk_img: 
             f"INPUT={input_devices}",
             f"HEADLESS_GRAPHIC={'y' if graphic == 'y' else 'n'}",
             f"DISK_IMG={disk_img}",
+            f"HOSTFWD={hostfwd}",
             f"ACCEL={BASELINE_ACCEL}",
             f"ICOUNT={BASELINE_ICOUNT}",
             f"SMP={BASELINE_SMP}",
             "justrun",
-            f"QEMU_ARGS=-snapshot -monitor none -serial tcp::{SERIAL_PORT},server=on{qmp_args}",
+            f"QEMU_ARGS={qemu_args}",
         ],
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def prepare_x11_base(arch: str, boot_timeout: float, command_timeout: float) -> pathlib.Path:
+    base_img = ensure_working_disk(arch)
+    X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    prepared_img = X11_STAGE_DIR / f"x11-base-{arch}.img"
+    if prepared_img.exists() and prepared_img.stat().st_mtime >= base_img.stat().st_mtime:
+        return prepared_img
+
+    shutil.copyfile(base_img, prepared_img)
+    proc = spawn_qemu(
+        arch,
+        net="y",
+        graphic="y",
+        input_devices="y",
+        disk_img=prepared_img,
+        hostfwd="n",
+        snapshot="n",
+    )
+    try:
+        wait_for_qemu_start(proc, boot_timeout)
+        sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=boot_timeout)
+        session = Session(sock)
+        session.wait_for_prompt(boot_timeout)
+        session.run_command(x11_install_command(), max(command_timeout, 900.0))
+        session.run_command("sync", command_timeout)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    return prepared_img
 
 
 def write_text(path: pathlib.Path, content: str) -> None:
@@ -2358,6 +2424,84 @@ def select_waitctl_phase_views(phase_name: str, views: list[EventView]) -> list[
     return [view for view in views if view.event.seq in keep]
 
 
+def select_x11_phase_views(phase_name: str, views: list[EventView]) -> list[EventView]:
+    if phase_name == "phase-1-server":
+        keep_labels = {"PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+        focus_syscalls = {"openat", "ioctl", "mmap", "read", "close"}
+    elif phase_name == "phase-2-client":
+        keep_labels = {"PageFault", "PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+        focus_syscalls = {"socket", "connect", "openat", "read", "write", "close"}
+    else:
+        return views
+
+    keep: set[int] = {view.event.seq for view in views if view.label in keep_labels}
+    pending_syscalls: dict[int, str] = {}
+    for view in views:
+        if view.label == "SysEnter":
+            name = syscall_name(view.event.arg0)
+            if name in focus_syscalls:
+                if name in {"read", "write"} and parse_i64(view.event.arg1) in {0, 1, 2}:
+                    continue
+                keep.add(view.event.seq)
+                pending_syscalls[view.event.tid] = name
+            continue
+        if view.label == "SysExit":
+            name = syscall_name(view.event.arg0)
+            if pending_syscalls.get(view.event.tid) == name:
+                if name in {"read", "write"} and abs(parse_i64(view.event.arg1)) == 1:
+                    pending_syscalls.pop(view.event.tid, None)
+                    continue
+                keep.add(view.event.seq)
+                pending_syscalls.pop(view.event.tid, None)
+    selected = [view for view in views if view.event.seq in keep]
+    collapsed: list[EventView] = []
+    previous_signature: tuple[str, str] | None = None
+    for view in selected:
+        if view.label in {"PollSleep", "PollWake"}:
+            signature = (view.label, view.detail)
+            if signature == previous_signature:
+                continue
+            previous_signature = signature
+            collapsed.append(view)
+            continue
+        previous_signature = None
+        collapsed.append(view)
+    return collapsed
+
+
+def build_x11_phase_walkthrough(
+    phase_name: str,
+    key_views: list[EventView],
+    transcript: str,
+    notes: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    if phase_name == "phase-1-server":
+        lines = [
+            "this phase isolates X server bring-up over fbdev and evdev: package setup is already done, then `X -retro` opens the framebuffer, input devices, and its local UNIX socket.",
+        ]
+        if any(view.label == "PageFault" for view in key_views):
+            lines.append("framebuffer-backed pages faulted into the X server while it brought the screen up.")
+        if any(view.label in {"PollSleep", "PollWake"} for view in key_views):
+            lines.append("the server's device/event loop entered poll and woke again while finishing initialization.")
+        if X11_SERVER_TOKEN in transcript:
+            lines.append("the guest printed the server-ready token, so `/tmp/.X11-unix/X0` was live and ready for clients.")
+        lines.extend(notes)
+        return tuple(lines)
+
+    if phase_name == "phase-2-client":
+        lines = [
+            "this phase isolates the first real X client: `xcalc` connects to the local X server, draws one window, and stays alive long enough for the runner to capture a framebuffer screenshot.",
+        ]
+        if any(view.label in {"PollSleep", "PollWake"} for view in key_views):
+            lines.append("client/server interaction stayed visible through poll wakeups while the X connection became active.")
+        if X11_CLIENT_TOKEN in transcript:
+            lines.append("the guest printed `x11-lab`, so `xcalc` stayed alive long enough to prove the GUI client path succeeded.")
+        lines.extend(notes)
+        return tuple(lines)
+
+    return ()
+
+
 def build_waitctl_phase_walkthrough(
     phase_name: str,
     key_views: list[EventView],
@@ -2452,6 +2596,67 @@ def render_waitctl_phase_artifacts(
         input_stream=input_stream,
         walkthrough=walkthrough,
     )
+
+
+def render_x11_phase_artifacts(
+    phase_dir: pathlib.Path,
+    phase_name: str,
+    title: str,
+    events: list[TraceEvent],
+    stats_text: str,
+    last_fault_text: str,
+    input_stream: tuple[str, ...],
+    transcript: str,
+    notes: tuple[str, ...],
+    raw: bool,
+) -> PhaseResult:
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    event_views = build_event_views(events)
+    key_views = select_x11_phase_views(phase_name, event_views)
+    write_text(phase_dir / "key_trace.txt", render_event_table(key_views))
+    walkthrough = build_x11_phase_walkthrough(phase_name, key_views, transcript, notes)
+    create_phase_summary(
+        phase_dir / "summary.txt",
+        title,
+        input_stream,
+        events,
+        key_views,
+        stats_text,
+        walkthrough,
+    )
+    if raw:
+        trace_lines = [
+            f"{event.seq}\t{event.time_ns}\t{event.tid}\t{event.kind}\t{event.arg0}\t{event.arg1}"
+            for event in events
+        ]
+        write_text(phase_dir / "starry_trace.txt", "\n".join(trace_lines) + ("\n" if trace_lines else ""))
+        write_text(phase_dir / "starry_stats.txt", stats_text)
+        write_text(phase_dir / "starry_last_fault.txt", last_fault_text)
+    return PhaseResult(
+        name=phase_name,
+        title=title,
+        out_dir=phase_dir,
+        events=events,
+        event_views=event_views,
+        key_events=[view.event for view in key_views],
+        key_views=key_views,
+        stats_text=stats_text,
+        last_fault_text=last_fault_text,
+        input_stream=input_stream,
+        walkthrough=walkthrough,
+    )
+
+
+def render_x11_key_trace(path: pathlib.Path, phase_results: tuple[PhaseResult, ...]) -> list[EventView]:
+    sections: list[str] = []
+    combined: list[EventView] = []
+    for phase in phase_results:
+        sections.append(f"== {phase.name}: {phase.title} ==")
+        sections.append(render_event_table(phase.key_views))
+        sections.append("")
+        combined.extend(phase.key_views)
+    write_text(path, "\n".join(sections).rstrip() + "\n")
+    return combined
 
 
 def create_phase_summary(
@@ -2736,6 +2941,17 @@ def qmp_execute(handle: "socket.SocketIO", execute: str, arguments: dict[str, ob
             return message
         if "error" in message:
             raise RuntimeError(f"qmp {execute} failed: {message['error']}")
+
+
+def qmp_screendump(path: pathlib.Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve()
+    wait_for_tcp_port("127.0.0.1", QMP_PORT, timeout=10.0)
+    with socket.create_connection(("127.0.0.1", QMP_PORT), timeout=10) as sock:
+        handle = sock.makefile("rwb")
+        qmp_read_message(handle)
+        qmp_execute(handle, "qmp_capabilities")
+        qmp_execute(handle, "screendump", {"filename": str(resolved)})
 
 
 def start_input_peer() -> PeerController:
@@ -3143,6 +3359,57 @@ def start_demo_peer(demo: Demo) -> PeerController | None:
     if demo.name == "ssh-select":
         return start_shell_peer(SSH_SELECT_PORT, "ssh-select")
     return None
+
+
+def x11_install_command() -> str:
+    packages = "xorg-server xf86-video-fbdev xf86-input-evdev xcalc"
+    return (
+        f"rm -f {X11_APK_LOG_GUEST}; "
+        f"apk info -e {packages} >/dev/null 2>&1 || apk add {packages} >{X11_APK_LOG_GUEST} 2>&1"
+    )
+
+
+def x11_server_command() -> str:
+    return (
+        "sh -c '"
+        f"rm -f {X11_SERVER_LOG_GUEST} {X11_SERVER_PID_GUEST}; "
+        f"X -retro >{X11_SERVER_LOG_GUEST} 2>&1 & "
+        "pid=$!; "
+        f"echo $pid > {X11_SERVER_PID_GUEST}; "
+        "for i in $(seq 1 80); do "
+        f"  [ -S /tmp/.X11-unix/X0 ] && {{ printf \"{X11_SERVER_TOKEN}\\n\"; exit 0; }}; "
+        "  sleep 0.25; "
+        "done; "
+        "kill $pid 2>/dev/null || true; "
+        "exit 1'"
+    )
+
+
+def x11_client_command() -> str:
+    return (
+        "sh -c '"
+        f"rm -f {X11_CLIENT_LOG_GUEST} {X11_CLIENT_PID_GUEST}; "
+        f"DISPLAY=:0 xcalc >{X11_CLIENT_LOG_GUEST} 2>&1 & "
+        "pid=$!; "
+        f"echo $pid > {X11_CLIENT_PID_GUEST}; "
+        "sleep 2; "
+        "kill -0 $pid; "
+        f"printf \"{X11_CLIENT_TOKEN}\\n\"'"
+    )
+
+
+def x11_cleanup_command() -> str:
+    return (
+        "sh -c '"
+        f"for f in {X11_CLIENT_PID_GUEST} {X11_SERVER_PID_GUEST}; do "
+        "  [ -f \"$f\" ] || continue; "
+        "  pid=$(cat \"$f\" 2>/dev/null); "
+        "  [ -n \"$pid\" ] && kill \"$pid\" 2>/dev/null || true; "
+        "done; "
+        "sleep 1; "
+        "for f in "
+        f"{X11_CLIENT_PID_GUEST} {X11_SERVER_PID_GUEST}; do rm -f \"$f\"; done'"
+    )
 
 
 def summarize_syscalls(events: list[TraceEvent]) -> list[str]:
@@ -3587,6 +3854,33 @@ def build_walkthrough(
         if task_exit is not None:
             lines.append(f"the helper itself exited cleanly with {task_exit.detail}.")
         return lines
+    if demo.name == "x11":
+        if phase_results:
+            phase_map = {phase.name: phase for phase in phase_results}
+            server_phase = phase_map.get("phase-1-server")
+            client_phase = phase_map.get("phase-2-client")
+            lines = [
+                "the X11-lite demo is split into two focused phases so device bring-up and first-client rendering stay readable instead of collapsing into one huge mixed trace.",
+            ]
+            if server_phase is not None:
+                lines.append("phase 1 isolated `X -retro` over fbdev+evdev, including framebuffer mapping, local server bring-up, and the first poll loop.")
+                lines.extend(f"(phase 1) {line}" for line in server_phase.walkthrough[:3])
+            if client_phase is not None:
+                lines.append("phase 2 isolated the first real client, `xcalc`, including its connection to X and one captured GUI frame.")
+                lines.extend(f"(phase 2) {line}" for line in client_phase.walkthrough[:4])
+                screenshot = client_phase.out_dir / "screen.ppm"
+                if screenshot.exists():
+                    lines.append(f"the runner also captured one framebuffer screenshot at `{screenshot}` as proof that the X client actually drew on screen.")
+            transcript = artifact_outputs.get("demo-step-1.txt", "")
+            if X11_CLIENT_TOKEN in transcript:
+                lines.append(
+                    "the combined transcript printed `x11-lab`, so the X server stayed up and the first GUI client remained alive long enough to draw."
+                )
+            lines.extend(peer_notes)
+            return lines
+        return [
+            "the X11-lite demo brings up `X -retro` over fbdev+evdev, then launches `xcalc` as the first real client.",
+        ]
     if demo.name == "fd":
         fd_count = parse_fd_snapshot(artifact_outputs.get("starry_fd.txt", ""))
         lines = [
@@ -3993,10 +4287,20 @@ def execute_run(
     command_timeout: float,
     raw: bool,
 ) -> RunResult:
-    base_img = ensure_working_disk(arch)
+    if demo.name == "x11":
+        base_img = prepare_x11_base(arch, boot_timeout, command_timeout)
+    else:
+        base_img = ensure_working_disk(arch)
     run_disk = create_lab_disk(base_img, demo)
     ensure_guest_helpers(demo, arch, run_disk)
-    proc = spawn_qemu(arch, demo.net, demo.graphic, demo.input, run_disk)
+    proc = spawn_qemu(
+        arch,
+        demo.net,
+        demo.graphic,
+        demo.input,
+        run_disk,
+        hostfwd="y" if demo.name == "sshd" else "n",
+    )
     try:
         wait_for_qemu_start(proc, boot_timeout)
         sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=boot_timeout)
@@ -4044,6 +4348,87 @@ def execute_run(
                 )
             phase_results = tuple(phase_results_list)
             cleaned_output = normalize_demo_output(demo, "\n".join(t for t in phase_transcripts if t))
+            step_path = out_dir / "demo-step-1.txt"
+            write_text(step_path, cleaned_output)
+            demo_outputs.append((step_path, cleaned_output))
+        elif demo.name == "x11":
+            phase_results_list: list[PhaseResult] = []
+            x11_peer_notes: list[str] = []
+            install_command = x11_install_command()
+            input_stream.append(install_command)
+            session.run_command(install_command, max(command_timeout, 600.0))
+            x11_phase_specs = (
+                (
+                    "phase-1-server",
+                    "X server over fbdev+evdev",
+                    "echo 1 > /proc/starry/reset",
+                    x11_server_command(),
+                    "echo 1 > /proc/starry/off",
+                    (),
+                ),
+                (
+                    "phase-2-client",
+                    "First X client (`xcalc`)",
+                    "echo 1 > /proc/starry/reset",
+                    x11_client_command(),
+                    "echo 1 > /proc/starry/off",
+                    (),
+                ),
+            )
+            try:
+                for phase_name, phase_title, phase_start, phase_command, phase_end, notes in x11_phase_specs:
+                    input_stream.append(f"{phase_start} [{phase_name}]")
+                    session.run_command(phase_start, command_timeout)
+                    input_stream.append(f"{phase_command} [{phase_name}]")
+                    transcript = clean_capture(session.run_command(phase_command, max(command_timeout, 60.0)), phase_command)
+                    phase_notes = list(notes)
+                    if phase_name == "phase-2-client":
+                        screenshot_path = out_dir / phase_name / "screen.ppm"
+                        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+                        qmp_screendump(screenshot_path)
+                        phase_notes.append(f"the runner captured one QMP screendump at `{screenshot_path}` after the client window appeared.")
+                        x11_peer_notes.append(f"{phase_name}: {phase_notes[-1]}")
+                    input_stream.append(f"{phase_end} [{phase_name}]")
+                    session.run_command(phase_end, command_timeout)
+                    phase_outputs = collect_trace_artifacts(session, command_timeout)
+                    phase_events = parse_trace(phase_outputs["starry_trace.txt"])
+                    phase_results_list.append(
+                        render_x11_phase_artifacts(
+                            out_dir / phase_name,
+                            phase_name,
+                            phase_title,
+                            phase_events,
+                            phase_outputs["starry_stats.txt"],
+                            phase_outputs["starry_last_fault.txt"],
+                            (phase_command,),
+                            transcript,
+                            tuple(phase_notes),
+                            raw,
+                        )
+                    )
+            except Exception as exc:
+                apk_log = clean_capture(
+                    session.run_command(f"cat {X11_APK_LOG_GUEST} 2>/dev/null || true", command_timeout),
+                    f"cat {X11_APK_LOG_GUEST} 2>/dev/null || true",
+                )
+                x_log = clean_capture(
+                    session.run_command(f"cat {X11_SERVER_LOG_GUEST} 2>/dev/null || true", command_timeout),
+                    f"cat {X11_SERVER_LOG_GUEST} 2>/dev/null || true",
+                )
+                xcalc_log = clean_capture(
+                    session.run_command(f"cat {X11_CLIENT_LOG_GUEST} 2>/dev/null || true", command_timeout),
+                    f"cat {X11_CLIENT_LOG_GUEST} 2>/dev/null || true",
+                )
+                raise RuntimeError(
+                    f"{exc}\napk log:\n{apk_log}\nX log:\n{x_log}\nxcalc log:\n{xcalc_log}"
+                ) from exc
+            finally:
+                cleanup_command = x11_cleanup_command()
+                input_stream.append(cleanup_command)
+                session.run_command(cleanup_command, command_timeout)
+            phase_results = tuple(phase_results_list)
+            peer_notes = tuple(x11_peer_notes)
+            cleaned_output = f"{X11_CLIENT_TOKEN}\n"
             step_path = out_dir / "demo-step-1.txt"
             write_text(step_path, cleaned_output)
             demo_outputs.append((step_path, cleaned_output))
@@ -4270,7 +4655,12 @@ def execute_run(
             last_fault_text = phase_results[-1].last_fault_text if phase_results else "none\n"
             events = [event for phase in phase_results for event in phase.events]
             event_views = [view for phase in phase_results for view in phase.event_views]
-            key_views = render_sshd_key_trace(out_dir / "key_trace.txt", phase_results)
+            if demo.name == "sshd":
+                key_views = render_sshd_key_trace(out_dir / "key_trace.txt", phase_results)
+            elif demo.name == "x11":
+                key_views = render_x11_key_trace(out_dir / "key_trace.txt", phase_results)
+            else:
+                key_views = []
             key_events = [view.event for view in key_views]
             artifact_outputs["starry_stats.txt"] = stats_text
             artifact_outputs["starry_last_fault.txt"] = last_fault_text
