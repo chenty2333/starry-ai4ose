@@ -186,6 +186,17 @@ Exit condition:
 Exit condition:
 `make lab-repeat-shm` stays exact-match green, and the output makes it obvious that the child inherited the segment, detached successfully, and the segment stopped being attachable after `IPC_RMID` plus the last detach.
 
+## M16: Graphics Stage 1, Raw Framebuffer
+
+- [x] Add a dedicated `fb` helper workload that opens `/dev/fb0`, issues framebuffer metadata ioctls, mmaps the device, and draws a deterministic teaching scene.
+- [x] Stage the helper into the lab rootfs and expose `make lab-fb` / `make lab-repeat-fb`.
+- [x] Teach the runner to bring QEMU up with headless graphic devices so framebuffer labs stay scriptable over the serial control plane.
+- [x] Teach the runner to summarize `openat -> ioctl -> mmap -> draw -> munmap` in one readable framebuffer walkthrough.
+- [x] Re-check repeatability for the framebuffer workload.
+
+Exit condition:
+`make lab-repeat-fb` stays exact-match green, and the output makes it obvious that `/dev/fb0` was queried, mapped, and written successfully through a deterministic drawing workload.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

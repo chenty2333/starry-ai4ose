@@ -47,12 +47,14 @@ TTYSIG_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "ttysig.c"
 COWCTL_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "cowctl.c"
 FILEMAP_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "filemapctl.c"
 SHMCHECK_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "shmcheck.c"
+FBDRAW_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "fbdraw.c"
 PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
 WAITCTL_HELPER_GUEST = "/usr/bin/lab_waitctl"
 TTYSIG_HELPER_GUEST = "/usr/bin/lab_ttysig"
 COWCTL_HELPER_GUEST = "/usr/bin/lab_cowctl"
 FILEMAP_HELPER_GUEST = "/usr/bin/lab_filemapctl"
 SHMCHECK_HELPER_GUEST = "/usr/bin/lab_shmcheck"
+FBDRAW_HELPER_GUEST = "/usr/bin/lab_fbdraw"
 DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
@@ -190,6 +192,8 @@ class Demo:
     focus_page_fault_arg0: str | None = None
     focus_signal_arg0: str | None = None
     net: str = "n"
+    graphic: str = "n"
+    input: str = "n"
 
 
 @dataclass(frozen=True)
@@ -345,6 +349,20 @@ DEMOS: dict[str, Demo] = {
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
         net="n",
+    ),
+    "fb": Demo(
+        name="fb",
+        goal="Show raw framebuffer bring-up through /dev/fb0 ioctls, mmap, and direct pixel writes.",
+        commands=(FBDRAW_HELPER_GUEST,),
+        expected_events=("SysEnter", "SysExit", "PageFault", "WaitReap", "TaskExit"),
+        focus_events=("PageFault", "WaitReap", "SignalSend", "SignalHandle", "TaskExit"),
+        focus_syscalls=("openat", "ioctl", "mmap", "munmap", "close"),
+        setup_commands=(),
+        focus_page_fault_arg0=None,
+        focus_signal_arg0=None,
+        net="n",
+        graphic="y",
+        input="n",
     ),
     "fd": Demo(
         name="fd",
@@ -834,7 +852,7 @@ def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
 
 
 def ensure_guest_helpers(demo: Demo, arch: str) -> None:
-    if demo.name not in {"cow", "filemap", "shm", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
+    if demo.name not in {"cow", "filemap", "shm", "fb", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
         return
     img = ensure_working_disk(arch)
     if demo.name == "cow":
@@ -846,6 +864,9 @@ def ensure_guest_helpers(demo: Demo, arch: str) -> None:
     if demo.name == "shm":
         helper = compile_helper(SHMCHECK_HELPER_SOURCE, "shmcheck", arch)
         debugfs_write(img, helper, SHMCHECK_HELPER_GUEST)
+    if demo.name == "fb":
+        helper = compile_helper(FBDRAW_HELPER_SOURCE, "fbdraw", arch)
+        debugfs_write(img, helper, FBDRAW_HELPER_GUEST)
     if demo.name in {"pty", "jobctl", "ssh-poll", "ssh-select"}:
         helper = compile_helper(PTY_HELPER_SOURCE, "pty-relay", arch)
         debugfs_write(img, helper, PTY_HELPER_GUEST)
@@ -869,13 +890,16 @@ def run_build(arch: str) -> None:
     )
 
 
-def spawn_qemu(arch: str, net: str) -> subprocess.Popen[str]:
+def spawn_qemu(arch: str, net: str, graphic: str, input_devices: str) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [
             "make",
             f"ARCH={arch}",
             f"APP_FEATURES={BASELINE_APP_FEATURES}",
             f"NET={net}",
+            f"GRAPHIC={graphic}",
+            f"INPUT={input_devices}",
+            f"HEADLESS_GRAPHIC={'y' if graphic == 'y' else 'n'}",
             f"ACCEL={BASELINE_ACCEL}",
             f"ICOUNT={BASELINE_ICOUNT}",
             f"SMP={BASELINE_SMP}",
@@ -1538,6 +1562,66 @@ def select_key_views(demo: Demo, views: list[EventView]) -> list[EventView]:
                     if pending_syscalls.get(view.event.tid) == name:
                         keep.add(view.event.seq)
                         pending_syscalls.pop(view.event.tid, None)
+            selected_views = [view for view in views if view.event.seq in keep]
+    if demo.name == "fb":
+        helper_tid: int | None = None
+        fb_fd: int | None = None
+        mmap_exit_seq: int | None = None
+        page_fault_budget = 8
+        for view in reversed(selected_views):
+            if view.label == "WaitReap":
+                helper_tid = parse_usize(view.event.arg0)
+                break
+        if helper_tid is not None:
+            keep_syscalls = {"openat", "ioctl", "mmap", "munmap", "close"}
+            keep_labels = {"PageFault", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+            keep: set[int] = set()
+            pending_syscalls: dict[int, str] = {}
+            parent_tid = next(
+                (view.event.tid for view in views if view.label == "WaitReap" and parse_usize(view.event.arg0) == helper_tid),
+                None,
+            )
+            for view in views:
+                if view.event.tid == helper_tid:
+                    if (
+                        view.label == "SysExit"
+                        and syscall_name(view.event.arg0) == "openat"
+                        and fb_fd is None
+                        and parse_i64(view.event.arg1) >= 0
+                    ):
+                        fb_fd = parse_i64(view.event.arg1)
+                    if (
+                        view.label == "SysExit"
+                        and syscall_name(view.event.arg0) == "mmap"
+                        and parse_i64(view.event.arg1) > 0
+                        and mmap_exit_seq is None
+                    ):
+                        mmap_exit_seq = view.event.seq
+                    if view.label in keep_labels:
+                        if view.label == "PageFault":
+                            if mmap_exit_seq is None or view.event.seq <= mmap_exit_seq or page_fault_budget <= 0:
+                                continue
+                            page_fault_budget -= 1
+                        keep.add(view.event.seq)
+                        continue
+                    if view.label == "SysEnter":
+                        name = syscall_name(view.event.arg0)
+                        if name in keep_syscalls:
+                            if name in {"ioctl", "close"} and (fb_fd is None or parse_i64(view.event.arg1) != fb_fd):
+                                continue
+                            keep.add(view.event.seq)
+                            pending_syscalls[view.event.tid] = name
+                        continue
+                    if view.label == "SysExit":
+                        name = syscall_name(view.event.arg0)
+                        if pending_syscalls.get(view.event.tid) == name:
+                            keep.add(view.event.seq)
+                            pending_syscalls.pop(view.event.tid, None)
+                        continue
+                if parent_tid is not None and view.event.tid == parent_tid and view.label in {"WaitReap", "SignalSend", "SignalHandle"}:
+                    keep.add(view.event.seq)
+                    if view.label == "SignalHandle" and view.event.arg0 != "0x11":
+                        keep.discard(view.event.seq)
             selected_views = [view for view in views if view.event.seq in keep]
     if demo.name in {"ssh-poll", "ssh-select", "sshd"}:
         trimmed = []
@@ -2812,6 +2896,50 @@ def build_walkthrough(
         if task_exit is not None:
             lines.append(f"the workload closed out cleanly with {task_exit.detail}.")
         return lines
+    if demo.name == "fb":
+        helper_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        helper_tid = parse_usize(helper_reap.event.arg0) if helper_reap is not None else None
+        helper_views = [view for view in key_views if helper_tid is None or view.event.tid == helper_tid]
+        open_exit = next(
+            (view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "openat"),
+            None,
+        )
+        ioctl_exits = [
+            view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "ioctl"
+        ]
+        mmap_exit = next(
+            (view for view in helper_views if view.label == "SysExit" and syscall_name(view.event.arg0) == "mmap"),
+            None,
+        )
+        page_faults = [view for view in helper_views if view.label == "PageFault"]
+        task_exit = next((view for view in helper_views if view.label == "TaskExit"), None)
+        transcript = artifact_outputs.get("demo-step-1.txt", "")
+        lines = [
+            "the helper opened `/dev/fb0`, queried both fixed and variable framebuffer metadata, mapped the backing memory, and drew a small teaching scene directly into the framebuffer.",
+        ]
+        if open_exit is not None:
+            lines.append(f"the framebuffer device opened successfully through {open_exit.detail}.")
+        if len(ioctl_exits) >= 2:
+            lines.append(
+                f"two framebuffer metadata ioctls completed as {ioctl_exits[0].detail} and {ioctl_exits[1].detail} before drawing began."
+            )
+        elif ioctl_exits:
+            lines.append(f"framebuffer metadata flowed through {ioctl_exits[0].detail}.")
+        if mmap_exit is not None:
+            lines.append(f"pixel memory became writable through {mmap_exit.detail}.")
+        if page_faults:
+            lines.append(
+                f"the first drawing touches faulted framebuffer pages into the process view ({len(page_faults)} visible page-fault event(s) kept in the teaching trace)."
+            )
+        if "fb-lab" in transcript:
+            lines.append(
+                "the helper printed `fb-lab ... checksum=...`, which means the color bands, boxed center panel, and simple glyphs were all written through the mapped framebuffer."
+            )
+        if helper_reap is not None:
+            lines.append(f"the shell-side cleanup finished through {helper_reap.detail}.")
+        if task_exit is not None:
+            lines.append(f"the helper itself exited cleanly with {task_exit.detail}.")
+        return lines
     if demo.name == "fd":
         fd_count = parse_fd_snapshot(artifact_outputs.get("starry_fd.txt", ""))
         lines = [
@@ -3083,6 +3211,9 @@ def create_summary(
         f"- app_features: {BASELINE_APP_FEATURES}",
         f"- accel: {BASELINE_ACCEL}",
         f"- net: {demo.net}",
+        f"- graphic: {demo.graphic}",
+        f"- input: {demo.input}",
+        f"- headless_graphic: {'y' if demo.graphic == 'y' else 'n'}",
         f"- icount: {BASELINE_ICOUNT}",
         f"- smp: {BASELINE_SMP}",
         f"- dev_random_seed: {BASELINE_RANDOM_SEED}",
@@ -3215,7 +3346,7 @@ def execute_run(
     raw: bool,
 ) -> RunResult:
     ensure_guest_helpers(demo, arch)
-    proc = spawn_qemu(arch, demo.net)
+    proc = spawn_qemu(arch, demo.net, demo.graphic, demo.input)
     try:
         wait_for_qemu_start(proc, boot_timeout)
         sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=boot_timeout)
@@ -3571,6 +3702,9 @@ def create_repeatability_report(path: pathlib.Path, demo: Demo, runs: list[RunRe
         f"- app_features: {BASELINE_APP_FEATURES}",
         f"- accel: {BASELINE_ACCEL}",
         f"- net: {reference.net}",
+        f"- graphic: {demo.graphic}",
+        f"- input: {demo.input}",
+        f"- headless_graphic: {'y' if demo.graphic == 'y' else 'n'}",
         f"- icount: {BASELINE_ICOUNT}",
         f"- smp: {BASELINE_SMP}",
         f"- dev_random_seed: {BASELINE_RANDOM_SEED}",

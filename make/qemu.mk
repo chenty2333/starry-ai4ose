@@ -73,8 +73,15 @@ ifeq ($(NET_DUMP), y)
 endif
 
 qemu_args-$(GRAPHIC) += \
-  -device virtio-gpu-$(vdev-suffix) -vga none \
-  -serial mon:stdio
+  -device virtio-gpu-$(vdev-suffix) -vga none
+
+ifeq ($(GRAPHIC), y)
+  ifeq ($(HEADLESS_GRAPHIC), y)
+    qemu_args-y += -display none
+  else
+    qemu_args-y += -serial mon:stdio
+  endif
+endif
 
 ifeq ($(GRAPHIC), n)
   qemu_args-y += -nographic

@@ -23,6 +23,7 @@
 #     - `BLK`: Enable storage devices (virtio-blk)
 #     - `NET`: Enable network devices (virtio-net)
 #     - `GRAPHIC`: Enable display devices and graphic output (virtio-gpu)
+#     - `HEADLESS_GRAPHIC`: Keep graphic devices enabled while suppressing the host GUI window
 #     - `BUS`: Device bus type: mmio, pci
 #     - `MEM`: Memory size (default is 128M)
 #     - `DISK_IMG`: Path to the virtual disk image
@@ -62,6 +63,7 @@ NO_AXSTD ?= n
 BLK ?= n
 NET ?= n
 GRAPHIC ?= n
+HEADLESS_GRAPHIC ?= n
 INPUT ?= n
 VSOCK ?= n
 BUS ?= pci
