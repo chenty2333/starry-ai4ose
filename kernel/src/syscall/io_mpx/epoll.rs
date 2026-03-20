@@ -16,8 +16,7 @@ use crate::{
     },
     lab::{self, EventKind},
     mm::{UserConstPtr, UserPtr, nullable},
-    syscall::io_mpx::ObservedPollable,
-    syscall::signal::check_sigset_size,
+    syscall::{io_mpx::ObservedPollable, signal::check_sigset_size},
     task::with_blocked_signals,
     time::TimeValueLike,
 };
@@ -101,9 +100,7 @@ fn do_epoll_wait(
         nullable!(sigmask.get_as_ref())?.copied(),
         || match block_on(future::timeout(
             timeout,
-            poll_io(&observed, IoEvents::IN, false, || {
-                epoll.poll_events(events)
-            }),
+            poll_io(&observed, IoEvents::IN, false, || epoll.poll_events(events)),
         )) {
             Ok(r) => r.map(|n| n as _),
             Err(_) => Ok(0),

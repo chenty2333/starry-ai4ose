@@ -26,8 +26,10 @@ pub use self::{
     pidfd::PidFd,
     pipe::Pipe,
 };
-use crate::task::{AX_FILE_LIMIT, AsThread};
-use crate::lab::{self, EventKind};
+use crate::{
+    lab::{self, EventKind},
+    task::{AX_FILE_LIMIT, AsThread},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Kstat {

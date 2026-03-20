@@ -11,8 +11,10 @@ use core::{
 use axpoll::{IoEvents, Pollable};
 
 pub use self::{epoll::*, poll::*, select::*};
-use crate::file::FileLike;
-use crate::lab::{self, EventKind};
+use crate::{
+    file::FileLike,
+    lab::{self, EventKind},
+};
 
 struct FdPollSet(pub Vec<(Arc<dyn FileLike>, IoEvents)>);
 impl Pollable for FdPollSet {

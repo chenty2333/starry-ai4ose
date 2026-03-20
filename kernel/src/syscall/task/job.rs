@@ -19,7 +19,11 @@ fn resolve_setpgid_target(pid: Pid) -> AxResult<Arc<crate::task::ProcessData>> {
         return Ok(curr.as_thread().proc_data.clone());
     }
 
-    if curr_proc.children().iter().any(|child| child.pid() == target_pid) {
+    if curr_proc
+        .children()
+        .iter()
+        .any(|child| child.pid() == target_pid)
+    {
         get_process_data(target_pid)
     } else {
         Err(AxError::NoSuchProcess)
@@ -40,7 +44,11 @@ pub fn sys_setsid() -> AxResult<isize> {
     if let Some((session, group)) = proc.create_session() {
         register_session(&session);
         register_process_group(&group);
-        lab::emit(EventKind::SessionCreate, session.sid() as usize, group.pgid() as usize);
+        lab::emit(
+            EventKind::SessionCreate,
+            session.sid() as usize,
+            group.pgid() as usize,
+        );
         Ok(session.sid() as _)
     } else {
         Err(AxError::OperationNotPermitted)
@@ -78,8 +86,7 @@ pub fn sys_setpgid(pid: Pid, pgid: Pid) -> AxResult<isize> {
             register_process_group(&group);
         }
     } else {
-        let group =
-            get_process_group(target_pgid).map_err(|_| AxError::OperationNotPermitted)?;
+        let group = get_process_group(target_pgid).map_err(|_| AxError::OperationNotPermitted)?;
         if !proc.move_to_group(&group) {
             return Err(AxError::OperationNotPermitted);
         }

@@ -93,10 +93,7 @@ fn lab_stats_text() -> String {
     let stats = lab::stats();
     let buffered = lab::trace_snapshot().len();
     format!(
-        "enabled\t{}\n\
-         emitted\t{}\n\
-         overwritten\t{}\n\
-         buffered\t{}\n",
+        "enabled\t{}\nemitted\t{}\noverwritten\t{}\nbuffered\t{}\n",
         usize::from(lab::enabled()),
         stats.emitted,
         stats.overwritten,
@@ -107,9 +104,7 @@ fn lab_stats_text() -> String {
 fn lab_last_fault_text() -> String {
     match lab::last_fault() {
         Some(fault) => format!(
-            "tid\t{}\n\
-             addr\t{:#x}\n\
-             flags\t{:#x}\n",
+            "tid\t{}\naddr\t{:#x}\nflags\t{:#x}\n",
             fault.tid, fault.addr, fault.flags,
         ),
         None => "none\n".to_string(),
@@ -157,8 +152,7 @@ fn lab_fd_text() -> String {
 
 fn lab_control_text() -> String {
     format!(
-        "enabled\t{}\n\
-         action_files\tclear reset on off fault_demo\n",
+        "enabled\t{}\naction_files\tclear reset on off fault_demo\n",
         usize::from(lab::enabled()),
     )
 }
@@ -181,7 +175,9 @@ fn lab_action_file(fs: Arc<SimpleFs>, action: &'static str) -> Arc<SimpleFile> {
     SimpleFile::new_regular(
         fs,
         RwFile::new(move |req| match req {
-            SimpleFileOperation::Read => Ok(Some(format!("write any data to trigger {}\n", action))),
+            SimpleFileOperation::Read => {
+                Ok(Some(format!("write any data to trigger {}\n", action)))
+            }
             SimpleFileOperation::Write(_data) => {
                 handle_lab_action(action)?;
                 Ok(None::<String>)
@@ -195,7 +191,8 @@ fn lab_fault_demo_file(fs: Arc<SimpleFs>) -> Arc<SimpleFile> {
         fs,
         RwFile::new(move |req| match req {
             SimpleFileOperation::Read => Ok(Some(
-                "write any data to trigger a synthetic fault demo in the current task\n".to_string(),
+                "write any data to trigger a synthetic fault demo in the current task\n"
+                    .to_string(),
             )),
             SimpleFileOperation::Write(_data) => {
                 lab::record_fault(0xdead_beef, 0xc);
@@ -542,14 +539,26 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
     root.add("starry", {
         let mut starry = DirMapping::new();
-        starry.add("trace", SimpleFile::new_regular(fs.clone(), || Ok(lab_trace_text())));
-        starry.add("stats", SimpleFile::new_regular(fs.clone(), || Ok(lab_stats_text())));
+        starry.add(
+            "trace",
+            SimpleFile::new_regular(fs.clone(), || Ok(lab_trace_text())),
+        );
+        starry.add(
+            "stats",
+            SimpleFile::new_regular(fs.clone(), || Ok(lab_stats_text())),
+        );
         starry.add(
             "last_fault",
             SimpleFile::new_regular(fs.clone(), || Ok(lab_last_fault_text())),
         );
-        starry.add("fd", SimpleFile::new_regular(fs.clone(), || Ok(lab_fd_text())));
-        starry.add("control", SimpleFile::new_regular(fs.clone(), || Ok(lab_control_text())));
+        starry.add(
+            "fd",
+            SimpleFile::new_regular(fs.clone(), || Ok(lab_fd_text())),
+        );
+        starry.add(
+            "control",
+            SimpleFile::new_regular(fs.clone(), || Ok(lab_control_text())),
+        );
         starry.add("clear", lab_action_file(fs.clone(), "clear"));
         starry.add("reset", lab_action_file(fs.clone(), "reset"));
         starry.add("on", lab_action_file(fs.clone(), "on"));
