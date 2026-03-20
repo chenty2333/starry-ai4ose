@@ -219,6 +219,17 @@ Exit condition:
 Exit condition:
 `make lab-repeat-gui` stays exact-match green, and the output makes it obvious that framebuffer drawing and evdev input were combined into one deterministic interactive userspace program.
 
+## M19: Graphics Stage 3.5, Playable Snake
+
+- [x] Add a dedicated `snake` helper workload that turns fbdev + evdev into a small playable game instead of only a teaching mini-scene.
+- [x] Teach the runner to inject a deterministic keyboard script that grows the snake and then exits cleanly.
+- [x] Expose `make lab-snake` / `make lab-repeat-snake`.
+- [x] Teach the runner to summarize `openat -> ioctl -> mmap -> poll/read -> redraw -> munmap` for the snake workload.
+- [x] Re-check repeatability for the scripted snake run.
+
+Exit condition:
+`make lab-repeat-snake` stays exact-match green, and the output makes it obvious that a real fbdev+evdev game loop ran, consumed keyboard turns, grew the snake, and rendered a deterministic final frame.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion
