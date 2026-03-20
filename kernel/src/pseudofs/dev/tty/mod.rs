@@ -96,6 +96,13 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
     pub fn pty_number(&self) -> u32 {
         self.terminal.pty_number.load(Ordering::Acquire)
     }
+
+    fn signal_background_tty_access(&self, signo: Signo) -> AxResult<usize> {
+        let curr = current();
+        let pgid = curr.as_thread().proc_data.proc.group().pgid();
+        send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(signo)))?;
+        Err(AxError::Interrupted)
+    }
 }
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
@@ -103,22 +110,23 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
         if self.is_ptm {
             block_on(poll_io(self, IoEvents::IN, false, || self.ldisc.lock().read(buf)))
         } else {
-            block_on(poll_io(
-                &self.terminal.job_control,
-                IoEvents::IN,
-                false,
-                || {
-                    if self.terminal.job_control.current_in_foreground() {
-                        self.ldisc.lock().read(buf)
-                    } else {
-                        Err(AxError::WouldBlock)
-                    }
-                },
-            ))
+            block_on(poll_io(self, IoEvents::IN, false, || {
+                if self.terminal.job_control.current_in_foreground() {
+                    self.ldisc.lock().read(buf)
+                } else {
+                    self.signal_background_tty_access(Signo::SIGTTIN)
+                }
+            }))
         }
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> AxResult<usize> {
+        if !self.is_ptm {
+            let termios = self.terminal.load_termios();
+            if termios.tostop() && !self.terminal.job_control.current_in_foreground() {
+                return self.signal_background_tty_access(Signo::SIGTTOU);
+            }
+        }
         self.writer.write(buf);
         Ok(buf.len())
     }

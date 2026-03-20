@@ -144,6 +144,17 @@ Exit condition:
 Exit condition:
 `make lab-repeat-jobctl` and `make lab-repeat-waitctl` both stay green, with stop semantics visible in the pty job-control demo and continued/reap semantics visible in the explicit wait helper demo.
 
+## M12: Real SSH Job Control Edges
+
+- [x] Observe `Ctrl-Z`, `fg`, and `Ctrl-C` through a real `sshd` session instead of only the local pty helper.
+- [x] Split the `waitctl` teaching output into phase-focused stop/continue/reap reports so all three wait4 states stay visible.
+- [x] Observe `SIGTTOU` for background tty output over a real SSH-backed controlling terminal.
+- [x] Observe `SIGTTIN` for background tty input over a real SSH-backed controlling terminal.
+- [x] Re-check repeatability for the extended `waitctl` and `sshd` teaching paths.
+
+Exit condition:
+`make lab-repeat-waitctl` stays exact-match green, and `make lab-sshd` clearly shows `Ctrl-Z/Ctrl-C`, `SIGTTOU`, and `SIGTTIN` in its phase summaries and SSH transcript.
+
 ## Deferred by Default
 
 - [ ] Broad syscall-count expansion

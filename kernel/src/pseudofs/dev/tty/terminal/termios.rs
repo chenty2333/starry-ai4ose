@@ -5,8 +5,8 @@ use core::ops::{Deref, DerefMut};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
     B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ICANON, ICRNL, IEXTEN, ISIG, IXON,
-    ONLCR, OPOST, VDISCARD, VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL, VLNEXT, VQUIT, VREPRINT,
-    VSUSP, VWERASE, speed_t, tcflag_t,
+    ONLCR, OPOST, TOSTOP, VDISCARD, VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL, VLNEXT, VQUIT,
+    VREPRINT, VSUSP, VWERASE, speed_t, tcflag_t,
 };
 use starry_signal::Signo;
 
@@ -87,6 +87,10 @@ impl Termios {
 
     pub fn contains_iexten(&self) -> bool {
         self.has_lflag(IEXTEN)
+    }
+
+    pub fn tostop(&self) -> bool {
+        self.has_lflag(TOSTOP)
     }
 
     pub fn is_eol(&self, ch: u8) -> bool {

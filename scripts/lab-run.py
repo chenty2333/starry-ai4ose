@@ -43,8 +43,10 @@ WORKING_DISK_IMG = REPO_ROOT / "make" / "disk.img"
 LAB_BIN_DIR = REPO_ROOT / ".lab-bin"
 PTY_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "pty_relay.c"
 WAITCTL_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "waitctl.c"
+TTYSIG_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "ttysig.c"
 PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
 WAITCTL_HELPER_GUEST = "/usr/bin/lab_waitctl"
+TTYSIG_HELPER_GUEST = "/usr/bin/lab_ttysig"
 DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
@@ -59,6 +61,12 @@ AUTHORIZED_KEYS_GUEST = "/root/.ssh/authorized_keys"
 SSHD_PHASE1_TOKEN = "__LAB_SSH_PHASE1_CONNECTED__"
 SSHD_PHASE2_TOKEN = "__LAB_SSH_PHASE2_PTY__"
 SSHD_PHASE3_TOKEN = "sshd-lab"
+SSHD_PHASE4_TOKEN = "sshd-jobctl-lab"
+SSHD_PHASE5A_TOKEN = "sshd-sigttou-lab"
+SSHD_PHASE5B_TOKEN = "sshd-sigttin-lab"
+WAITCTL_STOP_TOKEN = "waitctl-stop-lab"
+WAITCTL_CONTINUE_TOKEN = "waitctl-continue-lab"
+WAITCTL_REAP_TOKEN = "waitctl-reap-lab"
 SSHD_PHASE2_LINES: tuple[str, ...] = (
     "PS1=",
     "export PS1",
@@ -69,6 +77,47 @@ SSHD_PHASE3_LINES: tuple[str, ...] = (
     "PS1=",
     "export PS1",
     f"sh -c 'sleep 1 & wait $!; printf \"{SSHD_PHASE3_TOKEN}\\\\n\"'",
+    "exit",
+)
+SSHD_PHASE4_LINES: tuple[str, ...] = (
+    "PS1=",
+    "export PS1",
+    "set -m",
+    "sleep 30",
+    "__LAB_DELAY__:0.5",
+    "\x1a",
+    "__LAB_DELAY__:0.2",
+    "jobs",
+    "fg",
+    "__LAB_DELAY__:1.0",
+    "\x03",
+    f"printf '{SSHD_PHASE4_TOKEN}\\n'",
+    "exit",
+)
+SSHD_PHASE5A_LINES: tuple[str, ...] = (
+    "PS1=",
+    "export PS1",
+    "set -m",
+    "stty tostop",
+    f"{TTYSIG_HELPER_GUEST} write &",
+    "__LAB_DELAY__:1.3",
+    "jobs",
+    "fg",
+    "__LAB_DELAY__:0.2",
+    f"printf '{SSHD_PHASE5A_TOKEN}\\n'",
+    "exit",
+)
+SSHD_PHASE5B_LINES: tuple[str, ...] = (
+    "PS1=",
+    "export PS1",
+    "set -m",
+    f"{TTYSIG_HELPER_GUEST} read &",
+    "__LAB_DELAY__:1.3",
+    "jobs",
+    "fg",
+    "ttin-input",
+    "__LAB_DELAY__:0.2",
+    f"printf '{SSHD_PHASE5B_TOKEN}\\n'",
     "exit",
 )
 
@@ -364,11 +413,11 @@ DEMOS: dict[str, Demo] = {
     "waitctl": Demo(
         name="waitctl",
         goal="Exercise explicit wait4 stopped/continued/reap semantics with a tiny helper process tree.",
-        commands=("sh /tmp/lab_waitctl_demo.sh 2>/dev/null || true",),
-        expected_events=("SignalSend", "SignalHandle", "WaitContinue", "WaitReap", "TaskExit"),
-        focus_events=("SignalSend", "SignalHandle", "WaitContinue", "WaitReap", "TaskExit"),
+        commands=(WAITCTL_HELPER_GUEST,),
+        expected_events=("SignalSend", "SignalHandle", "WaitStop", "WaitContinue", "WaitReap", "TaskExit"),
+        focus_events=("SignalSend", "SignalHandle", "WaitStop", "WaitContinue", "WaitReap", "TaskExit"),
         focus_syscalls=("wait4", "kill", "close"),
-        setup_commands=WAITCTL_SETUP_COMMANDS,
+        setup_commands=(),
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
         net="n",
@@ -446,6 +495,7 @@ DEMOS: dict[str, Demo] = {
             "SessionCreate",
             "TtyCtl",
             "ProcessGroupSet",
+            "WaitStop",
             "WaitReap",
             "PollSleep",
             "PollWake",
@@ -456,6 +506,7 @@ DEMOS: dict[str, Demo] = {
             "SessionCreate",
             "TtyCtl",
             "ProcessGroupSet",
+            "WaitStop",
             "WaitReap",
             "SignalSend",
             "SignalHandle",
@@ -740,6 +791,8 @@ def ensure_guest_helpers(demo: Demo, arch: str) -> None:
         helper = compile_helper(WAITCTL_HELPER_SOURCE, "waitctl", arch)
         debugfs_write(img, helper, WAITCTL_HELPER_GUEST)
     if demo.name == "sshd":
+        ttysig = compile_helper(TTYSIG_HELPER_SOURCE, "ttysig", arch)
+        debugfs_write(img, ttysig, TTYSIG_HELPER_GUEST)
         dropbear, dropbearkey, libcrypt = prepare_dropbear_assets(arch)
         debugfs_mkdir(img, DROPBEAR_LIB_GUEST_DIR)
         debugfs_write(img, dropbear, DROPBEAR_GUEST)
@@ -813,20 +866,29 @@ def normalize_demo_output(demo: Demo, text: str) -> str:
         "sleep 30",
         "jobs",
         "fg",
+        "set -m",
+        "stty tostop",
+        "stty -tostop",
         "echo jobctl-lab",
         "echo ssh-lab",
+        f"printf '{SSHD_PHASE4_TOKEN}\\n'",
+        f"printf '{SSHD_PHASE5A_TOKEN}\\n'",
+        f"printf '{SSHD_PHASE5B_TOKEN}\\n'",
         "PS1=",
         "export PS1",
         f"printf '{SSHD_PHASE2_TOKEN}\\n'",
         r"printf${IFS}sshd-lab\\n",
         r"printf${IFS}ssh-lab\\n",
         f"sh -c 'sleep 1 & wait $!; printf \"{SSHD_PHASE3_TOKEN}\\\\n\"'",
+        f"{TTYSIG_HELPER_GUEST} write &",
+        f"{TTYSIG_HELPER_GUEST} read &",
         "sleep 1 & wait",
         r"sleep${IFS}1&wait",
         "sleep 1 &",
         r"sleep${IFS}1&",
         "wait $!",
         r"wait${IFS}$!",
+        "ttin-input",
         "exit",
         "Connection to 127.0.0.1 closed.",
         "Welcome to Alpine!",
@@ -1418,6 +1480,103 @@ def select_sshd_phase_views(phase_name: str, views: list[EventView]) -> list[Eve
             collapsed.append(view)
         return collapsed
 
+    if phase_name == "phase-4-jobctl":
+        keep_labels = {
+            "PtyOpen",
+            "SessionCreate",
+            "TtyCtl",
+            "ProcessGroupSet",
+            "WaitStop",
+            "WaitContinue",
+            "WaitReap",
+            "SignalSend",
+            "SignalHandle",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        }
+        focus_syscalls = {"read", "write", "wait4", "ioctl", "close"}
+        keep: set[int] = {view.event.seq for view in views if view.label in keep_labels}
+        pending_syscalls: dict[int, str] = {}
+        for view in views:
+            if view.label == "SysEnter":
+                name = syscall_name(view.event.arg0)
+                if name in focus_syscalls:
+                    if name in {"read", "write"} and parse_i64(view.event.arg1) in {0, 1, 2}:
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls[view.event.tid] = name
+                continue
+            if view.label == "SysExit":
+                name = syscall_name(view.event.arg0)
+                if pending_syscalls.get(view.event.tid) == name:
+                    if name in {"read", "write"} and abs(parse_i64(view.event.arg1)) == 1:
+                        pending_syscalls.pop(view.event.tid, None)
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls.pop(view.event.tid, None)
+        selected = [view for view in views if view.event.seq in keep]
+        collapsed: list[EventView] = []
+        burst_signatures: set[tuple[int, str, str]] = set()
+        for view in selected:
+            if view.label in {"PollSleep", "PollWake"}:
+                signature = (view.event.tid, view.label, view.detail)
+                if signature in burst_signatures:
+                    continue
+                burst_signatures.add(signature)
+                collapsed.append(view)
+                continue
+            burst_signatures.clear()
+            collapsed.append(view)
+        return collapsed
+
+    if phase_name in {"phase-5a-sigttou", "phase-5b-sigttin"}:
+        keep_labels = {
+            "ProcessGroupSet",
+            "WaitStop",
+            "WaitContinue",
+            "WaitReap",
+            "SignalSend",
+            "SignalHandle",
+            "PollSleep",
+            "PollWake",
+            "TaskExit",
+        }
+        focus_syscalls = {"read", "write", "wait4", "ioctl", "close"}
+        keep: set[int] = {view.event.seq for view in views if view.label in keep_labels}
+        pending_syscalls: dict[int, str] = {}
+        for view in views:
+            if view.label == "SysEnter":
+                name = syscall_name(view.event.arg0)
+                if name in focus_syscalls:
+                    if name in {"read", "write"} and parse_i64(view.event.arg1) in {0, 1, 2}:
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls[view.event.tid] = name
+                continue
+            if view.label == "SysExit":
+                name = syscall_name(view.event.arg0)
+                if pending_syscalls.get(view.event.tid) == name:
+                    if name in {"read", "write"} and abs(parse_i64(view.event.arg1)) == 1:
+                        pending_syscalls.pop(view.event.tid, None)
+                        continue
+                    keep.add(view.event.seq)
+                    pending_syscalls.pop(view.event.tid, None)
+        selected = [view for view in views if view.event.seq in keep]
+        collapsed: list[EventView] = []
+        burst_signatures: set[tuple[int, str, str]] = set()
+        for view in selected:
+            if view.label in {"PollSleep", "PollWake"}:
+                signature = (view.event.tid, view.label, view.detail)
+                if signature in burst_signatures:
+                    continue
+                burst_signatures.add(signature)
+                collapsed.append(view)
+                continue
+            burst_signatures.clear()
+            collapsed.append(view)
+        return collapsed
+
     return views
 
 
@@ -1500,7 +1659,211 @@ def build_sshd_phase_walkthrough(
             lines.append(f"the phase closed with {task_exit.detail}.")
         return tuple(lines)
 
+    if phase_name == "phase-4-jobctl":
+        wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
+        wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        sigtstp = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGTSTP")),
+            None,
+        )
+        sigcont = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGCONT")),
+            None,
+        )
+        sigint = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGINT")),
+            None,
+        )
+        lines = [
+            "this phase isolates real SSH job control: Ctrl-Z to stop the foreground job, `fg` to resume it, and Ctrl-C to terminate it from the remote pty.",
+        ]
+        if sigtstp is not None:
+            lines.append("the host-side Ctrl-Z keystroke reached the remote pty and generated SIGTSTP for the foreground job.")
+        if wait_stop is not None:
+            lines.append(f"the shell reported the stop through {wait_stop.detail}.")
+        if sigcont is not None or wait_continue is not None:
+            detail = wait_continue.detail if wait_continue is not None else "a SIGCONT-driven foreground resume"
+            lines.append(f"`fg` resumed the job, and the continue path showed up as {detail}.")
+        if sigint is not None:
+            lines.append("the host-side Ctrl-C keystroke generated SIGINT for the resumed foreground job.")
+        if wait_reap is not None:
+            lines.append(f"the shell's final collection path completed through {wait_reap.detail}.")
+        if transcript.strip():
+            lines.append("the remote transcript printed `sshd-jobctl-lab`, so the SSH-backed shell really returned control after the Ctrl-Z/fg/Ctrl-C cycle.")
+        return tuple(lines)
+
+    if phase_name == "phase-5a-sigttou":
+        wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
+        wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        sigttou = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGTTOU")),
+            None,
+        )
+        lines = [
+            "this phase isolates background tty output over a real SSH pty: a background writer runs with `TOSTOP` enabled and should stop on SIGTTOU until foregrounded.",
+        ]
+        if sigttou is not None:
+            lines.append("the background writer hit `TOSTOP` semantics and received SIGTTOU before being foregrounded.")
+        if wait_stop is not None:
+            lines.append(f"the shell surfaced the resulting stop state through {wait_stop.detail}.")
+        if wait_continue is not None:
+            lines.append(f"foreground resume activity showed up as {wait_continue.detail}.")
+        if wait_reap is not None:
+            lines.append(f"the shell eventually reaped the background tty worker through {wait_reap.detail}.")
+        if transcript.strip():
+            lines.append("the remote transcript included `sshd-sigttou-lab`, so the writer-side tty-stop path completed end to end.")
+        return tuple(lines)
+
+    if phase_name == "phase-5b-sigttin":
+        wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
+        wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
+        wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+        sigttin = next(
+            (view for view in key_views if view.label == "SignalHandle" and view.detail.startswith("handle SIGTTIN")),
+            None,
+        )
+        lines = [
+            "this phase isolates background tty input over a real SSH pty: a background reader attempts to consume terminal input and should stop on SIGTTIN until foregrounded.",
+        ]
+        if sigttin is not None:
+            lines.append("the background reader attempted to consume tty input and received SIGTTIN until it was foregrounded.")
+        if wait_stop is not None:
+            lines.append(f"the shell surfaced the resulting stop state through {wait_stop.detail}.")
+        if wait_continue is not None:
+            lines.append(f"foreground resume activity showed up as {wait_continue.detail}.")
+        if wait_reap is not None:
+            lines.append(f"the shell eventually reaped the background tty worker through {wait_reap.detail}.")
+        if transcript.strip():
+            lines.append("the remote transcript included `sigttin:ttin-input` and `sshd-sigttin-lab`, so the reader-side tty-stop path completed end to end.")
+        return tuple(lines)
+
     return ()
+
+
+def select_waitctl_phase_views(phase_name: str, views: list[EventView]) -> list[EventView]:
+    if phase_name == "phase-1-stop":
+        keep_labels = {"SignalSend", "SignalHandle", "WaitStop", "WaitReap", "TaskExit"}
+    elif phase_name == "phase-2-continue":
+        keep_labels = {"SignalSend", "SignalHandle", "WaitStop", "WaitContinue", "WaitReap", "TaskExit"}
+    elif phase_name == "phase-3-reap":
+        keep_labels = {"SignalSend", "SignalHandle", "WaitReap", "TaskExit"}
+    else:
+        return views
+
+    focus_syscalls = {"wait4", "kill", "close"}
+    keep: set[int] = {view.event.seq for view in views if view.label in keep_labels}
+    pending_syscalls: dict[int, str] = {}
+    for view in views:
+        if view.label == "SysEnter":
+            name = syscall_name(view.event.arg0)
+            if name in focus_syscalls:
+                keep.add(view.event.seq)
+                pending_syscalls[view.event.tid] = name
+            continue
+        if view.label == "SysExit":
+            name = syscall_name(view.event.arg0)
+            if pending_syscalls.get(view.event.tid) == name:
+                keep.add(view.event.seq)
+                pending_syscalls.pop(view.event.tid, None)
+    return [view for view in views if view.event.seq in keep]
+
+
+def build_waitctl_phase_walkthrough(
+    phase_name: str,
+    key_views: list[EventView],
+    transcript: str,
+) -> tuple[str, ...]:
+    wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
+    wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
+    wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
+
+    if phase_name == "phase-1-stop":
+        lines = [
+            "this phase isolates the stopped wait4 state: the helper sends SIGTSTP to its child and waits with WUNTRACED.",
+        ]
+        if wait_stop is not None:
+            lines.append(f"`wait4(..., WUNTRACED)` surfaced the stop through {wait_stop.detail}.")
+        if wait_reap is not None:
+            lines.append(f"after the stop report, the helper cleaned the child up through {wait_reap.detail}.")
+        if WAITCTL_STOP_TOKEN in transcript:
+            lines.append("the helper printed `waitctl-stop-lab`, so the stop-reporting phase completed end to end.")
+        return tuple(lines)
+
+    if phase_name == "phase-2-continue":
+        lines = [
+            "this phase isolates the continued wait4 state: the helper stops its child, resumes it with SIGCONT, and waits with WCONTINUED.",
+        ]
+        if wait_stop is not None:
+            lines.append(f"the setup stop remained visible as {wait_stop.detail}.")
+        if wait_continue is not None:
+            lines.append(f"`wait4(..., WCONTINUED)` surfaced the resume through {wait_continue.detail}.")
+        if wait_reap is not None:
+            lines.append(f"cleanup after the continue phase completed through {wait_reap.detail}.")
+        if WAITCTL_CONTINUE_TOKEN in transcript:
+            lines.append("the helper printed `waitctl-continue-lab`, so the continue-reporting phase completed end to end.")
+        return tuple(lines)
+
+    if phase_name == "phase-3-reap":
+        lines = [
+            "this phase isolates the final reap path: the helper terminates its child with SIGINT and waits for the terminal status.",
+        ]
+        if wait_reap is not None:
+            lines.append(f"the blocking wait reaped the child through {wait_reap.detail}.")
+        if WAITCTL_REAP_TOKEN in transcript:
+            lines.append("the helper printed `waitctl-reap-lab`, so the reap-reporting phase completed end to end.")
+        return tuple(lines)
+
+    return ()
+
+
+def render_waitctl_phase_artifacts(
+    phase_dir: pathlib.Path,
+    phase_name: str,
+    title: str,
+    events: list[TraceEvent],
+    stats_text: str,
+    last_fault_text: str,
+    input_stream: tuple[str, ...],
+    transcript: str,
+    raw: bool,
+) -> PhaseResult:
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    event_views = build_event_views(events)
+    key_views = select_waitctl_phase_views(phase_name, event_views)
+    write_text(phase_dir / "key_trace.txt", render_event_table(key_views))
+    walkthrough = build_waitctl_phase_walkthrough(phase_name, key_views, transcript)
+    create_phase_summary(
+        phase_dir / "summary.txt",
+        title,
+        input_stream,
+        events,
+        key_views,
+        stats_text,
+        walkthrough,
+    )
+    if raw:
+        trace_lines = [
+            f"{event.seq}\t{event.time_ns}\t{event.tid}\t{event.kind}\t{event.arg0}\t{event.arg1}"
+            for event in events
+        ]
+        write_text(phase_dir / "starry_trace.txt", "\n".join(trace_lines) + ("\n" if trace_lines else ""))
+        write_text(phase_dir / "starry_stats.txt", stats_text)
+        write_text(phase_dir / "starry_last_fault.txt", last_fault_text)
+    return PhaseResult(
+        name=phase_name,
+        title=title,
+        out_dir=phase_dir,
+        events=events,
+        event_views=event_views,
+        key_events=[view.event for view in key_views],
+        key_views=key_views,
+        stats_text=stats_text,
+        last_fault_text=last_fault_text,
+        input_stream=input_stream,
+        walkthrough=walkthrough,
+    )
 
 
 def create_phase_summary(
@@ -1905,7 +2268,6 @@ def run_host_ssh_demo(
     os.close(slave_fd)
 
     transcript = bytearray()
-    lines = [line + "\r" for line in input_lines]
     line_index = 0
     char_index = 0
     next_send_at = time.monotonic() + 1.0
@@ -1916,16 +2278,22 @@ def run_host_ssh_demo(
     try:
         while time.monotonic() < deadline:
             now = time.monotonic()
-            if line_index < len(lines) and now >= next_send_at:
-                line = lines[line_index]
-                os.write(master_fd, line[char_index].encode("utf-8"))
+            while line_index < len(input_lines) and now >= next_send_at:
+                line = input_lines[line_index]
+                if line.startswith("__LAB_DELAY__:"):
+                    next_send_at = now + float(line.split(":", 1)[1])
+                    line_index += 1
+                    continue
+                payload = line if len(line) == 1 and ord(line) < 0x20 else line + "\r"
+                os.write(master_fd, payload[char_index].encode("utf-8"))
                 char_index += 1
-                if char_index == len(line):
+                if char_index == len(payload):
                     line_index += 1
                     char_index = 0
                     next_send_at = now + delay_between_lines
                 else:
                     next_send_at = now + delay_between_chars
+                break
 
             readable, _, _ = select.select([master_fd], [], [], 0.05)
             if master_fd in readable:
@@ -1939,7 +2307,7 @@ def run_host_ssh_demo(
                 if chunk:
                     transcript.extend(chunk)
 
-            if proc.poll() is not None and line_index >= len(lines):
+            if proc.poll() is not None and line_index >= len(input_lines):
                 try:
                     chunk = os.read(master_fd, 4096)
                     if chunk:
@@ -2158,6 +2526,29 @@ def build_walkthrough(
             lines.append(f"the crashing task ended with {task_exit.detail}.")
         return lines
     if demo.name == "waitctl":
+        if phase_results:
+            phase_map = {phase.name: phase for phase in phase_results}
+            stop_phase = phase_map.get("phase-1-stop")
+            continue_phase = phase_map.get("phase-2-continue")
+            reap_phase = phase_map.get("phase-3-reap")
+            lines = [
+                "the helper is split into three focused wait4 phases so stopped, continued, and reaped states each stay visible without getting buried under unrelated trace noise.",
+            ]
+            if stop_phase is not None:
+                lines.append("phase 1 isolates the WUNTRACED stop report.")
+                lines.extend(f"(phase 1) {line}" for line in stop_phase.walkthrough[:3])
+            if continue_phase is not None:
+                lines.append("phase 2 isolates the WCONTINUED resume report.")
+                lines.extend(f"(phase 2) {line}" for line in continue_phase.walkthrough[:3])
+            if reap_phase is not None:
+                lines.append("phase 3 isolates the final reap path after SIGINT.")
+                lines.extend(f"(phase 3) {line}" for line in reap_phase.walkthrough[:3])
+            transcript = artifact_outputs.get("demo-step-1.txt", "")
+            if WAITCTL_STOP_TOKEN in transcript and WAITCTL_CONTINUE_TOKEN in transcript and WAITCTL_REAP_TOKEN in transcript:
+                lines.append(
+                    "the combined transcript printed `waitctl-stop-lab`, `waitctl-continue-lab`, and `waitctl-reap-lab`, so all three wait-status phases completed end to end."
+                )
+            return lines
         wait_stop = next((view for view in key_views if view.label == "WaitStop"), None)
         wait_continue = next((view for view in key_views if view.label == "WaitContinue"), None)
         wait_reap = next((view for view in key_views if view.label == "WaitReap"), None)
@@ -2170,8 +2561,14 @@ def build_walkthrough(
             lines.append(f"`wait4(..., WCONTINUED)` surfaced the resume through {wait_continue.detail}.")
         if wait_reap is not None:
             lines.append(f"the final blocking wait reaped the child through {wait_reap.detail}.")
-        if "waitctl-lab" in artifact_outputs.get("demo-step-1.txt", ""):
-            lines.append("the helper printed `waitctl-lab`, so all three wait-status phases completed end to end.")
+        if (
+            WAITCTL_STOP_TOKEN in artifact_outputs.get("demo-step-1.txt", "")
+            and WAITCTL_CONTINUE_TOKEN in artifact_outputs.get("demo-step-1.txt", "")
+            and WAITCTL_REAP_TOKEN in artifact_outputs.get("demo-step-1.txt", "")
+        ):
+            lines.append(
+                "the helper printed `waitctl-stop-lab`, `waitctl-continue-lab`, and `waitctl-reap-lab`, so all three wait-status phases completed end to end."
+            )
         return lines
     if demo.name == "udp":
         lines = [
@@ -2296,8 +2693,11 @@ def build_walkthrough(
         connect_phase = phase_map.get("phase-1-connect")
         pty_phase = phase_map.get("phase-2-pty")
         shell_phase = phase_map.get("phase-3-shell")
+        jobctl_phase = phase_map.get("phase-4-jobctl")
+        sigttou_phase = phase_map.get("phase-5a-sigttou")
+        sigttin_phase = phase_map.get("phase-5b-sigttin")
         lines: list[str] = [
-            f"the guest ran a real Dropbear SSH server on port {SSHD_PORT}, and the host OpenSSH client logged in over QEMU user-net forwarding through three focused trace windows.",
+            f"the guest ran a real Dropbear SSH server on port {SSHD_PORT}, and the host OpenSSH client logged in over QEMU user-net forwarding through focused trace windows for connect, pty bootstrap, shell wait semantics, interactive job control, and background tty stop signals.",
         ]
         if connect_phase is not None:
             lines.append("phase 1 isolated socket accept/authentication, so the network half of SSH is visible without later pty noise.")
@@ -2307,9 +2707,18 @@ def build_walkthrough(
         if shell_phase is not None:
             lines.append("phase 3 isolated the interactive shell workload, including the background child, SIGCHLD, wait4, and session teardown.")
             lines.extend(f"(phase 3) {line}" for line in shell_phase.walkthrough[:4])
+        if jobctl_phase is not None:
+            lines.append("phase 4 isolated real remote job control, including Ctrl-Z, `fg`, Ctrl-C, and the shell's stop/reap handling.")
+            lines.extend(f"(phase 4) {line}" for line in jobctl_phase.walkthrough[:5])
+        if sigttou_phase is not None:
+            lines.append("phase 5 isolated background tty output over SSH, focusing on SIGTTOU for a background writer with `TOSTOP` set.")
+            lines.extend(f"(phase 5a) {line}" for line in sigttou_phase.walkthrough[:5])
+        if sigttin_phase is not None:
+            lines.append("phase 6 isolated background tty input over SSH, focusing on SIGTTIN for a background reader.")
+            lines.extend(f"(phase 5b) {line}" for line in sigttin_phase.walkthrough[:5])
         if transcript:
             lines.append(
-                "the real SSH transcript printed `sshd-lab`, which confirms the path guest sshd -> pty -> shell -> pty -> encrypted socket -> host ssh client end to end."
+                "the real SSH transcripts printed `sshd-lab`, `sshd-jobctl-lab`, `sshd-sigttou-lab`, and `sshd-sigttin-lab`, which confirms the path guest sshd -> pty -> shell -> pty -> encrypted socket -> host ssh client end to end for ordinary commands, job-control keystrokes, and both background tty-stop cases."
             )
         if counts["PollSleep"] or counts["PollWake"]:
             lines.append(
@@ -2441,7 +2850,7 @@ def create_summary(
         lines.extend(f"- {line}" for line in peer_notes)
     if phase_results:
         lines.append("")
-        lines.append("ssh phases:")
+        lines.append(f"{demo.name} phases:")
         for phase in phase_results:
             lines.append(f"- {phase.name}: {phase.title}")
             for line in phase.walkthrough[:3]:
@@ -2508,7 +2917,45 @@ def execute_run(
             session.run_command(command, command_timeout)
         demo_outputs: list[tuple[pathlib.Path, str]] = []
         peer_notes: tuple[str, ...] = ()
-        if demo.name == "sshd":
+        if demo.name == "waitctl":
+            waitctl_phase_specs = (
+                ("phase-1-stop", "wait4 WUNTRACED stop", f"{WAITCTL_HELPER_GUEST} stop"),
+                ("phase-2-continue", "wait4 WCONTINUED continue", f"{WAITCTL_HELPER_GUEST} continue"),
+                ("phase-3-reap", "wait4 terminal reap", f"{WAITCTL_HELPER_GUEST} reap"),
+            )
+            phase_results_list: list[PhaseResult] = []
+            phase_transcripts: list[str] = []
+            for phase_name, phase_title, phase_command in waitctl_phase_specs:
+                reset_command = "echo 1 > /proc/starry/reset"
+                off_command = "echo 1 > /proc/starry/off"
+                input_stream.append(f"{reset_command} [{phase_name}]")
+                session.run_command(reset_command, command_timeout)
+                input_stream.append(f"{phase_command} [{phase_name}]")
+                transcript = clean_capture(session.run_command(phase_command, command_timeout), phase_command)
+                phase_transcripts.append(transcript)
+                input_stream.append(f"{off_command} [{phase_name}]")
+                session.run_command(off_command, command_timeout)
+                phase_outputs = collect_trace_artifacts(session, command_timeout)
+                phase_events = parse_trace(phase_outputs["starry_trace.txt"])
+                phase_results_list.append(
+                    render_waitctl_phase_artifacts(
+                        out_dir / phase_name,
+                        phase_name,
+                        phase_title,
+                        phase_events,
+                        phase_outputs["starry_stats.txt"],
+                        phase_outputs["starry_last_fault.txt"],
+                        (phase_command,),
+                        transcript,
+                        raw,
+                    )
+                )
+            phase_results = tuple(phase_results_list)
+            cleaned_output = normalize_demo_output(demo, "\n".join(t for t in phase_transcripts if t))
+            step_path = out_dir / "demo-step-1.txt"
+            write_text(step_path, cleaned_output)
+            demo_outputs.append((step_path, cleaned_output))
+        elif demo.name == "sshd":
             private_key, public_key = ensure_ssh_client_key()
             for command in sshd_setup_commands(public_key):
                 input_stream.append(command)
@@ -2554,10 +3001,52 @@ def execute_run(
                         SSHD_PHASE3_TOKEN,
                     ),
                 ),
+                (
+                    "phase-4-jobctl",
+                    "SSH interactive job control",
+                    ("echo 1 > /proc/starry/reset",),
+                    f"HOST:ssh -tt -p {SSHD_PORT} -i {private_key} root@127.0.0.1 [phase-4]",
+                    "echo 1 > /proc/starry/off",
+                    lambda: run_host_ssh_demo(
+                        private_key,
+                        command_timeout,
+                        SSHD_PHASE4_LINES,
+                        SSHD_PHASE4_TOKEN,
+                    ),
+                ),
+                (
+                    "phase-5a-sigttou",
+                    "SSH background tty output stop (SIGTTOU)",
+                    ("echo 1 > /proc/starry/reset",),
+                    f"HOST:ssh -tt -p {SSHD_PORT} -i {private_key} root@127.0.0.1 [phase-5a]",
+                    "echo 1 > /proc/starry/off",
+                    lambda: run_host_ssh_demo(
+                        private_key,
+                        command_timeout,
+                        SSHD_PHASE5A_LINES,
+                        SSHD_PHASE5A_TOKEN,
+                    ),
+                ),
+                (
+                    "phase-5b-sigttin",
+                    "SSH background tty input stop (SIGTTIN)",
+                    ("echo 1 > /proc/starry/reset",),
+                    f"HOST:ssh -tt -p {SSHD_PORT} -i {private_key} root@127.0.0.1 [phase-5b]",
+                    "echo 1 > /proc/starry/off",
+                    lambda: run_host_ssh_demo(
+                        private_key,
+                        command_timeout,
+                        SSHD_PHASE5B_LINES,
+                        SSHD_PHASE5B_TOKEN,
+                    ),
+                ),
             )
             phase_results_list: list[PhaseResult] = []
             ssh_peer_notes: list[str] = []
             phase3_peer_result: PeerResult | None = None
+            phase4_peer_result: PeerResult | None = None
+            phase5a_peer_result: PeerResult | None = None
+            phase5b_peer_result: PeerResult | None = None
             try:
                 for phase_name, phase_title, phase_start, host_command, phase_end, runner in ssh_phase_specs:
                     for command in phase_start:
@@ -2585,6 +3074,12 @@ def execute_run(
                     phase_results_list.append(phase_result)
                     if phase_name == "phase-3-shell":
                         phase3_peer_result = phase_peer_result
+                    if phase_name == "phase-4-jobctl":
+                        phase4_peer_result = phase_peer_result
+                    if phase_name == "phase-5a-sigttou":
+                        phase5a_peer_result = phase_peer_result
+                    if phase_name == "phase-5b-sigttin":
+                        phase5b_peer_result = phase_peer_result
             except Exception as exc:
                 auth_keys = clean_capture(
                     session.run_command(f"cat {AUTHORIZED_KEYS_GUEST} 2>/dev/null || true", command_timeout),
@@ -2617,7 +3112,16 @@ def execute_run(
             peer_notes = tuple(ssh_peer_notes)
             cleaned_output = normalize_demo_output(
                 demo,
-                "" if phase3_peer_result is None else phase3_peer_result.transcript,
+                "\n".join(
+                    transcript
+                    for transcript in (
+                        None if phase3_peer_result is None else phase3_peer_result.transcript,
+                        None if phase4_peer_result is None else phase4_peer_result.transcript,
+                        None if phase5a_peer_result is None else phase5a_peer_result.transcript,
+                        None if phase5b_peer_result is None else phase5b_peer_result.transcript,
+                    )
+                    if transcript
+                ),
             )
             step_path = out_dir / "demo-step-1.txt"
             write_text(step_path, cleaned_output)
@@ -2658,7 +3162,7 @@ def execute_run(
         artifact_outputs: dict[str, str] = {
             path.name: path.read_text(encoding="utf-8") for path, _cleaned in demo_outputs
         }
-        if demo.name == "sshd":
+        if phase_results:
             total_emitted = 0
             total_overwritten = 0
             total_buffered = 0
