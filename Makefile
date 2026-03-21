@@ -112,7 +112,7 @@ lab-x11:
 
 run-x11:
 	@img=$$(python3 ./scripts/lab-run.py x11 --stage-only --skip-build --boot-timeout 120 --command-timeout 600); \
-	$(MAKE) --no-print-directory GRAPHIC=y INPUT=y APP_FEATURES=qemu,lab DISK_IMG=$$img run
+	$(MAKE) --no-print-directory GRAPHIC=y INPUT=y NET=n HOSTFWD=n APP_FEATURES=qemu,lab DISK_IMG=$$img run
 
 lab-stage-snake:
 	$(MAKE) --no-print-directory lab-stage DEMO=snake
