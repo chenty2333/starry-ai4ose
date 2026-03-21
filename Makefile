@@ -111,7 +111,7 @@ lab-x11:
 	python3 ./scripts/lab-run.py x11 --boot-timeout 120 --command-timeout 600 $(LAB_RAW_FLAG)
 
 run-x11:
-	@img=$$(python3 ./scripts/lab-run.py x11 --stage-only --boot-timeout 120 --command-timeout 600); \
+	@img=$$(python3 ./scripts/lab-run.py x11 --stage-only --skip-build --boot-timeout 120 --command-timeout 600); \
 	$(MAKE) --no-print-directory GRAPHIC=y INPUT=y APP_FEATURES=qemu,lab DISK_IMG=$$img run
 
 lab-stage-snake:
