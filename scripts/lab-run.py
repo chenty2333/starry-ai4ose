@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import textwrap
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -68,6 +69,9 @@ DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
 X11_STAGE_DIR = LAB_BIN_DIR / "x11"
+X11_STAGE_ROOT = X11_STAGE_DIR / f"root-{BASELINE_ARCH}"
+X11_STAGE_TAR = X11_STAGE_DIR / f"x11-stage-{BASELINE_ARCH}.tar"
+X11_HELPER_LOCAL = X11_STAGE_DIR / "lab_x11demo.sh"
 DROPBEAR_GUEST = "/usr/bin/lab_dropbear"
 DROPBEARKEY_GUEST = "/usr/bin/lab_dropbearkey"
 DROPBEAR_LIB_GUEST_DIR = "/usr/lib/ssh-lab"
@@ -93,6 +97,8 @@ X11_CLIENT_LOG_GUEST = "/tmp/lab_xcalc.log"
 X11_SERVER_PID_GUEST = "/tmp/lab_x11.pid"
 X11_CLIENT_PID_GUEST = "/tmp/lab_xcalc.pid"
 X11_CONFIG_GUEST = "/tmp/lab_x11.conf"
+X11_STAGE_TAR_GUEST = "/usr/share/starry-lab/x11-stage.tar"
+X11_HELPER_GUEST = "/usr/bin/lab_x11demo"
 SSHD_PHASE2_LINES: tuple[str, ...] = (
     "PS1=",
     "export PS1",
@@ -180,6 +186,11 @@ X11_CONFIG_LINES: tuple[str, ...] = (
     '    InputDevice "Mouse0" "CorePointer"',
     'EndSection',
 )
+X11_APK_REPOSITORIES: tuple[str, ...] = (
+    "https://dl-cdn.alpinelinux.org/alpine/v3.23/main",
+    "https://dl-cdn.alpinelinux.org/alpine/v3.23/community",
+)
+X11_APK_PACKAGES = "xorg-server xf86-video-fbdev xf86-input-evdev xcalc"
 
 TTY_CTL_NAMES: dict[int, str] = {
     1: "TIOCSCTTY",
@@ -969,6 +980,174 @@ def ensure_ssh_client_key() -> tuple[pathlib.Path, str]:
     return private_key, public_key.read_text(encoding="utf-8").strip()
 
 
+def ensure_x11_stage_root(arch: str) -> pathlib.Path:
+    X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = X11_STAGE_ROOT / ".stage-ok"
+    if stamp.exists():
+        return X11_STAGE_ROOT
+
+    if X11_STAGE_ROOT.exists():
+        shutil.rmtree(X11_STAGE_ROOT)
+    X11_STAGE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    repos = X11_STAGE_DIR / "repositories"
+    write_text(repos, "\n".join(X11_APK_REPOSITORIES) + "\n")
+    apk_cmd = (
+        "set -e; "
+        "ROOT=\"$1\"; "
+        "set +e; "
+        f"apk --usermode --arch {arch} --allow-untrusted "
+        f'--root "$ROOT" --repositories-file "{repos}" --initdb add {X11_APK_PACKAGES}; '
+        'rc=$?; [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ]'
+    )
+    proc = subprocess.run(
+        ["nix", "shell", "nixpkgs#apk-tools", "-c", "sh", "-lc", apk_cmd, "sh", str(X11_STAGE_ROOT)],
+        check=False,
+        cwd=REPO_ROOT,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"failed to stage host-side X11 userland (apk exit {proc.returncode})")
+
+    stamp.write_text(f"{X11_APK_PACKAGES}\n", encoding="utf-8")
+    return X11_STAGE_ROOT
+
+
+def ensure_x11_stage_tar(arch: str) -> pathlib.Path:
+    stage_root = ensure_x11_stage_root(arch)
+    stamp = stage_root / ".stage-ok"
+    if X11_STAGE_TAR.exists() and X11_STAGE_TAR.stat().st_mtime >= stamp.stat().st_mtime:
+        return X11_STAGE_TAR
+
+    subprocess.run(
+        [
+            "tar",
+            "--numeric-owner",
+            "--owner=0",
+            "--group=0",
+            "-C",
+            str(stage_root),
+            "-cf",
+            str(X11_STAGE_TAR),
+            ".",
+        ],
+        check=True,
+        cwd=REPO_ROOT,
+    )
+    return X11_STAGE_TAR
+
+
+def ensure_x11_helper_script() -> pathlib.Path:
+    X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    script = textwrap.dedent(
+        f"""\
+        #!/bin/sh
+        set -e
+        STAGE_TAR={X11_STAGE_TAR_GUEST}
+        CONF={X11_CONFIG_GUEST}
+        XLOG={X11_SERVER_LOG_GUEST}
+        CLOG={X11_CLIENT_LOG_GUEST}
+        XPID={X11_SERVER_PID_GUEST}
+        CPID={X11_CLIENT_PID_GUEST}
+
+        ensure_installed() {{
+            if command -v X >/dev/null 2>&1 && command -v xcalc >/dev/null 2>&1; then
+                return 0
+            fi
+            [ -f "$STAGE_TAR" ] || {{
+                echo "missing X11 payload: $STAGE_TAR" >&2
+                exit 1
+            }}
+            tar -xf "$STAGE_TAR" -C /
+            sync
+        }}
+
+        write_config() {{
+            cat >"$CONF" <<'EOF'
+        {chr(10).join(X11_CONFIG_LINES)}
+        EOF
+        }}
+
+        stop_all() {{
+            pid=$(cat "$CPID" 2>/dev/null || true)
+            if [ -n "$pid" ]; then
+                kill "$pid" 2>/dev/null || true
+            fi
+            pid=$(cat "$XPID" 2>/dev/null || true)
+            if [ -n "$pid" ]; then
+                kill "$pid" 2>/dev/null || true
+            fi
+            rm -f "$CPID" "$XPID" /tmp/.X0-lock /tmp/.X11-unix/X0
+        }}
+
+        start_server() {{
+            ensure_installed
+            write_config
+            mkdir -p /tmp/.X11-unix
+            rm -f "$XLOG" "$XPID" /tmp/.X0-lock /tmp/.X11-unix/X0
+            X -config "$CONF" -retro >"$XLOG" 2>&1 &
+            pid=$!
+            echo "$pid" >"$XPID"
+            for i in $(seq 1 40); do
+                [ -S /tmp/.X11-unix/X0 ] && return 0
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    cat "$XLOG" >&2 || true
+                    return 1
+                fi
+                sleep 0.05
+            done
+            cat "$XLOG" >&2 || true
+            return 1
+        }}
+
+        start_client() {{
+            ensure_installed
+            rm -f "$CLOG" "$CPID"
+            DISPLAY=:0 xcalc >"$CLOG" 2>&1 &
+            pid=$!
+            echo "$pid" >"$CPID"
+            sleep 2
+            if ! kill -0 "$pid" 2>/dev/null; then
+                cat "$CLOG" >&2 || true
+                return 1
+            fi
+            return 0
+        }}
+
+        case "${{1:-start}}" in
+            install)
+                ensure_installed
+                ;;
+            server)
+                stop_all
+                start_server
+                printf '{X11_SERVER_TOKEN}\\n'
+                ;;
+            client)
+                start_client
+                printf '{X11_CLIENT_TOKEN}\\n'
+                ;;
+            start|demo)
+                stop_all
+                start_server
+                start_client
+                printf 'x11-manual-lab\\n'
+                ;;
+            stop)
+                stop_all
+                ;;
+            *)
+                echo "usage: $0 [install|server|client|start|stop]" >&2
+                exit 1
+                ;;
+        esac
+        """
+    )
+    X11_HELPER_LOCAL.write_text(script, encoding="utf-8")
+    X11_HELPER_LOCAL.chmod(0o755)
+    return X11_HELPER_LOCAL
+
+
 def debugfs_run(img: pathlib.Path, command: str, *, check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["debugfs", "-w", "-R", command, str(img)],
@@ -1015,6 +1194,9 @@ def ensure_guest_helpers(demo: Demo, arch: str, img: pathlib.Path) -> None:
         ev_helper = compile_helper(EVWATCH_HELPER_SOURCE, "evwatch", arch)
         debugfs_write(img, fb_helper, FBDRAW_HELPER_GUEST)
         debugfs_write(img, ev_helper, EVWATCH_HELPER_GUEST)
+        debugfs_mkdir(img, "/usr/share/starry-lab")
+        debugfs_write(img, ensure_x11_stage_tar(arch), X11_STAGE_TAR_GUEST)
+        debugfs_write(img, ensure_x11_helper_script(), X11_HELPER_GUEST)
     if demo.name == "gui":
         helper = compile_helper(MINIGUI_HELPER_SOURCE, "minigui", arch)
         debugfs_write(img, helper, MINIGUI_HELPER_GUEST)
@@ -1099,33 +1281,19 @@ def prepare_x11_base(arch: str, boot_timeout: float, command_timeout: float) -> 
     base_img = ensure_working_disk(arch)
     X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
     prepared_img = X11_STAGE_DIR / f"x11-base-{arch}.img"
-    if prepared_img.exists() and prepared_img.stat().st_mtime >= base_img.stat().st_mtime:
+    newest_input = max(
+        base_img.stat().st_mtime,
+        ensure_x11_stage_tar(arch).stat().st_mtime,
+        ensure_x11_helper_script().stat().st_mtime,
+        FBDRAW_HELPER_SOURCE.stat().st_mtime,
+        EVWATCH_HELPER_SOURCE.stat().st_mtime,
+        pathlib.Path(__file__).stat().st_mtime,
+    )
+    if prepared_img.exists() and prepared_img.stat().st_mtime >= newest_input:
         return prepared_img
 
     shutil.copyfile(base_img, prepared_img)
-    proc = spawn_qemu(
-        arch,
-        net="y",
-        graphic="y",
-        input_devices="y",
-        disk_img=prepared_img,
-        hostfwd="n",
-        snapshot="n",
-    )
-    try:
-        wait_for_qemu_start(proc, boot_timeout)
-        sock = socket.create_connection(("localhost", SERIAL_PORT), timeout=boot_timeout)
-        session = Session(sock)
-        session.wait_for_prompt(boot_timeout)
-        session.run_command(x11_install_command(), max(command_timeout, 900.0))
-        session.run_command("sync", command_timeout)
-    finally:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+    ensure_guest_helpers(DEMOS["x11"], arch, prepared_img)
     return prepared_img
 
 
@@ -3619,37 +3787,15 @@ def start_demo_peer(demo: Demo) -> PeerController | None:
 
 
 def x11_install_command() -> str:
-    packages = "xorg-server xf86-video-fbdev xf86-input-evdev xcalc"
-    return (
-        f"rm -f {X11_APK_LOG_GUEST}; "
-        f"apk info -e {packages} >/dev/null 2>&1 || apk add {packages} >{X11_APK_LOG_GUEST} 2>&1"
-    )
+    return f"sh -c 'rm -f {X11_APK_LOG_GUEST}; {X11_HELPER_GUEST} install >{X11_APK_LOG_GUEST} 2>&1'"
 
 
 def x11_server_start_command() -> str:
-    return (
-        "sh -c '"
-        "mkdir -p /tmp/.X11-unix; "
-        f"rm -f {X11_SERVER_LOG_GUEST} {X11_SERVER_PID_GUEST} /tmp/.X0-lock /tmp/.X11-unix/X0; "
-        f"X -config {X11_CONFIG_GUEST} -retro >{X11_SERVER_LOG_GUEST} 2>&1 & "
-        "pid=$!; "
-        f"echo $pid > {X11_SERVER_PID_GUEST}; "
-        "kill -0 $pid 2>/dev/null; "
-        f"printf \"{X11_SERVER_TOKEN}\\n\"'"
-    )
+    return f"{X11_HELPER_GUEST} server"
 
 
 def x11_client_command() -> str:
-    return (
-        "sh -c '"
-        f"rm -f {X11_CLIENT_LOG_GUEST} {X11_CLIENT_PID_GUEST}; "
-        f"DISPLAY=:0 xcalc >{X11_CLIENT_LOG_GUEST} 2>&1 & "
-        "pid=$!; "
-        f"echo $pid > {X11_CLIENT_PID_GUEST}; "
-        "sleep 2; "
-        "kill -0 $pid; "
-        f"printf \"{X11_CLIENT_TOKEN}\\n\"'"
-    )
+    return f"{X11_HELPER_GUEST} client"
 
 
 def x11_wait_server_ready_command() -> str:
@@ -3670,18 +3816,7 @@ def x11_wait_server_ready_command() -> str:
 
 
 def x11_cleanup_command() -> str:
-    return (
-        "sh -c '"
-        f"for f in {X11_CLIENT_PID_GUEST} {X11_SERVER_PID_GUEST}; do "
-        "  [ -f \"$f\" ] || continue; "
-        "  pid=$(cat \"$f\" 2>/dev/null); "
-        "  [ -n \"$pid\" ] && kill \"$pid\" 2>/dev/null || true; "
-        "done; "
-        "sleep 1; "
-        "rm -f /tmp/.X0-lock /tmp/.X11-unix/X0; "
-        "for f in "
-        f"{X11_CLIENT_PID_GUEST} {X11_SERVER_PID_GUEST}; do rm -f \"$f\"; done'"
-    )
+    return f"{X11_HELPER_GUEST} stop"
 
 
 def summarize_syscalls(events: list[TraceEvent]) -> list[str]:
@@ -4610,9 +4745,6 @@ def execute_run(
             install_command = x11_install_command()
             input_stream.append(install_command)
             session.run_command(install_command, max(command_timeout, 600.0))
-            for command in X11_CONFIG_SETUP_COMMANDS:
-                input_stream.append(command)
-                session.run_command(command, command_timeout)
             try:
                 phase_reset = "echo 1 > /proc/starry/reset"
                 phase_off = "echo 1 > /proc/starry/off"
@@ -5137,9 +5269,12 @@ def main() -> int:
         run_build(args.arch)
 
     if args.stage_only:
+        if demo.name == "x11":
+            print(prepare_x11_base(args.arch, args.boot_timeout, args.command_timeout).resolve())
+            return 0
         base_img = ensure_working_disk(args.arch)
         ensure_guest_helpers(demo, args.arch, base_img)
-        print(base_img)
+        print(base_img.resolve())
         return 0
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
