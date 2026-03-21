@@ -1019,6 +1019,14 @@ def ensure_x11_stage_tar(arch: str) -> pathlib.Path:
     if X11_STAGE_TAR.exists() and X11_STAGE_TAR.stat().st_mtime >= stamp.stat().st_mtime:
         return X11_STAGE_TAR
 
+    entries = sorted(
+        child.name
+        for child in stage_root.iterdir()
+        if child.name != ".stage-ok"
+    )
+    if not entries:
+        raise RuntimeError(f"host-side X11 staging root is empty: {stage_root}")
+
     subprocess.run(
         [
             "tar",
@@ -1029,7 +1037,7 @@ def ensure_x11_stage_tar(arch: str) -> pathlib.Path:
             str(stage_root),
             "-cf",
             str(X11_STAGE_TAR),
-            ".",
+            *entries,
         ],
         check=True,
         cwd=REPO_ROOT,
@@ -1039,109 +1047,108 @@ def ensure_x11_stage_tar(arch: str) -> pathlib.Path:
 
 def ensure_x11_helper_script() -> pathlib.Path:
     X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
-    script = textwrap.dedent(
-        f"""\
-        #!/bin/sh
-        set -e
-        STAGE_TAR={X11_STAGE_TAR_GUEST}
-        CONF={X11_CONFIG_GUEST}
-        XLOG={X11_SERVER_LOG_GUEST}
-        CLOG={X11_CLIENT_LOG_GUEST}
-        XPID={X11_SERVER_PID_GUEST}
-        CPID={X11_CLIENT_PID_GUEST}
-
-        ensure_installed() {{
-            if command -v X >/dev/null 2>&1 && command -v xcalc >/dev/null 2>&1; then
-                return 0
-            fi
-            [ -f "$STAGE_TAR" ] || {{
-                echo "missing X11 payload: $STAGE_TAR" >&2
-                exit 1
-            }}
-            tar -xf "$STAGE_TAR" -C /
-            sync
-        }}
-
-        write_config() {{
-            cat >"$CONF" <<'EOF'
-        {chr(10).join(X11_CONFIG_LINES)}
-        EOF
-        }}
-
-        stop_all() {{
-            pid=$(cat "$CPID" 2>/dev/null || true)
-            if [ -n "$pid" ]; then
-                kill "$pid" 2>/dev/null || true
-            fi
-            pid=$(cat "$XPID" 2>/dev/null || true)
-            if [ -n "$pid" ]; then
-                kill "$pid" 2>/dev/null || true
-            fi
-            rm -f "$CPID" "$XPID" /tmp/.X0-lock /tmp/.X11-unix/X0
-        }}
-
-        start_server() {{
-            ensure_installed
-            write_config
-            mkdir -p /tmp/.X11-unix
-            rm -f "$XLOG" "$XPID" /tmp/.X0-lock /tmp/.X11-unix/X0
-            X -config "$CONF" -retro >"$XLOG" 2>&1 &
-            pid=$!
-            echo "$pid" >"$XPID"
-            for i in $(seq 1 40); do
-                [ -S /tmp/.X11-unix/X0 ] && return 0
-                if ! kill -0 "$pid" 2>/dev/null; then
-                    cat "$XLOG" >&2 || true
-                    return 1
-                fi
-                sleep 0.05
-            done
-            cat "$XLOG" >&2 || true
-            return 1
-        }}
-
-        start_client() {{
-            ensure_installed
-            rm -f "$CLOG" "$CPID"
-            DISPLAY=:0 xcalc >"$CLOG" 2>&1 &
-            pid=$!
-            echo "$pid" >"$CPID"
-            sleep 2
-            if ! kill -0 "$pid" 2>/dev/null; then
-                cat "$CLOG" >&2 || true
-                return 1
-            fi
-            return 0
-        }}
-
-        case "${{1:-start}}" in
-            install)
-                ensure_installed
-                ;;
-            server)
-                stop_all
-                start_server
-                printf '{X11_SERVER_TOKEN}\\n'
-                ;;
-            client)
-                start_client
-                printf '{X11_CLIENT_TOKEN}\\n'
-                ;;
-            start|demo)
-                stop_all
-                start_server
-                start_client
-                printf 'x11-manual-lab\\n'
-                ;;
-            stop)
-                stop_all
-                ;;
-            *)
-                echo "usage: $0 [install|server|client|start|stop]" >&2
-                exit 1
-                ;;
-        esac
-        """
+    config_text = "\n".join(X11_CONFIG_LINES)
+    script = (
+        "#!/bin/sh\n"
+        "set -e\n"
+        f"STAGE_TAR={X11_STAGE_TAR_GUEST}\n"
+        f"CONF={X11_CONFIG_GUEST}\n"
+        f"XLOG={X11_SERVER_LOG_GUEST}\n"
+        f"CLOG={X11_CLIENT_LOG_GUEST}\n"
+        f"XPID={X11_SERVER_PID_GUEST}\n"
+        f"CPID={X11_CLIENT_PID_GUEST}\n"
+        "\n"
+        "ensure_installed() {\n"
+        "    if command -v X >/dev/null 2>&1 && command -v xcalc >/dev/null 2>&1; then\n"
+        "        return 0\n"
+        "    fi\n"
+        "    [ -f \"$STAGE_TAR\" ] || {\n"
+        "        echo \"missing X11 payload: $STAGE_TAR\" >&2\n"
+        "        exit 1\n"
+        "    }\n"
+        "    tar -xf \"$STAGE_TAR\" -C /\n"
+        "    sync\n"
+        "}\n"
+        "\n"
+        "write_config() {\n"
+        "    cat >\"$CONF\" <<'EOF'\n"
+        f"{config_text}\n"
+        "EOF\n"
+        "}\n"
+        "\n"
+        "stop_all() {\n"
+        "    pid=$(cat \"$CPID\" 2>/dev/null || true)\n"
+        "    if [ -n \"$pid\" ]; then\n"
+        "        kill \"$pid\" 2>/dev/null || true\n"
+        "    fi\n"
+        "    pid=$(cat \"$XPID\" 2>/dev/null || true)\n"
+        "    if [ -n \"$pid\" ]; then\n"
+        "        kill \"$pid\" 2>/dev/null || true\n"
+        "    fi\n"
+        "    rm -f \"$CPID\" \"$XPID\" /tmp/.X0-lock /tmp/.X11-unix/X0\n"
+        "}\n"
+        "\n"
+        "start_server() {\n"
+        "    ensure_installed\n"
+        "    write_config\n"
+        "    [ -d /tmp/.X11-unix ] || mkdir /tmp/.X11-unix\n"
+        "    rm -f \"$XLOG\" \"$XPID\" /tmp/.X0-lock /tmp/.X11-unix/X0\n"
+        "    X -config \"$CONF\" -retro >\"$XLOG\" 2>&1 &\n"
+        "    pid=$!\n"
+        "    echo \"$pid\" >\"$XPID\"\n"
+        "    for i in $(seq 1 40); do\n"
+        "        [ -S /tmp/.X11-unix/X0 ] && return 0\n"
+        "        if ! kill -0 \"$pid\" 2>/dev/null; then\n"
+        "            cat \"$XLOG\" >&2 || true\n"
+        "            return 1\n"
+        "        fi\n"
+        "        sleep 0.05\n"
+        "    done\n"
+        "    cat \"$XLOG\" >&2 || true\n"
+        "    return 1\n"
+        "}\n"
+        "\n"
+        "start_client() {\n"
+        "    ensure_installed\n"
+        "    rm -f \"$CLOG\" \"$CPID\"\n"
+        "    DISPLAY=:0 xcalc >\"$CLOG\" 2>&1 &\n"
+        "    pid=$!\n"
+        "    echo \"$pid\" >\"$CPID\"\n"
+        "    sleep 2\n"
+        "    if ! kill -0 \"$pid\" 2>/dev/null; then\n"
+        "        cat \"$CLOG\" >&2 || true\n"
+        "        return 1\n"
+        "    fi\n"
+        "    return 0\n"
+        "}\n"
+        "\n"
+        "case \"${1:-start}\" in\n"
+        "    install)\n"
+        "        ensure_installed\n"
+        "        ;;\n"
+        "    server)\n"
+        "        stop_all\n"
+        "        start_server\n"
+        f"        printf '{X11_SERVER_TOKEN}\\n'\n"
+        "        ;;\n"
+        "    client)\n"
+        "        start_client\n"
+        f"        printf '{X11_CLIENT_TOKEN}\\n'\n"
+        "        ;;\n"
+        "    start|demo)\n"
+        "        stop_all\n"
+        "        start_server\n"
+        "        start_client\n"
+        "        printf 'x11-manual-lab\\n'\n"
+        "        ;;\n"
+        "    stop)\n"
+        "        stop_all\n"
+        "        ;;\n"
+        "    *)\n"
+        "        echo \"usage: $0 [install|server|client|start|stop]\" >&2\n"
+        "        exit 1\n"
+        "        ;;\n"
+        "esac\n"
     )
     X11_HELPER_LOCAL.write_text(script, encoding="utf-8")
     X11_HELPER_LOCAL.chmod(0o755)
