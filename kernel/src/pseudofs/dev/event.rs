@@ -27,11 +27,15 @@ const KEY_CNT: usize = EventType::Key.bits_count();
 struct Inner {
     device: AxInputDevice,
     read_ahead: Option<(Duration, Event)>,
+    pending_sync: Option<Duration>,
     poll_announced: bool,
     key_state: Bitmap<KEY_CNT>,
 }
 impl Inner {
     fn has_event(&mut self) -> bool {
+        if self.pending_sync.is_some() {
+            return true;
+        }
         if self.read_ahead.is_none() {
             match self.device.read_event() {
                 Ok(event) => {
@@ -62,6 +66,7 @@ pub struct EventDev {
 impl EventDev {
     pub fn new(mut device: AxInputDevice) -> Self {
         let mut ev_bits = Bitmap::new();
+        ev_bits.set(EventType::Synchronization as usize, true);
         for i in 0..EventType::COUNT {
             let Some(ty) = EventType::from_repr(i) else {
                 continue;
@@ -90,6 +95,7 @@ impl EventDev {
             inner: Mutex::new(Inner {
                 device,
                 read_ahead: None,
+                pending_sync: None,
                 poll_announced: false,
                 key_state: Bitmap::new(),
             }),
@@ -103,6 +109,13 @@ impl EventDev {
             Ok(copy_bytes(self.ev_bits.as_bytes(), bits))
         } else {
             let ty = EventType::from_repr(ty).ok_or(AxError::InvalidInput)?;
+            if ty == EventType::Synchronization {
+                bits.fill(0);
+                if let Some(first) = bits.first_mut() {
+                    *first = 1;
+                }
+                return Ok(bits.len().min(ty.bits_count().div_ceil(8)));
+            }
             match self.inner.lock().device.get_event_bits(ty, bits) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -168,6 +181,21 @@ impl DeviceOps for EventDev {
         let mut first_event = None;
         let mut inner = self.inner.lock();
         for out in buf.chunks_exact_mut(size_of::<InputEvent>()) {
+            if let Some(time) = inner.pending_sync.take() {
+                inner.poll_announced = false;
+                let input_event = InputEvent {
+                    time: KernelTimeval {
+                        tv_sec: time.as_secs() as _,
+                        tv_usec: time.subsec_micros() as _,
+                    },
+                    event_type: EventType::Synchronization as u16,
+                    code: 0,
+                    value: 0,
+                };
+                out.copy_from_slice(input_event.as_bytes());
+                read += out.len();
+                continue;
+            }
             if !inner.has_event() {
                 break;
             }
@@ -189,6 +217,9 @@ impl DeviceOps for EventDev {
             };
             out.copy_from_slice(input_event.as_bytes());
             read += out.len();
+            if event.event_type != EventType::Synchronization as u16 {
+                inner.pending_sync = Some(time);
+            }
         }
         if read == 0 {
             Err(AxError::WouldBlock)
@@ -322,10 +353,14 @@ impl Pollable for EventDev {
         let mut inner = self.inner.lock();
         let ready = inner.has_event();
         if ready && !inner.poll_announced {
-            let first_event = inner
-                .read_ahead
-                .map(|(_, event)| ((event.event_type as usize) << 16) | event.code as usize)
-                .unwrap_or(0);
+            let first_event = if inner.pending_sync.is_some() {
+                (EventType::Synchronization as usize) << 16
+            } else {
+                inner
+                    .read_ahead
+                    .map(|(_, event)| ((event.event_type as usize) << 16) | event.code as usize)
+                    .unwrap_or(0)
+            };
             inner.poll_announced = true;
             lab::emit(EventKind::InputPollWake, 1, first_event);
         }
@@ -347,22 +382,34 @@ pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
     let mut keys = [0; 0x300usize.div_ceil(8)];
     for (i, mut device) in input_devices.into_iter().enumerate() {
         assert!(device.get_event_bits(EventType::Key, &mut keys).unwrap());
-
-        let dev = Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            DeviceId::new(13, (i + 1) as _),
-            Arc::new(EventDev::new(device)),
-        );
+        let ops: Arc<dyn DeviceOps> = Arc::new(EventDev::new(device));
+        let event_minor = (i + 1) as u32;
 
         const BTN_MOUSE: usize = 0x110;
         if keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0 {
-            // Mouse
-            inputs.add("mice", dev);
-        } else {
-            inputs.add(format!("event{input_id}"), dev);
-            input_id += 1;
+            // Expose the mouse both as an evdev node and as the legacy
+            // aggregate `/dev/input/mice` stream so raw-input labs and X11 can
+            // choose the interface they need.
+            inputs.add(
+                "mice",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(13, event_minor + 0x40),
+                    ops.clone(),
+                ),
+            );
         }
+        inputs.add(
+            format!("event{input_id}"),
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(13, event_minor),
+                ops,
+            ),
+        );
+        input_id += 1;
     }
     inputs
 }

@@ -55,6 +55,7 @@ FBDRAW_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "fbdraw.c"
 EVWATCH_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "evwatch.c"
 MINIGUI_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "minigui.c"
 SNAKE_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "snake.c"
+XCALC_HELPER_SOURCE = REPO_ROOT / "scripts" / "lab-helpers" / "xcalc_lab.c"
 PTY_HELPER_GUEST = "/usr/bin/lab_pty_relay"
 WAITCTL_HELPER_GUEST = "/usr/bin/lab_waitctl"
 TTYSIG_HELPER_GUEST = "/usr/bin/lab_ttysig"
@@ -65,12 +66,17 @@ FBDRAW_HELPER_GUEST = "/usr/bin/lab_fbdraw"
 EVWATCH_HELPER_GUEST = "/usr/bin/lab_evwatch"
 MINIGUI_HELPER_GUEST = "/usr/bin/lab_minigui"
 SNAKE_HELPER_GUEST = "/usr/bin/lab_snake"
+XCALC_HELPER_GUEST = "/usr/bin/lab_xcalc"
 DROPBEAR_ATTR = "nixpkgs#pkgsCross.riscv64-musl.dropbear"
+XLIB11_DEV_ATTR = "nixpkgs#pkgsCross.riscv64-musl.libX11.dev"
+XCALC_ATTR = "nixpkgs#pkgsCross.riscv64-musl.xcalc"
 DROPBEAR_STAGE_DIR = LAB_BIN_DIR / "dropbear"
 SSH_KEY_STAGE_DIR = LAB_BIN_DIR / "ssh"
 X11_STAGE_DIR = LAB_BIN_DIR / "x11"
 X11_STAGE_ROOT = X11_STAGE_DIR / f"root-{BASELINE_ARCH}"
 X11_STAGE_TAR = X11_STAGE_DIR / f"x11-stage-{BASELINE_ARCH}.tar"
+X11_STAGE_META = X11_STAGE_DIR / "x11-stage.meta"
+XCALC_STAGE_TAR = X11_STAGE_DIR / f"xcalc-store-{BASELINE_ARCH}.tar"
 X11_HELPER_LOCAL = X11_STAGE_DIR / "lab_x11demo.sh"
 DROPBEAR_GUEST = "/usr/bin/lab_dropbear"
 DROPBEARKEY_GUEST = "/usr/bin/lab_dropbearkey"
@@ -96,10 +102,15 @@ X11_SERVER_LOG_GUEST = "/tmp/lab_x11.log"
 X11_CLIENT_LOG_GUEST = "/tmp/lab_xcalc.log"
 X11_SERVER_PID_GUEST = "/tmp/lab_x11.pid"
 X11_CLIENT_PID_GUEST = "/tmp/lab_xcalc.pid"
-X11_CONFIG_NAME = "lab_x11.conf"
-X11_CONFIG_GUEST = "/tmp/lab_x11.conf"
+X11_INPUT_LOG_GUEST = "/tmp/lab_xcalc.log.raw"
+X11_INPUT_PID_GUEST = "/tmp/lab_xinput.pid"
+X11_INPUT_OFFSET_GUEST = "/tmp/lab_xinput.offset"
+X11_CONFIG_NAME = "xorg.conf"
+X11_CONFIG_GUEST = "/etc/X11/xorg.conf"
 X11_STAGE_TAR_GUEST = "/usr/share/starry-lab/x11-stage.tar"
+XCALC_STAGE_TAR_GUEST = "/usr/share/starry-lab/xcalc-store.tar"
 X11_HELPER_GUEST = "/usr/bin/lab_x11demo"
+X11_INPUT_TOKEN = "x11-input-lab"
 SSHD_PHASE2_LINES: tuple[str, ...] = (
     "PS1=",
     "export PS1",
@@ -165,7 +176,7 @@ X11_CONFIG_LINES: tuple[str, ...] = (
     'Section "InputDevice"',
     '    Identifier "Mouse0"',
     '    Driver "evdev"',
-    '    Option "Device" "/dev/input/mice"',
+    '    Option "Device" "/dev/input/event1"',
     'EndSection',
     'Section "Device"',
     '    Identifier "FB0"',
@@ -191,7 +202,13 @@ X11_APK_REPOSITORIES: tuple[str, ...] = (
     "https://dl-cdn.alpinelinux.org/alpine/v3.23/main",
     "https://dl-cdn.alpinelinux.org/alpine/v3.23/community",
 )
-X11_APK_PACKAGES = "xorg-server xf86-video-fbdev xf86-input-evdev xcalc"
+X11_STAGE_VERSION = 4
+X11_APK_PACKAGES = (
+    "xorg-server xf86-video-fbdev xf86-input-evdev "
+    "xcalc xbitmaps xwininfo xsetroot xdpyinfo xev "
+    "font-adobe-75dpi font-adobe-100dpi font-bitstream-75dpi font-bitstream-100dpi"
+)
+X11_STAGE_TOPLEVEL: tuple[str, ...] = ("usr", "etc")
 
 TTY_CTL_NAMES: dict[int, str] = {
     1: "TIOCSCTTY",
@@ -513,7 +530,7 @@ DEMOS: dict[str, Demo] = {
         setup_commands=(),
         focus_page_fault_arg0=None,
         focus_signal_arg0=None,
-        net="y",
+        net="n",
         graphic="y",
         input="y",
     ),
@@ -887,6 +904,72 @@ def compile_helper(source: pathlib.Path, output_name: str, arch: str) -> pathlib
     return output
 
 
+def compile_x11_helper(source: pathlib.Path, output_name: str, arch: str) -> pathlib.Path:
+    LAB_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    output = LAB_BIN_DIR / f"{output_name}-{arch}"
+    if output.exists() and output.stat().st_mtime >= source.stat().st_mtime:
+        output.chmod(0o755)
+        return output
+
+    try:
+        libx11_dev = nix_build_output(XLIB11_DEV_ATTR)
+    except subprocess.CalledProcessError:
+        candidates = sorted(
+            pathlib.Path("/nix/store").glob(f"*-libx11-{arch}-unknown-linux-musl-*-dev")
+        )
+        if not candidates:
+            raise
+        libx11_dev = candidates[-1]
+    include_dirs = [libx11_dev / "include"]
+    propagated = libx11_dev / "nix-support" / "propagated-build-inputs"
+    if propagated.exists():
+        for raw in propagated.read_text(encoding="utf-8").split():
+            path = pathlib.Path(raw) / "include"
+            if path.exists():
+                include_dirs.append(path)
+    pc_values: dict[str, str] = {}
+    for line in (libx11_dev / "lib" / "pkgconfig" / "x11.pc").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.startswith(("Cflags:", "Libs:", "Requires")):
+            key, value = line.split("=", 1)
+            pc_values[key.strip()] = value.strip()
+    prefix = pc_values.get("prefix", "")
+    lib_dir = pathlib.Path(pc_values.get("libdir", "").replace("${prefix}", prefix))
+    if not lib_dir.exists():
+        raise RuntimeError(f"failed to locate libX11 link directory from x11.pc: {lib_dir}")
+    compiler = f"{arch}-linux-musl-gcc"
+    include_flags = [flag for path in include_dirs for flag in (f"-I{path}",)]
+    subprocess.run(
+        [
+            compiler,
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-s",
+            "-o",
+            str(output),
+            str(source),
+            *include_flags,
+            f"-L{lib_dir}",
+            "-Wl,-rpath,/usr/lib",
+            "-lX11",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "patchelf",
+            "--set-interpreter",
+            "/lib/ld-musl-riscv64.so.1",
+            "--set-rpath",
+            "/usr/lib",
+            str(output),
+        ],
+        check=True,
+    )
+    output.chmod(0o755)
+    return output
+
+
 def nix_build_output(attr: str) -> pathlib.Path:
     completed = subprocess.run(
         ["nix", "build", "--no-link", "--print-out-paths", attr],
@@ -984,7 +1067,8 @@ def ensure_ssh_client_key() -> tuple[pathlib.Path, str]:
 def ensure_x11_stage_root(arch: str) -> pathlib.Path:
     X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = X11_STAGE_ROOT / ".stage-ok"
-    if stamp.exists():
+    desired_stamp = f"v{X11_STAGE_VERSION}\n{X11_APK_PACKAGES}\n"
+    if stamp.exists() and stamp.read_text(encoding="utf-8") == desired_stamp:
         return X11_STAGE_ROOT
 
     if X11_STAGE_ROOT.exists():
@@ -1010,21 +1094,65 @@ def ensure_x11_stage_root(arch: str) -> pathlib.Path:
     if proc.returncode != 0:
         raise RuntimeError(f"failed to stage host-side X11 userland (apk exit {proc.returncode})")
 
-    stamp.write_text(f"{X11_APK_PACKAGES}\n", encoding="utf-8")
+    apk_log = X11_STAGE_ROOT / "var" / "log" / "apk.log"
+    if apk_log.is_dir():
+        shutil.rmtree(apk_log)
+    elif apk_log.exists():
+        apk_log.unlink()
+
+    stamp.write_text(desired_stamp, encoding="utf-8")
     return X11_STAGE_ROOT
 
 
 def ensure_x11_stage_tar(arch: str) -> pathlib.Path:
+    desired_stamp = f"v{X11_STAGE_VERSION}\n{arch}\n{X11_APK_PACKAGES}\n"
+    if X11_STAGE_TAR.exists():
+        if X11_STAGE_META.exists():
+            if X11_STAGE_META.read_text(encoding="utf-8") == desired_stamp:
+                return X11_STAGE_TAR
+        else:
+            X11_STAGE_META.write_text(desired_stamp, encoding="utf-8")
+            return X11_STAGE_TAR
+        with tempfile.TemporaryDirectory(prefix="starry-x11-stage-") as tmp_dir:
+            tmp_root = pathlib.Path(tmp_dir)
+            subprocess.run(
+                ["tar", "-xf", str(X11_STAGE_TAR), "-C", str(tmp_root)],
+                check=True,
+                cwd=REPO_ROOT,
+            )
+            apk_log = tmp_root / "var" / "log" / "apk.log"
+            if apk_log.is_dir():
+                shutil.rmtree(apk_log)
+            elif apk_log.exists():
+                apk_log.unlink()
+            entries = [name for name in X11_STAGE_TOPLEVEL if (tmp_root / name).exists()]
+            tmp_tar = X11_STAGE_DIR / f".x11-stage-{arch}.tar.tmp"
+            subprocess.run(
+                [
+                    "tar",
+                    "--numeric-owner",
+                    "--owner=0",
+                    "--group=0",
+                    "-C",
+                    str(tmp_root),
+                    "-cf",
+                    str(tmp_tar),
+                    *entries,
+                ],
+                check=True,
+                cwd=REPO_ROOT,
+            )
+            tmp_tar.replace(X11_STAGE_TAR)
+            X11_STAGE_META.write_text(desired_stamp, encoding="utf-8")
+            return X11_STAGE_TAR
+
     stage_root = ensure_x11_stage_root(arch)
     stamp = stage_root / ".stage-ok"
     if X11_STAGE_TAR.exists() and X11_STAGE_TAR.stat().st_mtime >= stamp.stat().st_mtime:
+        X11_STAGE_META.write_text(desired_stamp, encoding="utf-8")
         return X11_STAGE_TAR
 
-    entries = sorted(
-        child.name
-        for child in stage_root.iterdir()
-        if child.name != ".stage-ok"
-    )
+    entries = [name for name in X11_STAGE_TOPLEVEL if (stage_root / name).exists()]
     if not entries:
         raise RuntimeError(f"host-side X11 staging root is empty: {stage_root}")
 
@@ -1043,42 +1171,120 @@ def ensure_x11_stage_tar(arch: str) -> pathlib.Path:
         check=True,
         cwd=REPO_ROOT,
     )
+    X11_STAGE_META.write_text(desired_stamp, encoding="utf-8")
     return X11_STAGE_TAR
+
+
+def get_x11_stage_tar(arch: str) -> pathlib.Path:
+    return ensure_x11_stage_tar(arch)
+
+
+def ensure_xcalc_stage_tar(arch: str) -> tuple[pathlib.Path, pathlib.Path]:
+    if arch != BASELINE_ARCH:
+        raise RuntimeError(f"unsupported arch for xcalc assets: {arch}")
+
+    X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    package = nix_build_output(XCALC_ATTR)
+    completed = subprocess.run(
+        ["nix-store", "--query", "--requisites", str(package)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    requisites = [pathlib.Path(line.strip()) for line in completed.stdout.splitlines() if line.strip()]
+    if not requisites:
+        raise RuntimeError(f"failed to collect xcalc closure for {package}")
+
+    stamp_path = X11_STAGE_DIR / f"xcalc-stage-{arch}.stamp"
+    desired_stamp = "\n".join([str(package), *map(str, requisites)]) + "\n"
+    newest_input = max(path.stat().st_mtime for path in requisites)
+    if (
+        XCALC_STAGE_TAR.exists()
+        and stamp_path.exists()
+        and stamp_path.read_text(encoding="utf-8") == desired_stamp
+        and XCALC_STAGE_TAR.stat().st_mtime >= newest_input
+    ):
+        return XCALC_STAGE_TAR, package
+
+    tar_entries = [str(path)[1:] for path in requisites]
+    subprocess.run(
+        ["tar", "-C", "/", "-cf", str(XCALC_STAGE_TAR), *tar_entries],
+        check=True,
+        cwd=REPO_ROOT,
+    )
+    stamp_path.write_text(desired_stamp, encoding="utf-8")
+    return XCALC_STAGE_TAR, package
 
 
 def ensure_x11_helper_script() -> pathlib.Path:
     X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
     config_text = "\n".join(X11_CONFIG_LINES)
+    x11_stamp = X11_APK_PACKAGES.replace("'", "")
     script = (
         "#!/bin/sh\n"
         "set -e\n"
         f"STAGE_TAR={X11_STAGE_TAR_GUEST}\n"
+        f"XCALC_BIN={XCALC_HELPER_GUEST}\n"
         f"CONF={X11_CONFIG_GUEST}\n"
         f"CONF_NAME={X11_CONFIG_NAME}\n"
         f"XLOG={X11_SERVER_LOG_GUEST}\n"
         f"CLOG={X11_CLIENT_LOG_GUEST}\n"
         f"XPID={X11_SERVER_PID_GUEST}\n"
         f"CPID={X11_CLIENT_PID_GUEST}\n"
+        f"ILOG={X11_INPUT_LOG_GUEST}\n"
+        f"IPID={X11_INPUT_PID_GUEST}\n"
+        f"IOFF={X11_INPUT_OFFSET_GUEST}\n"
+        "STAMP=/usr/share/starry-lab/.x11-ready\n"
+        f"EXPECTED_STAMP='{x11_stamp}'\n"
+        "\n"
+        "have_runtime() {\n"
+        "    command -v X >/dev/null 2>&1 \\\n"
+        "        && [ -x \"$XCALC_BIN\" ] \\\n"
+        "        && [ -x /usr/libexec/Xorg ] \\\n"
+        "        && [ -f /usr/include/X11/bitmaps/calculator ]\n"
+        "}\n"
+        "\n"
+        "prepare_runtime() {\n"
+        "    mkdir /usr/share/starry-lab 2>/dev/null || true\n"
+        "    printf '%s\\n' \"$EXPECTED_STAMP\" >\"$STAMP\"\n"
+        "}\n"
         "\n"
         "ensure_installed() {\n"
-        "    if command -v X >/dev/null 2>&1 && command -v xcalc >/dev/null 2>&1; then\n"
+        "    ready=0\n"
+        "    if have_runtime; then\n"
+        "        ready=1\n"
+        "    fi\n"
+        "    if [ \"$ready\" -eq 0 ]; then\n"
+        "        [ -f \"$STAGE_TAR\" ] || {\n"
+        "            echo \"missing X11 payload: $STAGE_TAR\" >&2\n"
+        "            exit 1\n"
+        "        }\n"
+        "        rm -rf /var/log/apk.log >/dev/null 2>&1 || true\n"
+        "        tar -xf \"$STAGE_TAR\" -C /\n"
+        "    fi\n"
+        "    prepare_runtime\n"
+        "}\n"
+        "\n"
+        "require_runtime() {\n"
+        "    if have_runtime; then\n"
         "        return 0\n"
         "    fi\n"
-        "    [ -f \"$STAGE_TAR\" ] || {\n"
-        "        echo \"missing X11 payload: $STAGE_TAR\" >&2\n"
-        "        exit 1\n"
-        "    }\n"
-        "    tar -xf \"$STAGE_TAR\" -C /\n"
-        "    sync\n"
+        "    echo \"incomplete X11 runtime after install\" >&2\n"
+        "    return 1\n"
         "}\n"
         "\n"
         "write_config() {\n"
+        "    [ -d /etc/X11 ] || mkdir /etc/X11\n"
         "    cat >\"$CONF\" <<'EOF'\n"
         f"{config_text}\n"
         "EOF\n"
         "}\n"
         "\n"
         "stop_all() {\n"
+        "    pid=$(cat \"$IPID\" 2>/dev/null || true)\n"
+        "    if [ -n \"$pid\" ]; then\n"
+        "        kill \"$pid\" 2>/dev/null || true\n"
+        "    fi\n"
         "    pid=$(cat \"$CPID\" 2>/dev/null || true)\n"
         "    if [ -n \"$pid\" ]; then\n"
         "        kill \"$pid\" 2>/dev/null || true\n"
@@ -1087,19 +1293,23 @@ def ensure_x11_helper_script() -> pathlib.Path:
         "    if [ -n \"$pid\" ]; then\n"
         "        kill \"$pid\" 2>/dev/null || true\n"
         "    fi\n"
-        "    rm -f \"$CPID\" \"$XPID\" /tmp/.X0-lock /tmp/.X11-unix/X0\n"
+        "    rm -f \"$IPID\" \"$IOFF\" \"$CPID\" \"$XPID\" /tmp/.X0-lock /tmp/.X11-unix/X0\n"
         "}\n"
         "\n"
         "start_server() {\n"
-        "    ensure_installed\n"
+        "    ensure_installed || true\n"
+        "    require_runtime\n"
         "    write_config\n"
         "    [ -d /tmp/.X11-unix ] || mkdir /tmp/.X11-unix\n"
         "    rm -f \"$XLOG\" \"$XPID\" /tmp/.X0-lock /tmp/.X11-unix/X0\n"
-        "    (cd /tmp && X -config \"$CONF_NAME\" -retro >\"$XLOG\" 2>&1) &\n"
+        "    X -retro >\"$XLOG\" 2>&1 &\n"
         "    pid=$!\n"
         "    echo \"$pid\" >\"$XPID\"\n"
         "    for i in $(seq 1 40); do\n"
-        "        [ -S /tmp/.X11-unix/X0 ] && return 0\n"
+        "        if [ -S /tmp/.X11-unix/X0 ]; then\n"
+        "            sleep 5\n"
+        "            return 0\n"
+        "        fi\n"
         "        if ! kill -0 \"$pid\" 2>/dev/null; then\n"
         "            cat \"$XLOG\" >&2 || true\n"
         "            return 1\n"
@@ -1111,16 +1321,42 @@ def ensure_x11_helper_script() -> pathlib.Path:
         "}\n"
         "\n"
         "start_client() {\n"
-        "    ensure_installed\n"
+        "    ensure_installed || true\n"
+        "    require_runtime\n"
         "    rm -f \"$CLOG\" \"$CPID\"\n"
-        "    DISPLAY=:0 xcalc >\"$CLOG\" 2>&1 &\n"
+        "    raw_log=${CLOG}.raw\n"
+        "    diag_log=${CLOG}.diag\n"
+        "    rm -f \"$raw_log\" \"$diag_log\"\n"
+        "    DISPLAY=:0 \"$XCALC_BIN\" --log-input -geometry 240x320+40+40 >\"$raw_log\" 2>&1 </dev/null &\n"
         "    pid=$!\n"
         "    echo \"$pid\" >\"$CPID\"\n"
-        "    sleep 2\n"
+        "    tree_log=/tmp/lab_xwininfo.log\n"
+        "    sleep 3\n"
+        "    printf 'pid=%s\\n' \"$pid\" >\"$diag_log\"\n"
+        "    ls -l \"/proc/$pid/fd\" >>\"$diag_log\" 2>&1 || true\n"
+        "    timeout 2 sh -c 'DISPLAY=:0 xwininfo -root -tree' >\"$tree_log\" 2>&1 || true\n"
         "    if ! kill -0 \"$pid\" 2>/dev/null; then\n"
+        "        cat \"$diag_log\" \"$raw_log\" \"$tree_log\" 2>/dev/null >\"$CLOG\" || true\n"
         "        cat \"$CLOG\" >&2 || true\n"
         "        return 1\n"
         "    fi\n"
+        "    cat \"$diag_log\" \"$raw_log\" \"$tree_log\" 2>/dev/null >\"$CLOG\" || true\n"
+        "    return 0\n"
+        "}\n"
+        "\n"
+        "start_input_probe() {\n"
+        "    ensure_installed || true\n"
+        "    require_runtime\n"
+        "    rm -f \"$IPID\" \"$IOFF\"\n"
+        "    raw_log=\"$ILOG\"\n"
+        "    pid=$(cat \"$CPID\" 2>/dev/null || true)\n"
+        "    if [ -z \"$pid\" ] || ! kill -0 \"$pid\" 2>/dev/null; then\n"
+        "        return 1\n"
+        "    fi\n"
+        "    count=$(wc -c <\"$raw_log\" 2>/dev/null || echo 0)\n"
+        "    printf '%s\\n' \"$count\" >\"$IOFF\"\n"
+        "    echo \"$pid\" >\"$IPID\"\n"
+        "    sleep 0.1\n"
         "    return 0\n"
         "}\n"
         "\n"
@@ -1137,6 +1373,10 @@ def ensure_x11_helper_script() -> pathlib.Path:
         "        start_client\n"
         f"        printf '{X11_CLIENT_TOKEN}\\n'\n"
         "        ;;\n"
+        "    input)\n"
+        "        start_input_probe\n"
+        f"        printf '{X11_INPUT_TOKEN}\\n'\n"
+        "        ;;\n"
         "    start|demo)\n"
         "        stop_all\n"
         "        start_server\n"
@@ -1147,7 +1387,7 @@ def ensure_x11_helper_script() -> pathlib.Path:
         "        stop_all\n"
         "        ;;\n"
         "    *)\n"
-        "        echo \"usage: $0 [install|server|client|start|stop]\" >&2\n"
+        "        echo \"usage: $0 [install|server|client|input|start|stop]\" >&2\n"
         "        exit 1\n"
         "        ;;\n"
         "esac\n"
@@ -1180,6 +1420,57 @@ def debugfs_write(img: pathlib.Path, local: pathlib.Path, guest: str) -> None:
     debugfs_run(img, f"write {local} {guest}", check=True)
 
 
+def debugfs_exists(img: pathlib.Path, guest: str) -> bool:
+    completed = subprocess.run(
+        ["debugfs", "-R", f"stat {guest}", str(img)],
+        capture_output=True,
+        text=True,
+    )
+    output = (completed.stdout or "") + (completed.stderr or "")
+    return completed.returncode == 0 and "File not found" not in output
+
+
+def materialize_tar_into_image(img: pathlib.Path, tar_path: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="starry-img-mnt-") as mount_dir:
+        mount_path = pathlib.Path(mount_dir)
+        proc = subprocess.Popen(
+            ["fuse2fs", "-o", "fakeroot", str(img), str(mount_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"fuse2fs exited early while mounting {img}")
+                try:
+                    if any(mount_path.iterdir()):
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            else:
+                raise RuntimeError(f"timed out mounting {img} with fuse2fs")
+
+            apk_log = mount_path / "var" / "log" / "apk.log"
+            if apk_log.is_dir():
+                shutil.rmtree(apk_log, ignore_errors=True)
+            elif apk_log.exists():
+                apk_log.unlink()
+            subprocess.run(
+                ["tar", "-xf", str(tar_path), "-C", str(mount_path)],
+                check=True,
+                cwd=REPO_ROOT,
+            )
+        finally:
+            subprocess.run(["fusermount3", "-u", str(mount_path)], check=False)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+
 def ensure_guest_helpers(demo: Demo, arch: str, img: pathlib.Path) -> None:
     if demo.name not in {"cow", "filemap", "shm", "fb", "ev", "gui", "snake", "x11", "pty", "jobctl", "waitctl", "ssh-poll", "ssh-select", "sshd"}:
         return
@@ -1201,10 +1492,12 @@ def ensure_guest_helpers(demo: Demo, arch: str, img: pathlib.Path) -> None:
     if demo.name == "x11":
         fb_helper = compile_helper(FBDRAW_HELPER_SOURCE, "fbdraw", arch)
         ev_helper = compile_helper(EVWATCH_HELPER_SOURCE, "evwatch", arch)
+        xcalc_helper = compile_x11_helper(XCALC_HELPER_SOURCE, "xcalc-lab", arch)
         debugfs_write(img, fb_helper, FBDRAW_HELPER_GUEST)
         debugfs_write(img, ev_helper, EVWATCH_HELPER_GUEST)
+        debugfs_write(img, xcalc_helper, XCALC_HELPER_GUEST)
         debugfs_mkdir(img, "/usr/share/starry-lab")
-        debugfs_write(img, ensure_x11_stage_tar(arch), X11_STAGE_TAR_GUEST)
+        debugfs_write(img, get_x11_stage_tar(arch), X11_STAGE_TAR_GUEST)
         debugfs_write(img, ensure_x11_helper_script(), X11_HELPER_GUEST)
     if demo.name == "gui":
         helper = compile_helper(MINIGUI_HELPER_SOURCE, "minigui", arch)
@@ -1287,22 +1580,34 @@ def spawn_qemu(
 
 
 def prepare_x11_base(arch: str, boot_timeout: float, command_timeout: float) -> pathlib.Path:
+    def image_seeded(img: pathlib.Path) -> bool:
+        required = (
+            X11_HELPER_GUEST,
+            XCALC_HELPER_GUEST,
+            X11_STAGE_TAR_GUEST,
+        )
+        return all(debugfs_exists(img, path) for path in required)
+
     base_img = ensure_working_disk(arch)
     X11_STAGE_DIR.mkdir(parents=True, exist_ok=True)
     prepared_img = X11_STAGE_DIR / f"x11-base-{arch}.img"
+    stage_tar = get_x11_stage_tar(arch)
     newest_input = max(
         base_img.stat().st_mtime,
-        ensure_x11_stage_tar(arch).stat().st_mtime,
+        stage_tar.stat().st_mtime,
         ensure_x11_helper_script().stat().st_mtime,
         FBDRAW_HELPER_SOURCE.stat().st_mtime,
         EVWATCH_HELPER_SOURCE.stat().st_mtime,
+        XCALC_HELPER_SOURCE.stat().st_mtime,
         pathlib.Path(__file__).stat().st_mtime,
     )
-    if prepared_img.exists() and prepared_img.stat().st_mtime >= newest_input:
+    if prepared_img.exists() and prepared_img.stat().st_mtime >= newest_input and image_seeded(prepared_img):
         return prepared_img
 
     shutil.copyfile(base_img, prepared_img)
     ensure_guest_helpers(DEMOS["x11"], arch, prepared_img)
+    if not image_seeded(prepared_img):
+        raise RuntimeError(f"failed to prepare X11 helper image {prepared_img}")
     return prepared_img
 
 
@@ -2768,6 +3073,9 @@ def select_x11_phase_views(phase_name: str, views: list[EventView]) -> list[Even
     elif phase_name == "phase-3-x11":
         keep_labels = {"PollSleep", "PollWake", "WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
         focus_syscalls = {"socket", "connect", "openat", "read", "write", "close"}
+    elif phase_name == "phase-4-xinput":
+        keep_labels = {"WaitReap", "TaskExit", "SignalSend", "SignalHandle"}
+        focus_syscalls = ()
     else:
         return views
 
@@ -2875,6 +3183,23 @@ def build_x11_phase_walkthrough(
             lines.append("client/server interaction stayed visible through poll wakeups while the X connection became active.")
         if X11_CLIENT_TOKEN in transcript:
             lines.append("the guest printed `x11-lab`, so `xcalc` stayed alive long enough to prove the GUI client path succeeded.")
+        lines.extend(notes)
+        return tuple(lines)
+
+    if phase_name == "phase-4-xinput":
+        lines = [
+            "this phase keeps the X server and the visible `xcalc` window alive, clears the client's input log, then injects deterministic mouse movement and a click so the final step proves that host mouse input reaches a real mapped X client while the lab helper bridges `/dev/input/mice` into visible window-local motion and clicks.",
+        ]
+        if any(view.label == "InputOpen" for view in key_views):
+            lines.append("the live graphical stack reopened or kept using input nodes while the mapped client window stayed on screen.")
+        if any(view.label == "InputPollWake" for view in key_views):
+            rendered = ", ".join(view.detail for view in key_views if view.label == "InputPollWake")
+            lines.append(f"mouse readiness then surfaced as {rendered}.")
+        if any(view.label == "InputRead" for view in key_views):
+            rendered = ", ".join(view.detail for view in key_views if view.label == "InputRead")
+            lines.append(f"the X input stack drained actual evdev records through {rendered}.")
+        if X11_INPUT_TOKEN in transcript:
+            lines.append("the guest printed `x11-input-lab`, so the visible `xcalc` client stayed alive while the runner injected mouse movement and clicks.")
         lines.extend(notes)
         return tuple(lines)
 
@@ -3161,6 +3486,10 @@ def digest_lines(lines: list[str]) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+def digest_file(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
 def compare_lines(reference: list[str], current: list[str]) -> tuple[bool, str]:
     shared = min(len(reference), len(current))
     for index in range(shared):
@@ -3364,12 +3693,12 @@ def inject_x11_input_sequence() -> str:
     qmp_send_input_batches(
         (
             (
-                {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
-                {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
-            ),
-            (
                 {"type": "rel", "data": {"axis": "x", "value": 9}},
                 {"type": "rel", "data": {"axis": "y", "value": -5}},
+            ),
+            (
+                {"type": "rel", "data": {"axis": "x", "value": -6}},
+                {"type": "rel", "data": {"axis": "y", "value": 11}},
             ),
             (
                 {"type": "btn", "data": {"down": True, "button": "left"}},
@@ -3379,7 +3708,7 @@ def inject_x11_input_sequence() -> str:
             ),
         )
     )
-    return "the runner injected keyboard `A`, mouse move `(9,-5)`, and a left-button click while the X server trace window was still open."
+    return "the runner injected two mouse moves `(9,-5)` then `(-6,11)` and one left-button click while the visible `xcalc` client was logging input."
 
 
 def start_input_peer() -> PeerController:
@@ -3805,6 +4134,20 @@ def x11_server_start_command() -> str:
 
 def x11_client_command() -> str:
     return f"{X11_HELPER_GUEST} client"
+
+
+def x11_input_command() -> str:
+    return f"{X11_HELPER_GUEST} input"
+
+
+def x11_input_capture_command() -> str:
+    return (
+        "sh -c '"
+        "sleep 1; "
+        f"offset=$(cat {X11_INPUT_OFFSET_GUEST} 2>/dev/null || echo 0); "
+        f"dd if={X11_INPUT_LOG_GUEST} bs=1 skip=$offset 2>/dev/null || true; "
+        f"rm -f {X11_INPUT_PID_GUEST} {X11_INPUT_OFFSET_GUEST}'"
+    )
 
 
 def x11_wait_server_ready_command() -> str:
@@ -4253,8 +4596,9 @@ def build_walkthrough(
             fb_phase = phase_map.get("phase-1-fb")
             input_phase = phase_map.get("phase-2-input")
             x11_phase = phase_map.get("phase-3-x11")
+            xinput_phase = phase_map.get("phase-4-xinput")
             lines = [
-                "the X11-lite demo is split into three focused phases so the graphics stack stays teachable end to end: raw framebuffer first, raw evdev second, and the first real X client last.",
+                "the X11-lite demo is split into focused phases so the graphics stack stays teachable end to end: raw framebuffer first, raw evdev second, the first real X client third, and X-side mouse delivery last.",
             ]
             if fb_phase is not None:
                 lines.append("phase 1 isolated raw framebuffer bring-up on `/dev/fb0` before X11 entered the picture.")
@@ -4268,10 +4612,17 @@ def build_walkthrough(
                 screenshot = x11_phase.out_dir / "screen.ppm"
                 if screenshot.exists():
                     lines.append(f"the runner also captured one framebuffer screenshot at `{screenshot}` as proof that the X client actually drew on screen.")
+            if xinput_phase is not None:
+                lines.append("phase 4 kept the graphical session alive and proved that mouse motion/button events reached a real X client.")
+                lines.extend(f"(phase 4) {line}" for line in xinput_phase.walkthrough[:4])
             transcript = artifact_outputs.get("demo-step-1.txt", "")
             if X11_CLIENT_TOKEN in transcript:
                 lines.append(
                     "the combined transcript printed `x11-lab`, so the X server stayed up and the first GUI client remained alive long enough to draw."
+                )
+            if X11_INPUT_TOKEN in transcript:
+                lines.append(
+                    "the combined transcript also printed `x11-input-lab`, so the follow-up X-side probe stayed alive while injected mouse events reached the visible X client."
                 )
             lines.extend(peer_notes)
             return lines
@@ -4751,9 +5102,6 @@ def execute_run(
         elif demo.name == "x11":
             phase_results_list: list[PhaseResult] = []
             x11_peer_notes: list[str] = []
-            install_command = x11_install_command()
-            input_stream.append(install_command)
-            session.run_command(install_command, max(command_timeout, 600.0))
             try:
                 phase_reset = "echo 1 > /proc/starry/reset"
                 phase_off = "echo 1 > /proc/starry/off"
@@ -4830,10 +5178,16 @@ def execute_run(
                 x11_peer_notes.extend(f"phase-2-input: {note}" for note in phase2_notes)
 
                 # Phase 3: bring X up after the raw layers are already proven, then isolate the first client.
+                install_command = x11_install_command()
+                input_stream.append(f"{install_command} [phase-3-x11 prep]")
+                session.run_command(install_command, max(command_timeout, 120.0))
                 input_stream.append(f"{server_start} [phase-3-x11 prep]")
                 session.run_command(server_start, max(command_timeout, 60.0))
                 input_stream.append(f"{wait_ready} [phase-3-x11 prep]")
                 session.run_command(wait_ready, max(command_timeout, 60.0))
+                server_screenshot_path = out_dir / "phase-3-x11" / "server.ppm"
+                server_screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+                qmp_screendump(server_screenshot_path)
                 input_stream.append(f"{phase_reset} [phase-3-x11]")
                 session.run_command(phase_reset, command_timeout)
                 client_command = x11_client_command()
@@ -4842,10 +5196,20 @@ def execute_run(
                     session.run_command(client_command, max(command_timeout, 60.0)),
                     client_command,
                 )
+                if X11_CLIENT_TOKEN not in phase3_transcript:
+                    raise RuntimeError("x11 client helper did not report a mapped `xcalc` window")
                 screenshot_path = out_dir / "phase-3-x11" / "screen.ppm"
                 screenshot_path.parent.mkdir(parents=True, exist_ok=True)
                 qmp_screendump(screenshot_path)
-                phase3_notes = (f"the runner captured one QMP screendump at `{screenshot_path}` after the client window appeared.",)
+                server_hash = digest_file(server_screenshot_path)
+                client_hash = digest_file(screenshot_path)
+                if client_hash == server_hash:
+                    raise RuntimeError(
+                        "x11 client did not change the framebuffer; `xcalc` was still not visibly mapped"
+                    )
+                phase3_notes = (
+                    f"the runner captured `{server_screenshot_path}` before launching the client and `{screenshot_path}` after it started; the framebuffer hash changed from `{server_hash}` to `{client_hash}`, so the X client really drew on screen.",
+                )
                 x11_peer_notes.append(f"phase-3-x11: {phase3_notes[0]}")
                 input_stream.append(f"{phase_off} [phase-3-x11]")
                 session.run_command(phase_off, command_timeout)
@@ -4865,7 +5229,49 @@ def execute_run(
                         raw,
                     )
                 )
-                input_stream.append(f"{cleanup_command} [phase-3-x11]")
+
+                # Phase 4: keep X alive and prove mouse input reaches a real X client.
+                input_probe_command = x11_input_command()
+                input_stream.append(f"{input_probe_command} [phase-4-xinput prep]")
+                phase4_probe_transcript = clean_capture(
+                    session.run_command(input_probe_command, max(command_timeout, 30.0)),
+                    input_probe_command,
+                )
+                if X11_INPUT_TOKEN not in phase4_probe_transcript:
+                    raise RuntimeError("x11 input helper did not report a live visible-client probe")
+                input_stream.append(f"{phase_reset} [phase-4-xinput]")
+                session.run_command(phase_reset, command_timeout)
+                phase4_note = inject_x11_input_sequence()
+                input_stream.append("HOST:QMP inject deterministic X mouse input [phase-4-xinput]")
+                capture_command = x11_input_capture_command()
+                input_stream.append(f"{capture_command} [phase-4-xinput]")
+                phase4_transcript = clean_capture(
+                    session.run_command(capture_command, max(command_timeout, 30.0)),
+                    capture_command,
+                )
+                if "MotionNotify" not in phase4_transcript or "ButtonPress" not in phase4_transcript:
+                    raise RuntimeError("x11 input probe did not observe mouse motion/button events inside the visible xcalc window")
+                phase4_notes = (phase4_note,)
+                x11_peer_notes.append(f"phase-4-xinput: {phase4_notes[0]}")
+                input_stream.append(f"{phase_off} [phase-4-xinput]")
+                session.run_command(phase_off, command_timeout)
+                phase4_outputs = collect_trace_artifacts(session, command_timeout)
+                phase4_events = parse_trace(phase4_outputs["starry_trace.txt"])
+                phase_results_list.append(
+                    render_x11_phase_artifacts(
+                        out_dir / "phase-4-xinput",
+                        "phase-4-xinput",
+                        "Mouse delivery inside X11",
+                        phase4_events,
+                        phase4_outputs["starry_stats.txt"],
+                        phase4_outputs["starry_last_fault.txt"],
+                        ("HOST:QMP inject deterministic X mouse input", capture_command),
+                        phase4_transcript,
+                        phase4_notes,
+                        raw,
+                    )
+                )
+                input_stream.append(f"{cleanup_command} [phase-4-xinput]")
                 session.run_command(cleanup_command, command_timeout)
             except Exception as exc:
                 apk_log = clean_capture(
@@ -4888,7 +5294,11 @@ def execute_run(
                 session.run_command(cleanup_command, command_timeout)
             phase_results = tuple(phase_results_list)
             peer_notes = tuple(x11_peer_notes)
-            cleaned_output = f"{X11_CLIENT_TOKEN}\n"
+            cleaned_output = "\n".join(
+                token
+                for token in (phase3_transcript, phase4_transcript)
+                if token.strip()
+            )
             step_path = out_dir / "demo-step-1.txt"
             write_text(step_path, cleaned_output)
             demo_outputs.append((step_path, cleaned_output))
@@ -5156,6 +5566,7 @@ def execute_run(
                 ("lab_x11_apk.log", X11_APK_LOG_GUEST),
                 ("lab_x11.log", X11_SERVER_LOG_GUEST),
                 ("lab_xcalc.log", X11_CLIENT_LOG_GUEST),
+                ("lab_xev.log", X11_INPUT_LOG_GUEST),
             ):
                 command = f"cat {guest_path} 2>/dev/null || true"
                 output = session.run_command(command, command_timeout)
