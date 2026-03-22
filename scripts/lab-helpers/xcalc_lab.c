@@ -480,7 +480,11 @@ int main(int argc, char **argv) {
     }
 
     XMapWindow(app.display, app.window);
+    XRaiseWindow(app.display, app.window);
+    XSetInputFocus(app.display, app.window, RevertToParent, CurrentTime);
     XFlush(app.display);
+    XSync(app.display, False);
+    redraw(&app);
 
     while (running) {
         XEvent event;
