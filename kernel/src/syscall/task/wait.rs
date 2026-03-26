@@ -13,7 +13,7 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::AsThread;
+use crate::task::{AsThread, get_process_data};
 
 bitflags! {
     #[derive(Debug)]
@@ -90,6 +90,36 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
     }
 
     let check_children = || {
+        // Check for stopped children (WUNTRACED).
+        if options.contains(WaitOptions::WUNTRACED) {
+            for child in children.iter() {
+                if let Ok(data) = get_process_data(child.pid()) {
+                    if data.is_stopped() && data.take_stop_unreported() {
+                        let status = ((data.stop_signal() as i32) << 8) | 0x7f;
+                        if let Some(exit_code) = exit_code.nullable() {
+                            exit_code.vm_write(status)?;
+                        }
+                        return Ok(Some(child.pid() as _));
+                    }
+                }
+            }
+        }
+
+        // Check for continued children (WCONTINUED).
+        if options.contains(WaitOptions::WCONTINUED) {
+            for child in children.iter() {
+                if let Ok(data) = get_process_data(child.pid()) {
+                    if data.take_continued() {
+                        if let Some(exit_code) = exit_code.nullable() {
+                            exit_code.vm_write(0xffffi32)?;
+                        }
+                        return Ok(Some(child.pid() as _));
+                    }
+                }
+            }
+        }
+
+        // Check for exited (zombie) children.
         if let Some(child) = children.iter().find(|child| child.is_zombie()) {
             if !options.contains(WaitOptions::WNOWAIT) {
                 child.free();

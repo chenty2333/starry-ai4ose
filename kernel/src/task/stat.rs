@@ -76,10 +76,14 @@ impl TaskStat {
         let pid = proc.pid();
         let comm = task.name();
         let comm = comm[..comm.len().min(16)].to_owned();
-        let state = match task.state() {
-            TaskState::Running | TaskState::Ready => 'R',
-            TaskState::Blocked => 'S',
-            TaskState::Exited => 'Z',
+        let state = if proc_data.is_stopped() {
+            'T'
+        } else {
+            match task.state() {
+                TaskState::Running | TaskState::Ready => 'R',
+                TaskState::Blocked => 'S',
+                TaskState::Exited => 'Z',
+            }
         };
         let ppid = proc.parent().map_or(0, |p| p.pid());
         let pgrp = proc.group().pgid();

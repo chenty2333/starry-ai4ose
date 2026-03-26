@@ -1,12 +1,19 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    future::poll_fn,
+    sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
+};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
-use axtask::{TaskInner, current};
+use axtask::{
+    TaskInner, current,
+    future::block_on,
+};
 use starry_process::Pid;
-use starry_signal::{SignalInfo, SignalOSAction, SignalSet};
+use starry_signal::{SignalInfo, SignalOSAction, SignalSet, Signo};
 
-use super::{AsThread, Thread, do_exit, get_process_data, get_process_group, get_task};
+use super::{AsThread, ProcessData, Thread, do_exit, get_process_data, get_process_group, get_task};
 
 pub fn check_signals(
     thr: &Thread,
@@ -23,15 +30,16 @@ pub fn check_signals(
             do_exit(signo as i32, true);
         }
         SignalOSAction::CoreDump => {
-            // TODO: implement core dump
-            do_exit(128 + signo as i32, true);
+            if let Err(e) = super::coredump::generate_core_dump(thr, uctx, signo as u8) {
+                warn!("Core dump failed: {e:?}");
+            }
+            do_exit((signo as i32) | 0x80, true);
         }
         SignalOSAction::Stop => {
-            // TODO: implement stop
-            do_exit(1, true);
+            do_stop(thr, signo as u8);
         }
         SignalOSAction::Continue => {
-            // TODO: implement continue
+            do_continue(&thr.proc_data);
         }
         SignalOSAction::Handler => {
             // do nothing
@@ -93,6 +101,12 @@ pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()>
 
     if let Some(sig) = sig {
         let signo = sig.signo();
+
+        // POSIX: SIGCONT always resumes a stopped process, regardless of disposition.
+        if signo == Signo::SIGCONT {
+            do_continue(&proc_data);
+        }
+
         info!("Send signal {signo:?} to process {pid}");
         if let Some(tid) = proc_data.signal.send_signal(sig)
             && let Ok(task) = get_task(tid)
@@ -135,4 +149,78 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
     }
 
     Ok(())
+}
+
+/// Stops the current process (all threads) due to a stop signal.
+fn do_stop(thr: &Thread, signo: u8) {
+    let proc_data = &thr.proc_data;
+
+    // Ignore if already stopped.
+    if proc_data.is_stopped() {
+        return;
+    }
+
+    info!("Stopping process {} by signal {}", proc_data.proc.pid(), signo);
+    proc_data.set_stopped(signo);
+
+    // Notify parent process.
+    notify_parent_stop_continue(proc_data);
+
+    // Interrupt all sibling threads so they notice the stopped flag.
+    let curr_tid = current().id().as_u64() as Pid;
+    for tid in proc_data.proc.threads() {
+        if tid != curr_tid {
+            if let Ok(task) = get_task(tid) {
+                task.interrupt();
+            }
+        }
+    }
+
+    // Block this thread until the process is continued.
+    wait_if_stopped(proc_data);
+}
+
+/// Continues a stopped process.
+fn do_continue(proc_data: &ProcessData) {
+    if proc_data.is_stopped() {
+        info!("Continuing process {}", proc_data.proc.pid());
+        proc_data.set_continued();
+        notify_parent_stop_continue(proc_data);
+    }
+}
+
+/// Blocks the current thread while the process is in the stopped state.
+///
+/// Called from `check_signals` (the thread that received the stop signal)
+/// and from the user task main loop (sibling threads).
+pub fn wait_if_stopped(proc_data: &ProcessData) {
+    while proc_data.is_stopped() {
+        block_on(poll_fn(|cx| {
+            if !proc_data.is_stopped() {
+                Poll::Ready(())
+            } else {
+                proc_data.stop_event.register(cx.waker());
+                // Re-check after registration to avoid missed wake-ups.
+                if !proc_data.is_stopped() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }));
+    }
+}
+
+/// Sends SIGCHLD to the parent and wakes its child_exit_event.
+fn notify_parent_stop_continue(proc_data: &ProcessData) {
+    let process = &proc_data.proc;
+    if let Some(parent) = process.parent() {
+        let _ = send_signal_to_process(
+            parent.pid(),
+            Some(SignalInfo::new_kernel(Signo::SIGCHLD)),
+        );
+        if let Ok(parent_data) = get_process_data(parent.pid()) {
+            parent_data.child_exit_event.wake();
+        }
+    }
 }

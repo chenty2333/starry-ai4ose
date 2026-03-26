@@ -7,12 +7,13 @@ mod signal;
 mod stat;
 mod timer;
 mod user;
+pub(crate) mod coredump;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use axpoll::PollSet;
@@ -218,6 +219,17 @@ pub struct ProcessData {
 
     /// The default mask for file permissions.
     umask: AtomicU32,
+
+    /// Whether the process is stopped (by SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU).
+    stopped: AtomicBool,
+    /// The signal number that caused the stop (for waitpid status encoding).
+    stop_signal: AtomicU8,
+    /// Whether the process has been continued since last wait (consumed by WCONTINUED).
+    continued: AtomicBool,
+    /// Whether the current stop has been reported to waitpid (avoids duplicate reports).
+    stop_reported: AtomicBool,
+    /// Woken when threads should resume from stopped state.
+    pub stop_event: Arc<PollSet>,
 }
 
 impl ProcessData {
@@ -252,6 +264,12 @@ impl ProcessData {
             futex_table: Arc::new(FutexTable::new()),
 
             umask: AtomicU32::new(0o022),
+
+            stopped: AtomicBool::new(false),
+            stop_signal: AtomicU8::new(0),
+            continued: AtomicBool::new(false),
+            stop_reported: AtomicBool::new(false),
+            stop_event: Arc::default(),
         })
     }
 
@@ -284,5 +302,40 @@ impl ProcessData {
     /// Set the umask and return the old value.
     pub fn replace_umask(&self, umask: u32) -> u32 {
         self.umask.swap(umask, Ordering::SeqCst)
+    }
+
+    /// Returns whether the process is currently stopped.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Marks the process as stopped by the given signal.
+    pub fn set_stopped(&self, signo: u8) {
+        self.stop_signal.store(signo, Ordering::Relaxed);
+        self.stop_reported.store(false, Ordering::Relaxed);
+        self.continued.store(false, Ordering::Relaxed);
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Resumes the process from stopped state.
+    pub fn set_continued(&self) {
+        self.stopped.store(false, Ordering::Release);
+        self.continued.store(true, Ordering::Release);
+        self.stop_event.wake();
+    }
+
+    /// Returns the signal number that caused the stop.
+    pub fn stop_signal(&self) -> u8 {
+        self.stop_signal.load(Ordering::Relaxed)
+    }
+
+    /// Atomically takes the continued flag (returns true at most once per continuation).
+    pub fn take_continued(&self) -> bool {
+        self.continued.swap(false, Ordering::AcqRel)
+    }
+
+    /// Atomically takes the stop-unreported flag (returns true at most once per stop).
+    pub fn take_stop_unreported(&self) -> bool {
+        !self.stop_reported.swap(true, Ordering::AcqRel)
     }
 }

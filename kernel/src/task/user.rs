@@ -6,6 +6,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
     AsThread, TimerState, check_signals, raise_signal_fatal, set_timer_state, unblock_next_signal,
+    wait_if_stopped,
 };
 use crate::syscall::handle_syscall;
 
@@ -68,6 +69,9 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 if !unblock_next_signal() {
                     while check_signals(thr, &mut uctx, None) {}
                 }
+
+                // Block if the process has been stopped (by this or another thread).
+                wait_if_stopped(&thr.proc_data);
 
                 set_timer_state(&curr, TimerState::User);
                 curr.clear_interrupt();
