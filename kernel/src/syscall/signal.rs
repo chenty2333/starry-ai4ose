@@ -16,7 +16,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, block_next_signal, check_signals, processes, send_signal_to_process,
+        AsThread, check_signals, processes, send_signal_to_process,
         send_signal_to_process_group, send_signal_to_thread,
     },
     time::TimeValueLike,
@@ -205,8 +205,9 @@ pub fn sys_rt_tgsigqueueinfo(
 }
 
 pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
-    block_next_signal();
-    current().as_thread().signal.restore(uctx);
+    let curr = current();
+    curr.as_thread().block_next_signal_check();
+    curr.as_thread().signal.restore(uctx);
     Ok(uctx.retval() as isize)
 }
 

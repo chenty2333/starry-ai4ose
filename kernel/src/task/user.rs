@@ -5,7 +5,7 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, TimerState, check_signals, raise_signal_fatal, set_timer_state, unblock_next_signal,
+    AsThread, TimerState, check_signals, raise_signal_fatal, set_timer_state,
     wait_if_stopped,
 };
 use crate::syscall::handle_syscall;
@@ -66,7 +66,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                     }
                 }
 
-                if !unblock_next_signal() {
+                if !thr.take_block_next_signal_check() {
                     while check_signals(thr, &mut uctx, None) {}
                 }
 
