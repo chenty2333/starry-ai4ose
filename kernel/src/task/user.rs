@@ -1,4 +1,4 @@
-use axhal::uspace::{ExceptionKind, ReturnReason, UserContext};
+use axhal::uspace::{ExceptionInfo, ExceptionKind, ReturnReason, UserContext};
 use axtask::TaskInner;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
@@ -9,6 +9,32 @@ use super::{
     wait_if_stopped,
 };
 use crate::syscall::handle_syscall;
+
+/// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
+/// arch-specific exception information.
+#[allow(unused_variables)]
+fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x86_64 exception vectors that map to specific signals:
+        match exc_info.vector {
+            // Division error, Overflow, x87 FP, SIMD FP → SIGFPE
+            0x00 | 0x04 | 0x10 | 0x13 => return Signo::SIGFPE,
+            // Debug → SIGTRAP
+            0x01 => return Signo::SIGTRAP,
+            // Segment not present, Stack fault, Alignment check → SIGBUS
+            0x0B | 0x0C | 0x11 => return Signo::SIGBUS,
+            // Bound range exceeded, General protection, Double fault → SIGSEGV
+            0x05 | 0x08 | 0x0D => return Signo::SIGSEGV,
+            _ => {}
+        }
+    }
+
+    // Default: unknown exceptions are most likely access violations.
+    // SIGSEGV is the safest default (SIGTRAP would incorrectly suggest a
+    // debugger event).
+    Signo::SIGSEGV
+}
 
 /// Create a new user task.
 pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) -> TaskInner {
@@ -43,7 +69,6 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                     ReturnReason::Interrupt => {}
                     #[allow(unused_labels)]
                     ReturnReason::Exception(exc_info) => 'exc: {
-                        // TODO: detailed handling
                         let signo = match exc_info.kind() {
                             ExceptionKind::Misaligned => {
                                 #[cfg(target_arch = "loongarch64")]
@@ -54,10 +79,10 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                             }
                             ExceptionKind::Breakpoint => Signo::SIGTRAP,
                             ExceptionKind::IllegalInstruction => Signo::SIGILL,
-                            _ => Signo::SIGTRAP,
+                            ExceptionKind::Other => map_other_exception(&exc_info),
                         };
                         raise_signal_fatal(SignalInfo::new_kernel(signo))
-                            .expect("Failed to send SIGTRAP");
+                            .expect("Failed to send signal");
                     }
                     r => {
                         warn!("Unexpected return reason: {r:?}");
