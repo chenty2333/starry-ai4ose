@@ -307,6 +307,13 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
 
 pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
     debug!("flock <= fd: {fd}, operation: {operation}");
-    // TODO: flock
+
+    let file = get_file_like(fd)?;
+    let stat = file.stat()?;
+
+    // Get the process PID for lock ownership.
+    let pid = current().as_thread().proc_data.proc.pid();
+
+    crate::file::flock::do_flock((stat.dev, stat.ino), pid, operation)?;
     Ok(0)
 }
