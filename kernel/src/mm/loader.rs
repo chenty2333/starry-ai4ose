@@ -310,12 +310,19 @@ pub fn load_user_app(
 
     let ustack_top = VirtAddr::from_usize(crate::config::USER_STACK_TOP);
     let ustack_size = crate::config::USER_STACK_SIZE;
-    let ustack_start = ustack_top - ustack_size;
-    debug!("Mapping user stack: {ustack_start:#x?} -> {ustack_top:#x?}");
+    // Reserve one page at the bottom as an unmapped guard region.
+    // Accessing it triggers a page fault → SIGSEGV, catching stack overflow.
+    let guard_size = PAGE_SIZE_4K;
+    let ustack_start = ustack_top - ustack_size + guard_size;
+    let ustack_mapped_size = ustack_size - guard_size;
+    debug!(
+        "Mapping user stack: {ustack_start:#x?} -> {ustack_top:#x?} (guard page at {:#x?})",
+        ustack_top - ustack_size
+    );
 
     uspace.map(
         ustack_start,
-        ustack_size,
+        ustack_mapped_size,
         MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
         false,
         Backend::new_alloc(ustack_start, PageSize::Size4K),

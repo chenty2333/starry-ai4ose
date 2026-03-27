@@ -116,16 +116,28 @@ impl CloneArgs {
             return Err(AxError::InvalidInput);
         }
 
-        let namespace_flags = CloneFlags::NEWNS
-            | CloneFlags::NEWIPC
+        let unsupported_ns_flags = CloneFlags::NEWIPC
             | CloneFlags::NEWNET
             | CloneFlags::NEWPID
             | CloneFlags::NEWUSER
             | CloneFlags::NEWUTS
             | CloneFlags::NEWCGROUP;
 
-        if flags.intersects(namespace_flags) {
-            warn!("sys_clone/sys_clone3: namespace flags detected, stub support only");
+        if flags.intersects(unsupported_ns_flags) {
+            warn!("sys_clone/sys_clone3: unsupported namespace flags: {:?}",
+                  *flags & unsupported_ns_flags);
+            return Err(AxError::OperationNotSupported);
+        }
+
+        if flags.contains(CloneFlags::INTO_CGROUP) {
+            warn!("sys_clone3: CLONE_INTO_CGROUP not supported");
+            return Err(AxError::OperationNotSupported);
+        }
+
+        // CLONE_NEWNS (mount namespace) is accepted but currently a no-op
+        // (child shares the parent's mount namespace).
+        if flags.contains(CloneFlags::NEWNS) {
+            warn!("sys_clone: CLONE_NEWNS accepted but not isolated (shared mount namespace)");
         }
 
         Ok(())

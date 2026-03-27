@@ -5,13 +5,15 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::current;
+use starry_process::Pid;
+use starry_signal::{SignalInfo, Signo};
 use starry_vm::vm_load_until_nul;
 
 use crate::{
     config::USER_HEAP_BASE,
     file::FD_TABLE,
     mm::{load_user_app, vm_load_string},
-    task::AsThread,
+    task::{AsThread, send_signal_to_thread},
 };
 
 pub fn sys_execve(
@@ -48,9 +50,17 @@ pub fn sys_execve(
     let proc_data = &curr.as_thread().proc_data;
 
     if proc_data.proc.threads().len() > 1 {
-        // TODO: handle multi-thread case
-        error!("sys_execve: multi-thread not supported");
-        return Err(AxError::WouldBlock);
+        // Linux de-threads on execve: kill all sibling threads first.
+        let curr_tid = curr.id().as_u64() as Pid;
+        proc_data.proc.group_exit();
+        let sig = SignalInfo::new_kernel(Signo::SIGKILL);
+        for tid in proc_data.proc.threads() {
+            if tid != curr_tid {
+                let _ = send_signal_to_thread(None, tid, Some(sig.clone()));
+            }
+        }
+        // Yield to give siblings time to exit.
+        axtask::yield_now();
     }
 
     let mut aspace = proc_data.aspace.lock();
