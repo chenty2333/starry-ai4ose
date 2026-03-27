@@ -22,8 +22,18 @@ use starry_vm::{VmError, VmIo, VmResult, vm_load_until_nul, vm_read_slice, vm_wr
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    task::AsThread,
+    task::{AsThread, Thread},
 };
+
+/// RAII guard that resets the `accessing_user_memory` flag on drop, ensuring
+/// cleanup even if the closure panics.
+struct UserMemoryAccessGuard<'a>(&'a Thread);
+
+impl Drop for UserMemoryAccessGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set_accessing_user_memory(false);
+    }
+}
 
 /// Enables scoped access into user memory, allowing page faults to occur inside
 /// kernel.
@@ -34,9 +44,8 @@ pub fn access_user_memory<R>(f: impl FnOnce() -> R) -> R {
     };
 
     thr.set_accessing_user_memory(true);
-    let result = f();
-    thr.set_accessing_user_memory(false);
-    result
+    let _guard = UserMemoryAccessGuard(thr);
+    f()
 }
 
 fn check_region(start: VirtAddr, layout: Layout, access_flags: MappingFlags) -> AxResult<()> {
