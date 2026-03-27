@@ -4,6 +4,7 @@ use alloc::{borrow::ToOwned, collections::binary_heap::BinaryHeap, sync::Arc};
 use core::{mem, time::Duration};
 
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos, wall_time};
+use axpoll::PollSet;
 use axtask::{
     WeakAxTaskRef, current,
     future::{block_on, timeout_at},
@@ -22,9 +23,17 @@ fn time_value_from_nanos(nanos: usize) -> TimeValue {
     TimeValue::new(secs, nsecs as u32)
 }
 
+/// The action to take when an alarm fires.
+enum AlarmAction {
+    /// Interrupt a task and poll its itimers.
+    PollTask(WeakAxTaskRef),
+    /// Wake a PollSet (used by timerfd).
+    WakePollSet(Arc<PollSet>),
+}
+
 struct Entry {
     deadline: Duration,
-    task: WeakAxTaskRef,
+    action: AlarmAction,
 }
 impl PartialEq for Entry {
     fn eq(&self, other: &Self) -> bool {
@@ -109,7 +118,7 @@ impl ITimer {
             let should_wake = guard.peek().is_none_or(|it| it.deadline > deadline);
             guard.push(Entry {
                 deadline,
-                task: Arc::downgrade(&current()),
+                action: AlarmAction::PollTask(Arc::downgrade(&current())),
             });
             drop(guard);
             if should_wake {
@@ -242,14 +251,28 @@ async fn alarm_task() {
         let now = wall_time();
         if entry.deadline <= now {
             let entry_deadline = entry.deadline;
-            if let Some(task) = entry.task.upgrade() {
-                drop(guard);
-                poll_timer(&task);
-            } else {
-                drop(guard);
+            match &entry.action {
+                AlarmAction::PollTask(weak_task) => {
+                    if let Some(task) = weak_task.upgrade() {
+                        drop(guard);
+                        poll_timer(&task);
+                    } else {
+                        drop(guard);
+                    }
+                }
+                AlarmAction::WakePollSet(poll_set) => {
+                    let poll_set = poll_set.clone();
+                    drop(guard);
+                    poll_set.wake();
+                }
             }
             let mut guard = ALARM_LIST.lock();
-            assert!(guard.pop().is_some_and(|it| it.deadline == entry_deadline));
+            // Pop the entry we just processed (it's still at the top).
+            if let Some(top) = guard.peek() {
+                if top.deadline == entry_deadline {
+                    guard.pop();
+                }
+            }
         } else {
             let deadline = entry.deadline;
             drop(guard);
@@ -274,4 +297,19 @@ pub fn spawn_alarm_task() {
         "alarm_task".to_owned(),
         axconfig::TASK_STACK_SIZE,
     );
+}
+
+/// Registers a one-shot alarm that wakes the given [`PollSet`] at the specified
+/// wall-clock deadline. Used by timerfd to get notified when the timer expires.
+pub fn register_pollset_alarm(deadline: Duration, poll_set: Arc<PollSet>) {
+    let mut guard = ALARM_LIST.lock();
+    let should_wake = guard.peek().is_none_or(|it| it.deadline > deadline);
+    guard.push(Entry {
+        deadline,
+        action: AlarmAction::WakePollSet(poll_set),
+    });
+    drop(guard);
+    if should_wake {
+        EVENT_NEW_TIMER.notify(1);
+    }
 }
