@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, string::ToString, sync::Arc};
+use alloc::{borrow::Cow, string::ToString};
 use core::{
     ffi::c_int,
     hint::likely,
@@ -14,7 +14,7 @@ use axsync::Mutex;
 use axtask::future::{block_on, poll_io};
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 
-use super::{FileLike, Kstat, get_file_like};
+use super::{FileHandle, FileLike, Kstat, get_file_like, get_typed_file};
 use crate::file::{IoDst, IoSrc};
 
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
@@ -29,7 +29,7 @@ pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -
 
 pub enum ResolveAtResult {
     File(Location),
-    Other(Arc<dyn FileLike>),
+    Other(FileHandle<dyn FileLike>),
 }
 
 impl ResolveAtResult {
@@ -168,17 +168,22 @@ impl FileLike for File {
         path_for(self.inner.location())
     }
 
-    fn from_fd(fd: c_int) -> AxResult<Arc<Self>>
+    fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>>
     where
         Self: Sized + 'static,
     {
-        get_file_like(fd)?.downcast_arc().map_err(|any| {
-            if any.is::<Directory>() {
-                AxError::IsADirectory
-            } else {
-                AxError::BrokenPipe
+        match get_typed_file(fd) {
+            Ok(file) => Ok(file),
+            Err(AxError::InvalidInput) => {
+                let file = get_file_like(fd)?;
+                if file.downcast_ref::<Directory>().is_some() {
+                    Err(AxError::IsADirectory)
+                } else {
+                    Err(AxError::BrokenPipe)
+                }
             }
-        })
+            Err(err) => Err(err),
+        }
     }
 }
 impl Pollable for File {
@@ -228,10 +233,8 @@ impl FileLike for Directory {
         path_for(&self.inner)
     }
 
-    fn from_fd(fd: c_int) -> AxResult<Arc<Self>> {
-        get_file_like(fd)?
-            .downcast_arc()
-            .map_err(|_| AxError::NotADirectory)
+    fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>> {
+        get_typed_file(fd).map_err(|_| AxError::NotADirectory)
     }
 }
 impl Pollable for Directory {

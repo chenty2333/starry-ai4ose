@@ -150,6 +150,7 @@ impl SimpleDirOps for ThreadFdDir {
             .read()
             .get(fd as _)
             .ok_or(VfsError::NotFound)?
+            .description
             .inner
             .path()
             .into_owned();

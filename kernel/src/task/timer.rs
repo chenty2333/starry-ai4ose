@@ -249,6 +249,10 @@ impl TimeManager {
 
 async fn alarm_task() {
     loop {
+        // Register before inspecting the queues so a newly inserted earlier
+        // deadline cannot race past us and get delayed until a stale timeout.
+        listener!(EVENT_NEW_TIMER => listener);
+
         let mut progressed = false;
         progressed |= process_due(AlarmClock::Realtime);
         progressed |= process_due(AlarmClock::Monotonic);
@@ -265,12 +269,10 @@ async fn alarm_task() {
             (None, Some(mt)) => Some(mt),
             (Some(rt), Some(mt)) => Some(rt.min(mt)),
         }) else {
-            listener!(EVENT_NEW_TIMER => listener);
             listener.await;
             continue;
         };
 
-        listener!(EVENT_NEW_TIMER => listener);
         let deadline = wall_time().checked_add(next_due);
         let _ = timeout_at(deadline, listener).await;
     }

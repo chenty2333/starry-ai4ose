@@ -2,15 +2,15 @@ mod epoll;
 mod poll;
 mod select;
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 use core::task::Context;
 
 use axpoll::{IoEvents, Pollable};
 
 pub use self::{epoll::*, poll::*, select::*};
-use crate::file::FileLike;
+use crate::file::{FileHandle, FileLike};
 
-struct FdPollSet(pub Vec<(Arc<dyn FileLike>, IoEvents)>);
+struct FdPollSet(pub Vec<(FileHandle<dyn FileLike>, IoEvents)>);
 impl Pollable for FdPollSet {
     fn poll(&self) -> IoEvents {
         unreachable!()

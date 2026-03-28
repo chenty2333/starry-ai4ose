@@ -10,7 +10,7 @@ use linux_raw_sys::net::{
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{FileLike, Socket, add_file_like},
+    file::{FileLike, Socket, add_file_description},
     mm::{IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut},
     syscall::net::{CMsg, CMsgBuilder},
 };
@@ -127,7 +127,7 @@ fn recv_impl(
                 CMsg::Rights { fds } => builder.push(SOL_SOCKET, SCM_RIGHTS, |data| {
                     let mut written = 0;
                     for (f, chunk) in fds.into_iter().zip(data.chunks_exact_mut(size_of::<i32>())) {
-                        let fd = add_file_like(f, false)?;
+                        let fd = add_file_description(f, false)?;
                         chunk.copy_from_slice(&fd.to_ne_bytes());
                         written += size_of::<i32>();
                     }

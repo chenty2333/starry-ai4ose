@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, sync::Arc, vec};
+use alloc::{borrow::Cow, vec};
 use core::{
     ffi::{c_char, c_int},
     task::Context,
@@ -14,7 +14,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
 use crate::{
-    file::{File, FileLike, Pipe, get_file_like},
+    file::{File, FileHandle, FileLike, Pipe, get_file_like},
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
 };
 
@@ -222,8 +222,8 @@ pub fn sys_pwritev2(
 }
 
 enum SendFile {
-    Direct(Arc<dyn FileLike>),
-    Offset(Arc<File>, *mut u64),
+    Direct(FileHandle<dyn FileLike>),
+    Offset(FileHandle<File>, *mut u64),
 }
 
 impl SendFile {

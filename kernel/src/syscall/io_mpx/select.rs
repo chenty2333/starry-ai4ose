@@ -13,7 +13,7 @@ use starry_signal::SignalSet;
 
 use super::FdPollSet;
 use crate::{
-    file::FD_TABLE,
+    file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
     task::with_blocked_signals,
@@ -74,17 +74,12 @@ fn do_select(
          {except_set:?}] timeout: {timeout:?}"
     );
 
-    let fd_table = FD_TABLE.read();
     let fd_bitmap = read_set.0 | write_set.0 | except_set.0;
     let fd_count = fd_bitmap.len();
     let mut fds = Vec::with_capacity(fd_count);
     let mut fd_indices = Vec::with_capacity(fd_count);
     for fd in fd_bitmap.into_iter() {
-        let f = fd_table
-            .get(fd)
-            .ok_or(AxError::BadFileDescriptor)?
-            .inner
-            .clone();
+        let f = get_file_like(fd as i32)?;
         let mut events = IoEvents::empty();
         events.set(IoEvents::IN, read_set.0.get(fd));
         events.set(IoEvents::OUT, write_set.0.get(fd));
@@ -95,7 +90,6 @@ fn do_select(
         }
     }
 
-    drop(fd_table);
     let fds = FdPollSet(fds);
 
     if let Some(readfds) = readfds.as_deref_mut() {

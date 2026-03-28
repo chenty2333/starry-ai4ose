@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, format, sync::Arc};
+use alloc::{borrow::Cow, format};
 use core::{ffi::c_int, ops::Deref, task::Context};
 
 use axerrno::{AxError, AxResult};
@@ -9,8 +9,8 @@ use axnet::{
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::S_IFSOCK;
 
-use super::{FileLike, Kstat};
-use crate::file::{IoDst, IoSrc, get_file_like};
+use super::{FileHandle, FileLike, Kstat};
+use crate::file::{IoDst, IoSrc, get_typed_file};
 
 pub struct Socket(pub SocketInner);
 
@@ -56,13 +56,11 @@ impl FileLike for Socket {
         format!("socket:[{}]", self as *const _ as usize).into()
     }
 
-    fn from_fd(fd: c_int) -> AxResult<Arc<Self>>
+    fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>>
     where
         Self: Sized + 'static,
     {
-        get_file_like(fd)?
-            .downcast_arc()
-            .map_err(|_| AxError::NotASocket)
+        get_typed_file(fd).map_err(|_| AxError::NotASocket)
     }
 }
 impl Pollable for Socket {

@@ -4,12 +4,12 @@ use axerrno::{AxError, AxResult};
 use linux_raw_sys::net::{SCM_RIGHTS, SOL_SOCKET, cmsghdr};
 
 use crate::{
-    file::{FileLike, get_file_like},
+    file::{FileDescription, get_file_description},
     mm::{UserConstPtr, UserPtr},
 };
 
 pub enum CMsg {
-    Rights { fds: Vec<Arc<dyn FileLike>> },
+    Rights { fds: Vec<Arc<FileDescription>> },
 }
 impl CMsg {
     pub fn parse(hdr: &cmsghdr) -> AxResult<Self> {
@@ -31,7 +31,7 @@ impl CMsg {
                     if fd < 0 {
                         return Err(AxError::BadFileDescriptor);
                     }
-                    let f = get_file_like(fd)?;
+                    let f = get_file_description(fd)?;
                     fds.push(f);
                 }
                 Self::Rights { fds }

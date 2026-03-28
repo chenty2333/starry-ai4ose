@@ -14,8 +14,8 @@ use linux_raw_sys::general::*;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, get_file_like,
-        with_fs,
+        Directory, FD_TABLE, File, FileLike, Pipe, add_file_description, add_file_like,
+        close_file_like, get_file_description, get_file_like, with_fs,
     },
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
@@ -187,8 +187,8 @@ pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
 }
 
 fn dup_fd(old_fd: c_int, cloexec: bool) -> AxResult<isize> {
-    let f = get_file_like(old_fd)?;
-    let new_fd = add_file_like(f, cloexec)?;
+    let description = get_file_description(old_fd)?;
+    let new_fd = add_file_description(description, cloexec)?;
     Ok(new_fd as _)
 }
 
@@ -308,12 +308,9 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
 pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
     debug!("flock <= fd: {fd}, operation: {operation}");
 
-    let file = get_file_like(fd)?;
-    let stat = file.stat()?;
+    let description = get_file_description(fd)?;
+    let stat = description.inner.stat()?;
 
-    // Get the process PID for lock ownership.
-    let pid = current().as_thread().proc_data.proc.pid();
-
-    crate::file::flock::do_flock((stat.dev, stat.ino), pid, operation)?;
+    crate::file::flock::do_flock((stat.dev, stat.ino), description.flock_owner(), operation)?;
     Ok(0)
 }

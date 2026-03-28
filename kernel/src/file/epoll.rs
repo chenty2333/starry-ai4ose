@@ -25,7 +25,7 @@ use hashbrown::HashMap;
 use kspin::SpinNoPreempt;
 use linux_raw_sys::general::{EPOLLET, EPOLLONESHOT, epoll_event};
 
-use crate::file::{FileLike, get_file_like};
+use crate::file::{FileDescription, FileLike, get_file_description};
 
 pub struct EpollEvent {
     pub events: IoEvents,
@@ -103,11 +103,11 @@ enum ConsumeResult {
 #[derive(Clone)]
 struct EntryKey {
     fd: i32,
-    file: Weak<dyn FileLike>,
+    file: Weak<FileDescription>,
 }
 impl EntryKey {
     fn new(fd: i32) -> AxResult<Self> {
-        let file = get_file_like(fd)?;
+        let file = get_file_description(fd)?;
         Ok(Self {
             fd,
             file: Arc::downgrade(&file),
@@ -115,7 +115,7 @@ impl EntryKey {
     }
 
     #[inline]
-    fn get_file(&self) -> Option<Arc<dyn FileLike>> {
+    fn get_file(&self) -> Option<Arc<FileDescription>> {
         self.file.upgrade()
     }
 }

@@ -3,7 +3,7 @@ use bitflags::bitflags;
 use starry_signal::SignalInfo;
 
 use crate::{
-    file::{FD_TABLE, FileLike, PidFd, add_file_like},
+    file::{FD_TABLE, FileLike, PidFd, add_file_description},
     syscall::signal::make_queue_signal_info,
     task::{AsThread, get_process_data, get_visible_task, send_signal_to_process},
 };
@@ -44,7 +44,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
         .get(target_fd as usize)
         .ok_or(AxError::BadFileDescriptor)
         .and_then(|fd| {
-            let fd = add_file_like(fd.inner.clone(), true)?;
+            let fd = add_file_description(fd.description.clone(), true)?;
             Ok(fd as isize)
         })
 }
