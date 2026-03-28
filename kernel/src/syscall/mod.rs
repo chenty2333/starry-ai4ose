@@ -9,6 +9,8 @@ mod sync;
 mod sys;
 mod task;
 mod time;
+#[cfg(feature = "bpf")]
+mod bpf;
 
 use axerrno::{AxError, LinuxError};
 use axhal::uspace::UserContext;
@@ -625,13 +627,16 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         ),
         Sysno::timerfd_gettime => sys_timerfd_gettime(uctx.arg0() as _, uctx.arg1() as _),
 
+        // bpf
+        #[cfg(feature = "bpf")]
+        Sysno::bpf => bpf::sys_bpf(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+
         // dummy fds
         Sysno::fanotify_init
         | Sysno::inotify_init1
         | Sysno::userfaultfd
         | Sysno::perf_event_open
         | Sysno::io_uring_setup
-        | Sysno::bpf
         | Sysno::fsopen
         | Sysno::fspick
         | Sysno::open_tree

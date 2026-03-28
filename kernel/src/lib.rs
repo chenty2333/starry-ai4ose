@@ -15,6 +15,9 @@ extern crate axlog;
 
 pub mod entry;
 
+#[cfg(feature = "bpf")]
+pub mod bpf;
+
 mod config;
 mod file;
 mod mm;

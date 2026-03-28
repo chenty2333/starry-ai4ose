@@ -7,6 +7,8 @@ mod pidfd;
 mod pipe;
 pub mod signalfd;
 pub mod timerfd;
+#[cfg(feature = "bpf")]
+pub mod bpf;
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::{ffi::c_int, time::Duration};
