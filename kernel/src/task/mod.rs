@@ -13,7 +13,7 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 use axpoll::PollSet;
@@ -204,6 +204,32 @@ impl AsThread for TaskInner {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StopState {
+    Running  = 0,
+    Stopping = 1,
+    Stopped  = 2,
+}
+
+impl From<u8> for StopState {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Running,
+            1 => Self::Stopping,
+            2 => Self::Stopped,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ContinueResult {
+    None,
+    CanceledStopping,
+    ResumedStopped,
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -239,8 +265,8 @@ pub struct ProcessData {
     /// The default mask for file permissions.
     umask: AtomicU32,
 
-    /// Whether the process is stopped (by SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU).
-    stopped: AtomicBool,
+    /// Job-control stop state shared by all threads in the process.
+    stop_state: AtomicU8,
     /// The signal number that caused the stop (for waitpid status encoding).
     stop_signal: AtomicU8,
     /// Whether the process has been continued since last wait (consumed by WCONTINUED).
@@ -284,7 +310,7 @@ impl ProcessData {
 
             umask: AtomicU32::new(0o022),
 
-            stopped: AtomicBool::new(false),
+            stop_state: AtomicU8::new(StopState::Running as u8),
             stop_signal: AtomicU8::new(0),
             continued: AtomicBool::new(false),
             stop_reported: AtomicBool::new(false),
@@ -323,24 +349,95 @@ impl ProcessData {
         self.umask.swap(umask, Ordering::SeqCst)
     }
 
+    fn stop_state(&self) -> StopState {
+        self.stop_state.load(Ordering::Acquire).into()
+    }
+
     /// Returns whether the process is currently stopped.
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.stop_state() == StopState::Stopped
     }
 
-    /// Marks the process as stopped by the given signal.
-    pub fn set_stopped(&self, signo: u8) {
+    /// Returns whether threads should park for a job-control stop.
+    pub fn should_wait_for_stop(&self) -> bool {
+        self.stop_state() != StopState::Running
+    }
+
+    /// Begins a job-control stop transition.
+    pub fn begin_stop(&self, signo: u8) -> bool {
+        if self
+            .stop_state
+            .compare_exchange(
+                StopState::Running as u8,
+                StopState::Stopping as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
         self.stop_signal.store(signo, Ordering::Relaxed);
-        self.stop_reported.store(false, Ordering::Relaxed);
-        self.continued.store(false, Ordering::Relaxed);
-        self.stopped.store(true, Ordering::Release);
+        true
     }
 
-    /// Resumes the process from stopped state.
-    pub fn set_continued(&self) {
-        self.stopped.store(false, Ordering::Release);
-        self.continued.store(true, Ordering::Release);
-        self.stop_event.wake();
+    /// Finalizes a stop transition if it has not been canceled by SIGCONT.
+    pub fn finish_stop(&self) -> bool {
+        if self
+            .stop_state
+            .compare_exchange(
+                StopState::Stopping as u8,
+                StopState::Stopped as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.stop_reported.store(false, Ordering::Release);
+        self.continued.store(false, Ordering::Release);
+        true
+    }
+
+    /// Resumes or cancels a job-control stop transition.
+    pub(crate) fn continue_job(&self) -> ContinueResult {
+        loop {
+            match self.stop_state() {
+                StopState::Running => return ContinueResult::None,
+                StopState::Stopping => {
+                    if self
+                        .stop_state
+                        .compare_exchange(
+                            StopState::Stopping as u8,
+                            StopState::Running as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.stop_event.wake();
+                        return ContinueResult::CanceledStopping;
+                    }
+                }
+                StopState::Stopped => {
+                    if self
+                        .stop_state
+                        .compare_exchange(
+                            StopState::Stopped as u8,
+                            StopState::Running as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.continued.store(true, Ordering::Release);
+                        self.stop_event.wake();
+                        return ContinueResult::ResumedStopped;
+                    }
+                }
+            }
+        }
     }
 
     /// Returns the signal number that caused the stop.

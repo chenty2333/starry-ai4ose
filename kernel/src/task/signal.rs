@@ -1,18 +1,18 @@
-use core::{
-    future::poll_fn,
-    task::Poll,
-};
+use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axtask::{
     TaskInner, current,
-    future::block_on,
+    future::{block_on, interruptible},
 };
 use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalOSAction, SignalSet, Signo};
 
-use super::{AsThread, ProcessData, Thread, do_exit, get_process_data, get_process_group, get_task};
+use super::{
+    AsThread, ContinueResult, ProcessData, Thread, do_exit, get_process_data, get_process_group,
+    get_task,
+};
 
 pub fn check_signals(
     thr: &Thread,
@@ -35,7 +35,7 @@ pub fn check_signals(
             do_exit((signo as i32) | 0x80, true);
         }
         SignalOSAction::Stop => {
-            do_stop(thr, signo as u8);
+            do_stop(thr, uctx, signo as u8);
         }
         SignalOSAction::Continue => {
             do_continue(&thr.proc_data);
@@ -141,19 +141,19 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
 }
 
 /// Stops the current process (all threads) due to a stop signal.
-fn do_stop(thr: &Thread, signo: u8) {
+fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
     let proc_data = &thr.proc_data;
 
-    // Ignore if already stopped.
-    if proc_data.is_stopped() {
+    // Ignore duplicate stop requests while a stop is already in progress.
+    if !proc_data.begin_stop(signo) {
         return;
     }
 
-    info!("Stopping process {} by signal {}", proc_data.proc.pid(), signo);
-    proc_data.set_stopped(signo);
-
-    // Notify parent process.
-    notify_parent_stop_continue(proc_data);
+    info!(
+        "Stopping process {} by signal {}",
+        proc_data.proc.pid(),
+        signo
+    );
 
     // Interrupt all sibling threads so they notice the stopped flag.
     let curr_tid = current().id().as_u64() as Pid;
@@ -165,16 +165,28 @@ fn do_stop(thr: &Thread, signo: u8) {
         }
     }
 
+    if proc_data.finish_stop() {
+        notify_parent_stop_continue(proc_data);
+    }
+
     // Block this thread until the process is continued.
-    wait_if_stopped(proc_data);
+    wait_if_stopped(thr, uctx);
 }
 
 /// Continues a stopped process.
 fn do_continue(proc_data: &ProcessData) {
-    if proc_data.is_stopped() {
-        info!("Continuing process {}", proc_data.proc.pid());
-        proc_data.set_continued();
-        notify_parent_stop_continue(proc_data);
+    match proc_data.continue_job() {
+        ContinueResult::None => {}
+        ContinueResult::CanceledStopping => {
+            info!(
+                "Canceling in-flight stop for process {}",
+                proc_data.proc.pid()
+            );
+        }
+        ContinueResult::ResumedStopped => {
+            info!("Continuing process {}", proc_data.proc.pid());
+            notify_parent_stop_continue(proc_data);
+        }
     }
 }
 
@@ -182,21 +194,25 @@ fn do_continue(proc_data: &ProcessData) {
 ///
 /// Called from `check_signals` (the thread that received the stop signal)
 /// and from the user task main loop (sibling threads).
-pub fn wait_if_stopped(proc_data: &ProcessData) {
-    while proc_data.is_stopped() {
-        block_on(poll_fn(|cx| {
-            if !proc_data.is_stopped() {
+pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
+    let proc_data = &thr.proc_data;
+    while !thr.pending_exit() && proc_data.should_wait_for_stop() {
+        match block_on(interruptible(poll_fn(|cx| {
+            if !proc_data.should_wait_for_stop() || thr.pending_exit() {
                 Poll::Ready(())
             } else {
                 proc_data.stop_event.register(cx.waker());
                 // Re-check after registration to avoid missed wake-ups.
-                if !proc_data.is_stopped() {
+                if !proc_data.should_wait_for_stop() || thr.pending_exit() {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
                 }
             }
-        }));
+        }))) {
+            Ok(()) => {}
+            Err(_) => while check_signals(thr, uctx, None) {},
+        }
     }
 }
 
@@ -204,10 +220,7 @@ pub fn wait_if_stopped(proc_data: &ProcessData) {
 fn notify_parent_stop_continue(proc_data: &ProcessData) {
     let process = &proc_data.proc;
     if let Some(parent) = process.parent() {
-        let _ = send_signal_to_process(
-            parent.pid(),
-            Some(SignalInfo::new_kernel(Signo::SIGCHLD)),
-        );
+        let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(Signo::SIGCHLD)));
         if let Ok(parent_data) = get_process_data(parent.pid()) {
             parent_data.child_exit_event.wake();
         }
