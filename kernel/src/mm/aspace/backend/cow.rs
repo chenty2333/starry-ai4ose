@@ -9,7 +9,7 @@ use axhal::{
 };
 use axsync::Mutex;
 use kspin::SpinNoIrq;
-use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
     AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, pages_in,
@@ -81,6 +81,7 @@ pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
     file: Option<(FileBackend, u64, Option<u64>)>,
+    map_id: Arc<()>,
 }
 
 impl CowBackend {
@@ -154,6 +155,85 @@ impl CowBackend {
             }
         }
 
+        Ok(())
+    }
+
+    fn clone_for_range_with_id(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        map_id: Arc<()>,
+    ) -> Self {
+        let delta = old_start.sub_addr(self.start);
+        Self {
+            start: new_start.sub(delta),
+            size: self.size,
+            file: self.file.clone(),
+            map_id,
+        }
+    }
+
+    pub(crate) fn clone_for_range(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {
+        self.clone_for_range_with_id(old_start, new_start, self.map_id.clone())
+    }
+
+    pub(crate) fn duplicate_mapping(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {
+        self.clone_for_range_with_id(old_start, new_start, Arc::new(()))
+    }
+
+    pub(crate) fn compatible_with(&self, other: &Self) -> bool {
+        if !Arc::ptr_eq(&self.map_id, &other.map_id) {
+            return false;
+        }
+        if self.size != other.size {
+            return false;
+        }
+        if self.start != other.start {
+            return false;
+        }
+        match (&self.file, &other.file) {
+            (None, None) => true,
+            (Some((lhs_backend, lhs_start, lhs_end)), Some((rhs_backend, rhs_start, rhs_end))) =>
+                lhs_start == rhs_start
+                    && lhs_end == rhs_end
+                    && match (lhs_backend, rhs_backend) {
+                        (FileBackend::Cached(lhs), FileBackend::Cached(rhs)) => lhs.ptr_eq(rhs),
+                        (FileBackend::Direct(lhs), FileBackend::Direct(rhs)) => lhs.ptr_eq(rhs),
+                        _ => false,
+                    },
+            _ => false,
+        }
+    }
+
+    pub(crate) fn clone_materialized_pages(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        size: usize,
+        pt: &mut PageTableCursor,
+    ) -> AxResult {
+        let old_range = VirtAddrRange::from_start_size(old_start, size);
+        let new_pages = pages_in(VirtAddrRange::from_start_size(new_start, size), self.size)?;
+        for (old_addr, new_addr) in pages_in(old_range, self.size)?.zip(new_pages) {
+            match pt.query(old_addr) {
+                Ok((paddr, flags, page_size)) => {
+                    assert_eq!(page_size, self.size);
+                    let frame = FRAME_TABLE
+                        .lock()
+                        .get_frame_ref(paddr)
+                        .ok_or(AxError::BadAddress)?;
+                    let mut frame = frame.lock();
+                    if frame.0 == u8::MAX {
+                        return Err(AxError::BadAddress);
+                    }
+                    frame.0 += 1;
+                    drop(frame);
+                    pt.map(new_addr, paddr, self.size, flags)?;
+                }
+                Err(PagingError::NotMapped) => {}
+                Err(_) => return Err(AxError::BadAddress),
+            }
+        }
         Ok(())
     }
 }
@@ -278,6 +358,7 @@ impl Backend {
             start,
             size,
             file: Some((file, file_start, file_end)),
+            map_id: Arc::new(()),
         })
     }
 
@@ -286,6 +367,7 @@ impl Backend {
             start,
             size,
             file: None,
+            map_id: Arc::new(()),
         })
     }
 }

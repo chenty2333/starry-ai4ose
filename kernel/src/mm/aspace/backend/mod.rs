@@ -1,6 +1,5 @@
 //! Memory mapping backends.
 use alloc::{boxed::Box, sync::Arc};
-
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
 use axhal::{
@@ -152,5 +151,83 @@ impl MappingBackend for Backend {
             return false;
         }
         cursor.protect_region(start, size, new_flags).is_ok()
+    }
+}
+
+impl Backend {
+    pub fn is_shareable(&self) -> bool {
+        matches!(self, Backend::Linear(_) | Backend::Shared(_) | Backend::File(_))
+    }
+
+    pub fn ensure_range_covered(&self, start: VirtAddr, size: usize) -> AxResult {
+        match self {
+            Backend::Linear(backend) => backend.ensure_range_covered(start, size),
+            Backend::Cow(_) | Backend::File(_) => Ok(()),
+            Backend::Shared(backend) => backend.ensure_range_covered(start, size),
+        }
+    }
+
+    pub fn relocate(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Self> {
+        match self {
+            Backend::Linear(backend) => backend.relocate(old_start, new_start),
+            Backend::Cow(backend) => Ok(Backend::Cow(backend.clone_for_range(old_start, new_start))),
+            Backend::Shared(backend) => {
+                Ok(Backend::Shared(backend.clone_for_range(old_start, new_start)))
+            }
+            Backend::File(backend) => {
+                Ok(Backend::File(backend.clone_for_range(old_start, new_start, aspace)))
+            }
+        }
+    }
+
+    pub fn duplicate_mapping(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Self> {
+        match self {
+            Backend::Linear(backend) => backend.duplicate_mapping(old_start, new_start),
+            Backend::Cow(backend) => {
+                Ok(Backend::Cow(backend.duplicate_mapping(old_start, new_start)))
+            }
+            Backend::Shared(backend) => {
+                Ok(Backend::Shared(backend.duplicate_mapping(old_start, new_start)))
+            }
+            Backend::File(backend) => Ok(Backend::File(
+                backend.duplicate_mapping(old_start, new_start, aspace),
+            )),
+        }
+    }
+
+    pub fn migrate_present_pages(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        size: usize,
+        pt: &mut PageTableCursor,
+    ) -> AxResult {
+        match self {
+            Backend::Linear(_) | Backend::Shared(_) => Ok(()),
+            Backend::Cow(backend) => backend.clone_materialized_pages(old_start, new_start, size, pt),
+            Backend::File(backend) => {
+                backend.clone_materialized_pages(old_start, new_start, size, pt)
+            }
+        }
+    }
+
+    pub fn compatible_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Backend::Linear(lhs), Backend::Linear(rhs)) => lhs.compatible_with(rhs),
+            (Backend::Cow(lhs), Backend::Cow(rhs)) => lhs.compatible_with(rhs),
+            (Backend::Shared(lhs), Backend::Shared(rhs)) => lhs.compatible_with(rhs),
+            (Backend::File(lhs), Backend::File(rhs)) => lhs.compatible_with(rhs),
+            _ => false,
+        }
     }
 }

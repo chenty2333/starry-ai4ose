@@ -9,7 +9,7 @@ use axerrno::{AxError, AxResult};
 use axfs::{CachedFile, FileFlags};
 use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
-use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use super::{AddrSpace, Backend, BackendOps, PopulateCallback, pages_in};
 
@@ -20,6 +20,7 @@ pub struct FileBackendInner {
     flags: FileFlags,
     offset_page: u32,
     handle: AtomicUsize,
+    map_id: Arc<()>,
     futex_handle: Arc<()>,
 }
 impl Drop for FileBackendInner {
@@ -103,6 +104,76 @@ impl FileBackend {
 
     pub fn futex_handle(&self) -> Weak<()> {
         Arc::downgrade(&self.0.futex_handle)
+    }
+
+    pub(crate) fn compatible_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0.map_id, &other.0.map_id)
+            && self.0.start == other.0.start
+            && self.0.offset_page == other.0.offset_page
+            && self.0.flags.bits() == other.0.flags.bits()
+            && self.0.cache.ptr_eq(&other.0.cache)
+    }
+
+    fn clone_for_range_with_id(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        aspace: &Arc<Mutex<AddrSpace>>,
+        map_id: Arc<()>,
+    ) -> Self {
+        let delta = old_start.sub_addr(self.0.start);
+        let start = new_start.sub(delta);
+        let inner = Arc::new(FileBackendInner {
+            start,
+            cache: self.0.cache.clone(),
+            flags: self.0.flags,
+            offset_page: self.0.offset_page,
+            handle: AtomicUsize::new(0),
+            map_id,
+            futex_handle: self.0.futex_handle.clone(),
+        });
+        inner.register_listener(aspace);
+        Self(inner)
+    }
+
+    pub(crate) fn clone_for_range(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> Self {
+        self.clone_for_range_with_id(old_start, new_start, aspace, self.0.map_id.clone())
+    }
+
+    pub(crate) fn duplicate_mapping(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> Self {
+        self.clone_for_range_with_id(old_start, new_start, aspace, Arc::new(()))
+    }
+
+    pub(crate) fn clone_materialized_pages(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        size: usize,
+        pt: &mut PageTableCursor,
+    ) -> AxResult {
+        let old_range = VirtAddrRange::from_start_size(old_start, size);
+        let new_pages = pages_in(VirtAddrRange::from_start_size(new_start, size), PageSize::Size4K)?;
+        for (old_addr, new_addr) in pages_in(old_range, PageSize::Size4K)?.zip(new_pages) {
+            match pt.query(old_addr) {
+                Ok((paddr, flags, page_size)) => {
+                    assert_eq!(page_size, PageSize::Size4K);
+                    pt.map(new_addr, paddr, PageSize::Size4K, flags)?;
+                }
+                Err(PagingError::NotMapped) => {}
+                Err(_) => return Err(AxError::BadAddress),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -223,6 +294,7 @@ impl BackendOps for FileBackend {
             flags: self.0.flags,
             offset_page: self.0.offset_page,
             handle: AtomicUsize::new(0),
+            map_id: self.0.map_id.clone(),
             futex_handle: self.0.futex_handle.clone(),
         });
         inner.register_listener(new_aspace);
@@ -245,6 +317,7 @@ impl Backend {
             flags,
             offset_page,
             handle: AtomicUsize::new(0),
+            map_id: Arc::new(()),
             futex_handle: Arc::new(()),
         });
         inner.register_listener(aspace);

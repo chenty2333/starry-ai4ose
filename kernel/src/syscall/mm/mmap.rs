@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 use axfs::FileBackend;
@@ -6,11 +6,9 @@ use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange, align_up_4k};
-use starry_vm::{vm_load, vm_write_slice};
-
 use crate::{
     file::{File, FileLike},
-    mm::{Backend, SharedPages},
+    mm::{AddrSpace, Backend, BackendOps, SharedPages},
     pseudofs::{Device, DeviceMmap},
     task::AsThread,
 };
@@ -32,6 +30,109 @@ bitflags::bitflags! {
         /// Extend change to start of growsup vma (mprotect only).
         const GROWSUP = PROT_GROWSUP;
     }
+}
+
+#[derive(Clone)]
+struct RemapSegment {
+    start: VirtAddr,
+    size: usize,
+    flags: MappingFlags,
+    backend: Backend,
+}
+
+fn collect_remap_segments(
+    aspace: &AddrSpace,
+    start: VirtAddr,
+    size: usize,
+) -> AxResult<Vec<RemapSegment>> {
+    let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+    let mut cursor = start;
+    let mut segments: Vec<RemapSegment> = Vec::new();
+
+    while cursor < end {
+        let area = aspace.find_area(cursor).ok_or(AxError::BadAddress)?;
+        if area.start() > cursor {
+            return Err(AxError::BadAddress);
+        }
+
+        let page_size = area.backend().page_size();
+        if !cursor.is_aligned(page_size) {
+            return Err(AxError::InvalidInput);
+        }
+
+        let seg_end = area.end().min(end);
+        let seg_size = seg_end.sub_addr(cursor);
+        if !page_size.is_aligned(seg_size) {
+            return Err(AxError::InvalidInput);
+        }
+
+        if let Some(first) = segments.first()
+            && (area.flags() != first.flags || !area.backend().compatible_with(&first.backend))
+        {
+            return Err(AxError::BadAddress);
+        }
+
+        segments.push(RemapSegment {
+            start: cursor,
+            size: seg_size,
+            flags: area.flags(),
+            backend: area.backend().clone(),
+        });
+        cursor = seg_end;
+    }
+
+    Ok(segments)
+}
+
+fn prefix_segments(segments: &[RemapSegment], size: usize) -> Vec<RemapSegment> {
+    let mut remaining = size;
+    let mut prefix = Vec::new();
+
+    for seg in segments {
+        if remaining == 0 {
+            break;
+        }
+        let take = seg.size.min(remaining);
+        prefix.push(RemapSegment {
+            start: seg.start,
+            size: take,
+            flags: seg.flags,
+            backend: seg.backend.clone(),
+        });
+        remaining -= take;
+    }
+
+    prefix
+}
+
+fn range_is_free(aspace: &AddrSpace, start: VirtAddr, size: usize, align: usize) -> bool {
+    let Some(limit) = VirtAddrRange::try_from_start_size(start, size) else {
+        return false;
+    };
+    aspace.find_free_area(start, size, limit, align) == Some(start)
+}
+
+fn map_relocated_segments(
+    aspace: &mut AddrSpace,
+    aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
+    old_start: VirtAddr,
+    new_start: VirtAddr,
+    segments: &[RemapSegment],
+    preserve_mapping_identity: bool,
+) -> AxResult {
+    for seg in segments {
+        let seg_start = new_start + seg.start.sub_addr(old_start);
+        let relocated = if preserve_mapping_identity {
+            seg.backend.relocate(seg.start, seg_start, aspace_handle)?
+        } else {
+            seg.backend
+                .duplicate_mapping(seg.start, seg_start, aspace_handle)?
+        };
+        aspace.map(seg_start, seg.size, seg.flags, false, relocated)?;
+        seg.backend
+            .migrate_present_pages(seg.start, seg_start, seg.size, &mut aspace.page_table_mut().cursor())?;
+    }
+    Ok(())
 }
 
 impl From<MmapProt> for MappingFlags {
@@ -212,10 +313,9 @@ pub fn sys_mmap(
                                 if range.is_empty() {
                                     return Err(AxError::InvalidInput);
                                 }
-                                length = length.min(range.size().align_down(page_size));
-                                Backend::new_linear(
-                                    start.as_usize() as isize - range.start.as_usize() as isize,
-                                )
+                                let max_size = range.size().align_down(page_size);
+                                length = length.min(max_size);
+                                Backend::new_linear(start, range.start, max_size)
                             }
                             DeviceMmap::Cache(cache) => Backend::new_file(
                                 start,
@@ -291,7 +391,12 @@ pub fn sys_mremap(
          {flags:#x}, new_addr: {new_addr:#x}"
     );
 
+    const SUPPORTED_FLAGS: u32 = MREMAP_MAYMOVE | MREMAP_FIXED;
+
     if !addr.is_multiple_of(PageSize::Size4K as usize) || new_size == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & !SUPPORTED_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -306,31 +411,98 @@ pub fn sys_mremap(
     let addr = VirtAddr::from(addr);
     let old_size = align_up_4k(old_size);
     let new_size = align_up_4k(new_size);
+    let curr = current();
+    let aspace_handle = curr.as_thread().proc_data.aspace.clone();
+    let mut aspace = aspace_handle.lock();
 
-    // Shrink: just unmap the tail.
-    if new_size <= old_size {
-        if new_size < old_size {
-            sys_munmap((addr + new_size).as_usize(), old_size - new_size)?;
+    if old_size == 0 {
+        if !may_move {
+            return Err(AxError::InvalidInput);
         }
+
+        let segments = collect_remap_segments(&aspace, addr, new_size)?;
+        if !segments.iter().all(|seg| seg.backend.is_shareable()) {
+            return Err(AxError::InvalidInput);
+        }
+
+        let page_size = segments[0].backend.page_size();
+        let dst = if fixed {
+            let dst = VirtAddr::from(new_addr);
+            if !dst.is_aligned(page_size) {
+                return Err(AxError::InvalidInput);
+            }
+            if dst == addr {
+                return Err(AxError::BadAddress);
+            }
+            if !aspace.contains_range(dst, new_size) {
+                return Err(AxError::NoMemory);
+            }
+            aspace.unmap(dst, new_size)?;
+            dst
+        } else {
+            aspace
+                .find_free_area(
+                    addr,
+                    new_size,
+                    VirtAddrRange::new(aspace.base(), aspace.end()),
+                    page_size as usize,
+                )
+                .or(aspace.find_free_area(
+                    aspace.base(),
+                    new_size,
+                    VirtAddrRange::new(aspace.base(), aspace.end()),
+                    page_size as usize,
+                ))
+                .ok_or(AxError::NoMemory)?
+        };
+
+        if let Err(err) = map_relocated_segments(
+            &mut aspace,
+            &aspace_handle,
+            addr,
+            dst,
+            &segments,
+            false,
+        )
+        {
+            let _ = aspace.unmap(dst, new_size);
+            return Err(err);
+        }
+        return Ok(dst.as_usize() as isize);
+    }
+
+    let segments = collect_remap_segments(&aspace, addr, old_size)?;
+    let page_size = segments[0].backend.page_size();
+    if !page_size.is_aligned(old_size) || !page_size.is_aligned(new_size) {
+        return Err(AxError::InvalidInput);
+    }
+    if fixed && !VirtAddr::from(new_addr).is_aligned(page_size) {
+        return Err(AxError::InvalidInput);
+    }
+
+    if !fixed && new_size == old_size {
         return Ok(addr.as_usize() as isize);
     }
 
-    let curr = current();
-    let aspace = curr.as_thread().proc_data.aspace.lock();
-    let area_flags = aspace.find_area(addr).ok_or(AxError::NoMemory)?.flags();
+    if !fixed && new_size < old_size {
+        aspace.unmap(addr + new_size, old_size - new_size)?;
+        return Ok(addr.as_usize() as isize);
+    }
 
-    // Try to grow in-place: check if the region right after is free.
-    let grow = new_size - old_size;
+    let preserve_size = old_size.min(new_size);
+    let moved_segments = prefix_segments(&segments, preserve_size);
+    let grow = new_size.saturating_sub(old_size);
+    let primary = &segments[0];
+
+    // Try to grow in-place first.
     let after = addr + old_size;
-    let can_grow_inplace = aspace.find_area(after).is_none()
-        && aspace.contains_range(after, grow);
-    drop(aspace);
-
-    if can_grow_inplace && !fixed {
-        // Extend by mapping additional anonymous pages right after.
-        let mut aspace = curr.as_thread().proc_data.aspace.lock();
-        let backend = Backend::new_alloc(after, PageSize::Size4K);
-        aspace.map(after, grow, area_flags, false, backend)?;
+    let can_grow_inplace = !fixed
+        && new_size > old_size
+        && range_is_free(&aspace, after, grow, page_size as usize);
+    if can_grow_inplace {
+        primary.backend.ensure_range_covered(addr, new_size)?;
+        let tail_backend = primary.backend.relocate(addr, addr, &aspace_handle)?;
+        aspace.map(after, grow, primary.flags, false, tail_backend)?;
         return Ok(addr.as_usize() as isize);
     }
 
@@ -338,29 +510,67 @@ pub fn sys_mremap(
         return Err(AxError::NoMemory);
     }
 
-    // Move to a new location (either MREMAP_FIXED target or find free space).
     let dst = if fixed {
         let dst = VirtAddr::from(new_addr);
-        if !dst.is_aligned_4k() {
+        let old_range =
+            VirtAddrRange::try_from_start_size(addr, old_size).ok_or(AxError::InvalidInput)?;
+        let dst_range =
+            VirtAddrRange::try_from_start_size(dst, new_size).ok_or(AxError::InvalidInput)?;
+        if old_range.overlaps(dst_range) {
             return Err(AxError::InvalidInput);
         }
-        // Unmap destination range.
-        sys_munmap(dst.as_usize(), new_size)?;
-        dst.as_usize()
+        if !aspace.contains_range(dst, new_size) {
+            return Err(AxError::NoMemory);
+        }
+        dst
     } else {
-        // Allocate new anonymous region.
-        sys_mmap(0, new_size, area_flags.bits() as _, MmapFlags::PRIVATE.bits(), -1, 0)? as usize
+        aspace
+            .find_free_area(
+                addr,
+                new_size,
+                VirtAddrRange::new(aspace.base(), aspace.end()),
+                page_size as usize,
+            )
+            .or(aspace.find_free_area(
+                aspace.base(),
+                new_size,
+                VirtAddrRange::new(aspace.base(), aspace.end()),
+                page_size as usize,
+            ))
+            .ok_or(AxError::NoMemory)?
     };
 
-    // Copy old data to new location.
-    let copy_len = new_size.min(old_size);
-    let data = vm_load(addr.as_ptr(), copy_len)?;
-    vm_write_slice(dst as *mut u8, &data)?;
+    if new_size > old_size {
+        primary.backend.ensure_range_covered(addr, new_size)?;
+    }
+    if fixed {
+        aspace.unmap(dst, new_size)?;
+    }
 
-    // Unmap old region.
-    sys_munmap(addr.as_usize(), old_size)?;
+    if let Err(err) = map_relocated_segments(
+        &mut aspace,
+        &aspace_handle,
+        addr,
+        dst,
+        &moved_segments,
+        true,
+    ) {
+        let _ = aspace.unmap(dst, preserve_size);
+        return Err(err);
+    }
+    if new_size > old_size {
+        let tail_backend = primary.backend.relocate(addr, dst, &aspace_handle)?;
+        if let Err(err) = aspace.map(dst + old_size, grow, primary.flags, false, tail_backend) {
+            let _ = aspace.unmap(dst, new_size);
+            return Err(err);
+        }
+    }
+    if let Err(err) = aspace.unmap(addr, old_size) {
+        let _ = aspace.unmap(dst, new_size);
+        return Err(err);
+    }
 
-    Ok(dst as isize)
+    Ok(dst.as_usize() as isize)
 }
 
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
@@ -387,13 +597,12 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
     }
+    if flags & !(MS_ASYNC | MS_SYNC | MS_INVALIDATE) != 0 {
+        return Err(AxError::InvalidInput);
+    }
 
     // MS_ASYNC and MS_SYNC are mutually exclusive.
     if flags & MS_ASYNC != 0 && flags & MS_SYNC != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    // At least one of MS_ASYNC or MS_SYNC must be set.
-    if flags & (MS_ASYNC | MS_SYNC) == 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -401,7 +610,7 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     let curr = current();
     let aspace = curr.as_thread().proc_data.aspace.lock();
     let length = align_up_4k(length);
-    if aspace.find_area(VirtAddr::from(addr)).is_none() {
+    if length > 0 && !aspace.can_access_range(VirtAddr::from(addr), length, MappingFlags::empty()) {
         return Err(AxError::NoMemory);
     }
 
@@ -416,9 +625,6 @@ pub fn sys_mlock(addr: usize, length: usize) -> AxResult<isize> {
 pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_mlock2 <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
 
-    if !addr.is_multiple_of(PageSize::Size4K as usize) {
-        return Err(AxError::InvalidInput);
-    }
     if flags & !MLOCK_ONFAULT != 0 {
         return Err(AxError::InvalidInput);
     }
@@ -426,7 +632,13 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     // Validate the range is mapped.
     let curr = current();
     let aspace = curr.as_thread().proc_data.aspace.lock();
-    if length > 0 && aspace.find_area(VirtAddr::from(addr)).is_none() {
+    let start = VirtAddr::from(addr).align_down_4k();
+    let end = VirtAddr::from(addr)
+        .checked_add(length)
+        .ok_or(AxError::InvalidInput)?
+        .align_up_4k();
+    let length = end.sub_addr(start);
+    if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
         return Err(AxError::NoMemory);
     }
 
