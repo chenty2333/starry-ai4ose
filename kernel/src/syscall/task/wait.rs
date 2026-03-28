@@ -98,8 +98,8 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         if options.contains(WaitOptions::WUNTRACED) {
             for child in children.iter() {
                 if let Ok(data) = get_process_data(child.pid()) {
-                    if data.is_stopped() && data.take_stop_unreported() {
-                        let status = ((data.stop_signal() as i32) << 8) | 0x7f;
+                    if let Some(stop_signal) = data.take_stop_status() {
+                        let status = ((stop_signal as i32) << 8) | 0x7f;
                         if let Some(exit_code) = exit_code.nullable() {
                             exit_code.vm_write(status)?;
                         }

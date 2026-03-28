@@ -13,7 +13,7 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
 };
 
 use axpoll::PollSet;
@@ -230,6 +230,25 @@ pub(crate) enum ContinueResult {
     ResumedStopped,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct JobControlState {
+    state: StopState,
+    stop_signal: u8,
+    continued: bool,
+    stop_reported: bool,
+}
+
+impl Default for JobControlState {
+    fn default() -> Self {
+        Self {
+            state: StopState::Running,
+            stop_signal: 0,
+            continued: false,
+            stop_reported: false,
+        }
+    }
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -266,13 +285,7 @@ pub struct ProcessData {
     umask: AtomicU32,
 
     /// Job-control stop state shared by all threads in the process.
-    stop_state: AtomicU8,
-    /// The signal number that caused the stop (for waitpid status encoding).
-    stop_signal: AtomicU8,
-    /// Whether the process has been continued since last wait (consumed by WCONTINUED).
-    continued: AtomicBool,
-    /// Whether the current stop has been reported to waitpid (avoids duplicate reports).
-    stop_reported: AtomicBool,
+    job_ctl: SpinNoIrq<JobControlState>,
     /// Woken when threads should resume from stopped state.
     pub stop_event: Arc<PollSet>,
 }
@@ -310,10 +323,7 @@ impl ProcessData {
 
             umask: AtomicU32::new(0o022),
 
-            stop_state: AtomicU8::new(StopState::Running as u8),
-            stop_signal: AtomicU8::new(0),
-            continued: AtomicBool::new(false),
-            stop_reported: AtomicBool::new(false),
+            job_ctl: SpinNoIrq::new(JobControlState::default()),
             stop_event: Arc::default(),
         })
     }
@@ -350,7 +360,7 @@ impl ProcessData {
     }
 
     fn stop_state(&self) -> StopState {
-        self.stop_state.load(Ordering::Acquire).into()
+        self.job_ctl.lock().state
     }
 
     /// Returns whether the process is currently stopped.
@@ -365,93 +375,66 @@ impl ProcessData {
 
     /// Begins a job-control stop transition.
     pub fn begin_stop(&self, signo: u8) -> bool {
-        if self
-            .stop_state
-            .compare_exchange(
-                StopState::Running as u8,
-                StopState::Stopping as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.state != StopState::Running {
             return false;
         }
-        self.stop_signal.store(signo, Ordering::Relaxed);
+        job_ctl.state = StopState::Stopping;
+        job_ctl.stop_signal = signo;
         true
     }
 
     /// Finalizes a stop transition if it has not been canceled by SIGCONT.
     pub fn finish_stop(&self) -> bool {
-        if self
-            .stop_state
-            .compare_exchange(
-                StopState::Stopping as u8,
-                StopState::Stopped as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.state != StopState::Stopping {
             return false;
         }
-        self.stop_reported.store(false, Ordering::Release);
-        self.continued.store(false, Ordering::Release);
+        job_ctl.state = StopState::Stopped;
+        job_ctl.stop_reported = false;
+        job_ctl.continued = false;
         true
     }
 
     /// Resumes or cancels a job-control stop transition.
     pub(crate) fn continue_job(&self) -> ContinueResult {
-        loop {
-            match self.stop_state() {
-                StopState::Running => return ContinueResult::None,
+        let result = {
+            let mut job_ctl = self.job_ctl.lock();
+            match job_ctl.state {
+                StopState::Running => ContinueResult::None,
                 StopState::Stopping => {
-                    if self
-                        .stop_state
-                        .compare_exchange(
-                            StopState::Stopping as u8,
-                            StopState::Running as u8,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.stop_event.wake();
-                        return ContinueResult::CanceledStopping;
-                    }
+                    job_ctl.state = StopState::Running;
+                    ContinueResult::CanceledStopping
                 }
                 StopState::Stopped => {
-                    if self
-                        .stop_state
-                        .compare_exchange(
-                            StopState::Stopped as u8,
-                            StopState::Running as u8,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.continued.store(true, Ordering::Release);
-                        self.stop_event.wake();
-                        return ContinueResult::ResumedStopped;
-                    }
+                    job_ctl.state = StopState::Running;
+                    job_ctl.continued = true;
+                    ContinueResult::ResumedStopped
                 }
             }
+        };
+        if result != ContinueResult::None {
+            self.stop_event.wake();
         }
-    }
-
-    /// Returns the signal number that caused the stop.
-    pub fn stop_signal(&self) -> u8 {
-        self.stop_signal.load(Ordering::Relaxed)
+        result
     }
 
     /// Atomically takes the continued flag (returns true at most once per continuation).
     pub fn take_continued(&self) -> bool {
-        self.continued.swap(false, Ordering::AcqRel)
+        let mut job_ctl = self.job_ctl.lock();
+        let continued = job_ctl.continued;
+        job_ctl.continued = false;
+        continued
     }
 
-    /// Atomically takes the stop-unreported flag (returns true at most once per stop).
-    pub fn take_stop_unreported(&self) -> bool {
-        !self.stop_reported.swap(true, Ordering::AcqRel)
+    /// Takes the current stopped status for waitpid reporting, if it has not been reported yet.
+    pub fn take_stop_status(&self) -> Option<u8> {
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.state == StopState::Stopped && !job_ctl.stop_reported {
+            job_ctl.stop_reported = true;
+            Some(job_ctl.stop_signal)
+        } else {
+            None
+        }
     }
 }

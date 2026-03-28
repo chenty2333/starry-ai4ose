@@ -63,6 +63,9 @@ pub fn with_blocked_signals<R>(
 }
 
 pub(super) fn send_signal_thread_inner(task: &TaskInner, thr: &Thread, sig: SignalInfo) {
+    if sig.signo() == Signo::SIGCONT {
+        do_continue(&thr.proc_data);
+    }
     if thr.signal.send_signal(sig) {
         task.interrupt();
     }
@@ -155,18 +158,9 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
         signo
     );
 
-    // Interrupt all sibling threads so they notice the stopped flag.
-    let curr_tid = current().id().as_u64() as Pid;
-    for tid in proc_data.proc.threads() {
-        if tid != curr_tid {
-            if let Ok(task) = get_task(tid) {
-                task.interrupt();
-            }
-        }
-    }
-
     if proc_data.finish_stop() {
         notify_parent_stop_continue(proc_data);
+        interrupt_stop_siblings(proc_data);
     }
 
     // Block this thread until the process is continued.
@@ -211,9 +205,30 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             }
         }))) {
             Ok(()) => {}
-            Err(_) => while check_signals(thr, uctx, None) {},
+            Err(_) => handle_stopped_interrupt(thr, uctx),
         }
     }
+}
+
+fn interrupt_stop_siblings(proc_data: &ProcessData) {
+    let curr_tid = current().id().as_u64() as Pid;
+    for tid in proc_data.proc.threads() {
+        if tid != curr_tid {
+            if let Ok(task) = get_task(tid) {
+                task.interrupt();
+            }
+        }
+    }
+}
+
+fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
+    if !thr.signal.pending().has(Signo::SIGKILL) {
+        return;
+    }
+
+    let old_blocked = thr.signal.set_blocked(!SignalSet::default());
+    while check_signals(thr, uctx, Some(old_blocked)) {}
+    thr.signal.set_blocked(old_blocked);
 }
 
 /// Sends SIGCHLD to the parent and wakes its child_exit_event.
