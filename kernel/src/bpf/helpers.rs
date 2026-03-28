@@ -123,7 +123,7 @@ fn helper_get_current_pid_tgid() -> u64 {
     let curr = current();
     if let Some(thr) = curr.try_as_thread() {
         let pid = thr.proc_data.proc.pid() as u64;
-        let tid = curr.id().as_u64();
+        let tid = thr.tid() as u64;
         (pid << 32) | (tid & 0xFFFF_FFFF)
     } else {
         0

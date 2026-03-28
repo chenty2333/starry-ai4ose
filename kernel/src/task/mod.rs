@@ -1,5 +1,6 @@
 //! User task management.
 
+pub(crate) mod coredump;
 mod futex;
 mod ops;
 mod resources;
@@ -7,7 +8,6 @@ mod signal;
 mod stat;
 mod timer;
 mod user;
-pub(crate) mod coredump;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
@@ -22,7 +22,7 @@ use axtask::{TaskExt, TaskInner};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use spin::RwLock;
-use starry_process::Process;
+use starry_process::{Pid, Process};
 use starry_signal::{
     Signo,
     api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
@@ -57,6 +57,10 @@ pub struct Thread {
     /// When the thread exits, the kernel clears the word at this address if it
     /// is not NULL.
     clear_child_tid: AtomicUsize,
+
+    /// User-visible thread ID. Normally this matches the scheduler task ID,
+    /// but after a non-leader execve() it is rebound to the process ID.
+    visible_tid: AtomicU32,
 
     /// The head of the robust list
     robust_list_head: AtomicUsize,
@@ -95,6 +99,7 @@ impl Thread {
             signal: ThreadSignalManager::new(tid, proc_data.signal.clone()),
             proc_data,
             clear_child_tid: AtomicUsize::new(0),
+            visible_tid: AtomicU32::new(tid),
             robust_list_head: AtomicUsize::new(0),
             time: AssumeSync(RefCell::new(TimeManager::new())),
             exit: Arc::new(AtomicBool::new(false)),
@@ -110,10 +115,20 @@ impl Thread {
         self.clear_child_tid.load(Ordering::Relaxed)
     }
 
+    /// Get the user-visible thread ID.
+    pub fn tid(&self) -> Pid {
+        self.visible_tid.load(Ordering::Acquire)
+    }
+
     /// Set the clear child tid field.
     pub fn set_clear_child_tid(&self, clear_child_tid: usize) {
         self.clear_child_tid
             .store(clear_child_tid, Ordering::Relaxed);
+    }
+
+    /// Set the user-visible thread ID.
+    pub fn set_tid(&self, tid: Pid) {
+        self.visible_tid.store(tid, Ordering::Release);
     }
 
     /// Get the robust list head.
@@ -249,6 +264,11 @@ impl Default for JobControlState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ExecControlState {
+    owner: Option<Pid>,
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -272,6 +292,8 @@ pub struct ProcessData {
     pub child_exit_event: Arc<PollSet>,
     /// Self exit event
     pub exit_event: Arc<PollSet>,
+    /// Woken when exec de-thread state changes or a sibling exits.
+    pub exec_event: Arc<PollSet>,
     /// The exit signal of the thread
     pub exit_signal: Option<Signo>,
 
@@ -286,6 +308,8 @@ pub struct ProcessData {
 
     /// Job-control stop state shared by all threads in the process.
     job_ctl: SpinNoIrq<JobControlState>,
+    /// Multi-thread exec coordination state.
+    exec_ctl: SpinNoIrq<ExecControlState>,
     /// Woken when threads should resume from stopped state.
     pub stop_event: Arc<PollSet>,
 }
@@ -312,6 +336,7 @@ impl ProcessData {
 
             child_exit_event: Arc::default(),
             exit_event: Arc::default(),
+            exec_event: Arc::default(),
             exit_signal,
 
             signal: Arc::new(ProcessSignalManager::new(
@@ -324,6 +349,7 @@ impl ProcessData {
             umask: AtomicU32::new(0o022),
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
+            exec_ctl: SpinNoIrq::new(ExecControlState::default()),
             stop_event: Arc::default(),
         })
     }
@@ -435,6 +461,59 @@ impl ProcessData {
             Some(job_ctl.stop_signal)
         } else {
             None
+        }
+    }
+
+    /// Begins a multi-thread exec de-threading phase.
+    pub fn begin_exec(&self, owner: Pid) -> bool {
+        let mut exec_ctl = self.exec_ctl.lock();
+        match exec_ctl.owner {
+            Some(curr) => curr == owner,
+            None => {
+                exec_ctl.owner = Some(owner);
+                true
+            }
+        }
+    }
+
+    /// Returns whether this thread should exit because another thread is committing execve().
+    pub fn should_exit_for_exec(&self, tid: Pid) -> bool {
+        matches!(self.exec_ctl.lock().owner, Some(owner) if owner != tid)
+    }
+
+    /// Returns whether the given thread still owns the in-flight exec.
+    pub fn is_exec_owner(&self, tid: Pid) -> bool {
+        self.exec_ctl.lock().owner == Some(tid)
+    }
+
+    /// Returns whether an exec de-thread phase is currently in progress.
+    pub fn exec_in_progress(&self) -> bool {
+        self.exec_ctl.lock().owner.is_some()
+    }
+
+    /// Adds a thread to the process unless an exec de-thread phase is already
+    /// in progress.
+    pub fn try_add_thread(&self, tid: Pid) -> bool {
+        let exec_ctl = self.exec_ctl.lock();
+        if exec_ctl.owner.is_some() {
+            return false;
+        }
+        self.proc.add_thread(tid);
+        true
+    }
+
+    /// Returns whether the thread group has drained to the exec owner only.
+    pub fn exec_ready(&self, owner: Pid) -> bool {
+        self.is_exec_owner(owner) && self.proc.threads().as_slice() == [owner]
+    }
+
+    /// Finishes or cancels the in-flight exec owned by `owner`.
+    pub fn end_exec(&self, owner: Pid) {
+        let mut exec_ctl = self.exec_ctl.lock();
+        if exec_ctl.owner == Some(owner) {
+            exec_ctl.owner = None;
+            drop(exec_ctl);
+            self.exec_event.wake();
         }
     }
 }

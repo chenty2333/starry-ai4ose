@@ -7,11 +7,13 @@ use axtask::{
     future::{block_on, interruptible},
 };
 use starry_process::Pid;
-use starry_signal::{SignalInfo, SignalOSAction, SignalSet, Signo};
+use starry_signal::{
+    DefaultSignalAction, SignalDisposition, SignalInfo, SignalOSAction, SignalSet, Signo,
+};
 
 use super::{
     AsThread, ContinueResult, ProcessData, Thread, do_exit, get_process_data, get_process_group,
-    get_task,
+    get_task, get_visible_task,
 };
 
 pub fn check_signals(
@@ -47,6 +49,34 @@ pub fn check_signals(
     true
 }
 
+pub(crate) fn has_pending_fatal_signal(thr: &Thread) -> bool {
+    let pending = thr.signal.pending();
+    if pending.is_empty() {
+        return false;
+    }
+
+    let actions = thr.proc_data.signal.actions.lock();
+    for raw in 1..=64u8 {
+        let Some(signo) = Signo::from_repr(raw) else {
+            continue;
+        };
+        if !pending.has(signo) {
+            continue;
+        }
+        if matches!(
+            actions[signo].disposition,
+            SignalDisposition::Default
+                if matches!(
+                    signo.default_action(),
+                    DefaultSignalAction::Terminate | DefaultSignalAction::CoreDump
+                )
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn with_blocked_signals<R>(
     blocked: Option<SignalSet>,
     f: impl FnOnce() -> AxResult<R>,
@@ -74,6 +104,26 @@ pub(super) fn send_signal_thread_inner(task: &TaskInner, thr: &Thread, sig: Sign
 /// Sends a signal to a thread.
 pub fn send_signal_to_thread(tgid: Option<Pid>, tid: Pid, sig: Option<SignalInfo>) -> AxResult<()> {
     let task = get_task(tid)?;
+    let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
+    if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
+        return Err(AxError::NoSuchProcess);
+    }
+
+    if let Some(sig) = sig {
+        info!("Send signal {:?} to thread {}", sig.signo(), tid);
+        send_signal_thread_inner(&task, thread, sig);
+    }
+
+    Ok(())
+}
+
+/// Sends a signal to a thread using the user-visible TID namespace.
+pub fn send_signal_to_visible_thread(
+    tgid: Option<Pid>,
+    tid: Pid,
+    sig: Option<SignalInfo>,
+) -> AxResult<()> {
+    let task = get_visible_task(tid)?;
     let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
     if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
         return Err(AxError::NoSuchProcess);
@@ -190,14 +240,24 @@ fn do_continue(proc_data: &ProcessData) {
 /// and from the user task main loop (sibling threads).
 pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
     let proc_data = &thr.proc_data;
-    while !thr.pending_exit() && proc_data.should_wait_for_stop() {
+    let tid = current().id().as_u64() as Pid;
+    while !thr.pending_exit()
+        && !proc_data.should_exit_for_exec(tid)
+        && proc_data.should_wait_for_stop()
+    {
         match block_on(interruptible(poll_fn(|cx| {
-            if !proc_data.should_wait_for_stop() || thr.pending_exit() {
+            if !proc_data.should_wait_for_stop()
+                || thr.pending_exit()
+                || proc_data.should_exit_for_exec(tid)
+            {
                 Poll::Ready(())
             } else {
                 proc_data.stop_event.register(cx.waker());
                 // Re-check after registration to avoid missed wake-ups.
-                if !proc_data.should_wait_for_stop() || thr.pending_exit() {
+                if !proc_data.should_wait_for_stop()
+                    || thr.pending_exit()
+                    || proc_data.should_exit_for_exec(tid)
+                {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -222,13 +282,19 @@ fn interrupt_stop_siblings(proc_data: &ProcessData) {
 }
 
 fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
-    if !thr.signal.pending().has(Signo::SIGKILL) {
+    let tid = current().id().as_u64() as Pid;
+    if thr.proc_data.should_exit_for_exec(tid) {
+        if has_pending_fatal_signal(thr) {
+            while check_signals(thr, uctx, None) {}
+        }
         return;
     }
 
-    let old_blocked = thr.signal.set_blocked(!SignalSet::default());
-    while check_signals(thr, uctx, Some(old_blocked)) {}
-    thr.signal.set_blocked(old_blocked);
+    if thr.signal.pending().is_empty() {
+        return;
+    }
+
+    while check_signals(thr, uctx, None) {}
 }
 
 /// Sends SIGCHLD to the parent and wakes its child_exit_event.

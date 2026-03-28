@@ -7,7 +7,9 @@ use core::{ffi::c_long, sync::atomic::Ordering};
 use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
+use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
+use memory_addr::PhysAddr;
 use spin::RwLock;
 use starry_process::{Pid, ProcessGroup, Session};
 use starry_signal::{SignalInfo, Signo};
@@ -20,6 +22,7 @@ use super::{
 };
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
+static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 
 static PROCESS_TABLE: RwLock<WeakMap<Pid, Weak<ProcessData>>> = RwLock::new(WeakMap::new());
 
@@ -33,6 +36,7 @@ static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap:
 /// possible noise caused by expired entries in the [`WeakMap`].
 pub fn cleanup_task_tables() {
     TASK_TABLE.write().cleanup();
+    TASK_ALIAS_TABLE.write().cleanup();
     PROCESS_TABLE.write().cleanup();
     PROCESS_GROUP_TABLE.write().cleanup();
     SESSION_TABLE.write().cleanup();
@@ -70,6 +74,11 @@ pub fn add_task_to_table(task: &AxTaskRef) {
     session_table.insert(session.sid(), &session);
 }
 
+/// Adds an additional lookup key for a task.
+pub fn add_task_alias(alias: Pid, task: &AxTaskRef) {
+    TASK_ALIAS_TABLE.write().insert(alias, task);
+}
+
 /// Lists all tasks.
 pub fn tasks() -> Vec<AxTaskRef> {
     TASK_TABLE.read().values().collect()
@@ -80,7 +89,35 @@ pub fn get_task(tid: Pid) -> AxResult<AxTaskRef> {
     if tid == 0 {
         return Ok(current().clone());
     }
-    TASK_TABLE.read().get(&tid).ok_or(AxError::NoSuchProcess)
+    TASK_TABLE
+        .read()
+        .get(&tid)
+        .or_else(|| TASK_ALIAS_TABLE.read().get(&tid))
+        .ok_or(AxError::NoSuchProcess)
+}
+
+/// Finds the task with the given user-visible TID.
+pub fn get_visible_task(tid: Pid) -> AxResult<AxTaskRef> {
+    if let Some(task) = TASK_ALIAS_TABLE.read().get(&tid)
+        && task.as_thread().tid() == tid
+        && !task.as_thread().pending_exit()
+    {
+        return Ok(task);
+    }
+
+    if let Some(task) = TASK_TABLE.read().get(&tid)
+        && task.as_thread().tid() == tid
+        && !task.as_thread().pending_exit()
+    {
+        return Ok(task);
+    }
+
+    Err(AxError::NoSuchProcess)
+}
+
+/// Removes a task alias lookup key.
+pub fn remove_task_alias(alias: Pid) {
+    TASK_ALIAS_TABLE.write().remove(&alias);
 }
 
 /// Lists all processes.
@@ -107,6 +144,21 @@ pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
 /// Finds the session with the given SID.
 pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
     SESSION_TABLE.read().get(&sid).ok_or(AxError::NoSuchProcess)
+}
+
+/// Updates the current task's saved and active user page table root.
+pub fn set_current_user_page_table_root(root: PhysAddr) {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    // SAFETY: this only mutates the current task's saved TaskContext while the task
+    // is running on the current CPU, so no other code can access it concurrently.
+    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
+    unsafe {
+        (*curr_ptr).ctx_mut().set_page_table_root(root);
+        axhal::asm::write_user_page_table(root);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    axhal::asm::flush_tlb(None);
 }
 
 /// Poll the timer
@@ -200,6 +252,8 @@ pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
 pub fn do_exit(exit_code: i32, group_exit: bool) {
     let curr = current();
     let thr = curr.as_thread();
+    let tid = curr.id().as_u64() as Pid;
+    let visible_tid = thr.tid();
 
     info!("{} exit with code: {}", curr.id_name(), exit_code);
 
@@ -221,7 +275,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     }
 
     let process = &thr.proc_data.proc;
-    if process.exit_thread(curr.id().as_u64() as Pid, exit_code) {
+    if visible_tid != tid {
+        remove_task_alias(visible_tid);
+    }
+    thr.proc_data.end_exec(tid);
+    if process.exit_thread(tid, exit_code) {
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {
@@ -237,6 +295,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
             .lock()
             .clear_proc_shm(process.pid());
     }
+    thr.proc_data.exec_event.wake();
     thr.exit_event.wake();
 
     if group_exit && !process.is_group_exited() {

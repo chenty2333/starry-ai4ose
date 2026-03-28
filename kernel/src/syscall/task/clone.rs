@@ -117,6 +117,7 @@ impl CloneArgs {
         }
 
         let unsupported_ns_flags = CloneFlags::NEWIPC
+            | CloneFlags::NEWNS
             | CloneFlags::NEWNET
             | CloneFlags::NEWPID
             | CloneFlags::NEWUSER
@@ -124,20 +125,16 @@ impl CloneArgs {
             | CloneFlags::NEWCGROUP;
 
         if flags.intersects(unsupported_ns_flags) {
-            warn!("sys_clone/sys_clone3: unsupported namespace flags: {:?}",
-                  *flags & unsupported_ns_flags);
+            warn!(
+                "sys_clone/sys_clone3: unsupported namespace flags: {:?}",
+                *flags & unsupported_ns_flags
+            );
             return Err(AxError::OperationNotSupported);
         }
 
         if flags.contains(CloneFlags::INTO_CGROUP) {
             warn!("sys_clone3: CLONE_INTO_CGROUP not supported");
             return Err(AxError::OperationNotSupported);
-        }
-
-        // CLONE_NEWNS (mount namespace) is accepted but currently a no-op
-        // (child shares the parent's mount namespace).
-        if flags.contains(CloneFlags::NEWNS) {
-            warn!("sys_clone: CLONE_NEWNS accepted but not isolated (shared mount namespace)");
         }
 
         Ok(())
@@ -189,6 +186,9 @@ impl CloneArgs {
 
         let curr = current();
         let old_proc_data = &curr.as_thread().proc_data;
+        if old_proc_data.exec_in_progress() {
+            return Err(AxError::Interrupted);
+        }
 
         let mut new_task = new_user_task(&curr.name(), new_uctx, set_child_tid);
 
@@ -265,7 +265,13 @@ impl CloneArgs {
             proc_data
         };
 
-        new_proc_data.proc.add_thread(tid);
+        if flags.contains(CloneFlags::THREAD) {
+            if !old_proc_data.try_add_thread(tid) {
+                return Err(AxError::Interrupted);
+            }
+        } else {
+            new_proc_data.proc.add_thread(tid);
+        }
 
         let thr = Thread::new(tid, new_proc_data.clone());
         if flags.contains(CloneFlags::CHILD_CLEARTID) {

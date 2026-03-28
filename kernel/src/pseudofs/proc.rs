@@ -26,7 +26,7 @@ use crate::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
     },
-    task::{AsThread, TaskStat, get_task, tasks},
+    task::{AsThread, TaskStat, get_task, get_visible_task, tasks},
 };
 
 fn real_meminfo() -> String {
@@ -77,18 +77,16 @@ impl SimpleDirOps for ProcessTaskDir {
         let Some(process) = self.process.upgrade() else {
             return Box::new(iter::empty());
         };
-        Box::new(
-            process
-                .threads()
-                .into_iter()
-                .map(|tid| tid.to_string().into()),
-        )
+        Box::new(process.threads().into_iter().filter_map(|tid| {
+            let task = get_task(tid).ok()?;
+            Some(Cow::Owned(task.as_thread().tid().to_string()))
+        }))
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
         let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let task = get_task(tid).map_err(|_| VfsError::NotFound)?;
+        let task = get_visible_task(tid).map_err(|_| VfsError::NotFound)?;
         if task.as_thread().proc_data.proc.pid() != process.pid() {
             return Err(VfsError::NotFound);
         }
@@ -119,7 +117,7 @@ fn task_status(task: &AxTaskRef) -> String {
         Mems_allowed:\t1\n\
         Mems_allowed_list:\t0",
         task.as_thread().proc_data.proc.pid(),
-        task.id().as_u64()
+        task.as_thread().tid()
     )
 }
 
@@ -236,9 +234,21 @@ impl SimpleDirOps for ThreadDir {
                     let start = area.start().as_usize();
                     let end = start + area.size();
                     let flags = area.flags();
-                    let r = if flags.contains(MappingFlags::READ) { 'r' } else { '-' };
-                    let w = if flags.contains(MappingFlags::WRITE) { 'w' } else { '-' };
-                    let x = if flags.contains(MappingFlags::EXECUTE) { 'x' } else { '-' };
+                    let r = if flags.contains(MappingFlags::READ) {
+                        'r'
+                    } else {
+                        '-'
+                    };
+                    let w = if flags.contains(MappingFlags::WRITE) {
+                        'w'
+                    } else {
+                        '-'
+                    };
+                    let x = if flags.contains(MappingFlags::EXECUTE) {
+                        'x'
+                    } else {
+                        '-'
+                    };
                     let shared = matches!(area.backend(), Backend::Shared(_));
                     let p = if shared { 's' } else { 'p' };
                     let name = match area.backend() {
@@ -325,7 +335,8 @@ impl SimpleDirOps for ProcFsHandler {
         Box::new(
             tasks()
                 .into_iter()
-                .map(|task| task.id().as_u64().to_string().into())
+                .filter(|task| !task.as_thread().pending_exit())
+                .map(|task| task.as_thread().tid().to_string().into())
                 .chain([Cow::Borrowed("self")]),
         )
     }
@@ -335,7 +346,7 @@ impl SimpleDirOps for ProcFsHandler {
             current().clone()
         } else {
             let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-            get_task(tid).map_err(|_| VfsError::NotFound)?
+            get_visible_task(tid).map_err(|_| VfsError::NotFound)?
         };
         let node = NodeOpsMux::Dir(SimpleDir::new_maker(
             self.0.clone(),
@@ -412,37 +423,27 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 {
                     let _ = write!(
                         out,
-                        "processor\t: {i}\n\
-                         hart\t\t: {i}\n\
-                         isa\t\t: rv64imafdc\n\
-                         mmu\t\t: sv39\n"
+                        "processor\t: {i}\nhart\t\t: {i}\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n"
                     );
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
                     let _ = write!(
                         out,
-                        "processor\t: {i}\n\
-                         BogoMIPS\t: 48.00\n\
-                         Features\t: fp asimd\n"
+                        "processor\t: {i}\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd\n"
                     );
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
                     let _ = write!(
                         out,
-                        "processor\t: {i}\n\
-                         vendor_id\t: GenuineIntel\n\
-                         model name\t: QEMU Virtual CPU\n"
+                        "processor\t: {i}\nvendor_id\t: GenuineIntel\nmodel name\t: QEMU Virtual \
+                         CPU\n"
                     );
                 }
                 #[cfg(target_arch = "loongarch64")]
                 {
-                    let _ = write!(
-                        out,
-                        "processor\t: {i}\n\
-                         ISA\t\t: loongarch64\n"
-                    );
+                    let _ = write!(out, "processor\t: {i}\nISA\t\t: loongarch64\n");
                 }
             }
             Ok(out)
@@ -460,7 +461,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     root.add(
         "loadavg",
         SimpleFile::new_regular(fs.clone(), || {
-            let all_tasks = tasks();
+            let all_tasks = tasks()
+                .into_iter()
+                .filter(|task| !task.as_thread().pending_exit())
+                .collect::<Vec<_>>();
             let total = all_tasks.len();
             let running = all_tasks
                 .iter()
@@ -470,7 +474,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             let load = running as f64;
             let last_pid = all_tasks
                 .iter()
-                .map(|t| t.id().as_u64())
+                .map(|t| t.as_thread().tid() as u64)
                 .max()
                 .unwrap_or(0);
             Ok(format!(

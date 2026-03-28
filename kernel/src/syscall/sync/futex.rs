@@ -9,7 +9,7 @@ use linux_raw_sys::general::{
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    task::{AsThread, FutexKey, futex_table_for, get_task},
+    task::{AsThread, FutexKey, futex_table_for, get_visible_task},
     time::TimeValueLike,
 };
 
@@ -119,7 +119,7 @@ pub fn sys_get_robust_list(
     head: *mut *const robust_list_head,
     size: *mut usize,
 ) -> AxResult<isize> {
-    let task = get_task(tid)?;
+    let task = get_visible_task(tid)?;
     head.vm_write(task.as_thread().robust_list_head() as _)?;
     size.vm_write(size_of::<robust_list_head>())?;
 

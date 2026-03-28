@@ -16,8 +16,8 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, check_signals, processes, send_signal_to_process,
-        send_signal_to_process_group, send_signal_to_thread,
+        AsThread, check_signals, processes, send_signal_to_process, send_signal_to_process_group,
+        send_signal_to_visible_thread,
     },
     time::TimeValueLike,
 };
@@ -147,13 +147,13 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
 
 pub fn sys_tkill(tid: Pid, signo: u32) -> AxResult<isize> {
     let sig = make_siginfo(signo, SI_TKILL)?;
-    send_signal_to_thread(None, tid, sig)?;
+    send_signal_to_visible_thread(None, tid, sig)?;
     Ok(0)
 }
 
 pub fn sys_tgkill(tgid: Pid, tid: Pid, signo: u32) -> AxResult<isize> {
     let sig = make_siginfo(signo, SI_TKILL)?;
-    send_signal_to_thread(Some(tgid), tid, sig)?;
+    send_signal_to_visible_thread(Some(tgid), tid, sig)?;
     Ok(0)
 }
 
@@ -200,7 +200,7 @@ pub fn sys_rt_tgsigqueueinfo(
     check_sigset_size(sigsetsize)?;
 
     let sig = make_queue_signal_info(tgid, signo, sig)?;
-    send_signal_to_thread(Some(tgid), tid, sig)?;
+    send_signal_to_visible_thread(Some(tgid), tid, sig)?;
     Ok(0)
 }
 

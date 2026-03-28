@@ -5,7 +5,8 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, TimerState, check_signals, raise_signal_fatal, set_timer_state, wait_if_stopped,
+    AsThread, TimerState, check_signals, do_exit, has_pending_fatal_signal, raise_signal_fatal,
+    set_timer_state, wait_if_stopped,
 };
 use crate::syscall::handle_syscall;
 
@@ -48,6 +49,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
             info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
 
             let thr = curr.as_thread();
+            let tid = curr.id().as_u64() as Pid;
             while !thr.pending_exit() {
                 let reason = uctx.run();
 
@@ -90,12 +92,30 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                     }
                 }
 
+                if thr.proc_data.should_exit_for_exec(tid) {
+                    if has_pending_fatal_signal(thr) {
+                        while check_signals(thr, &mut uctx, None) {}
+                    } else {
+                        do_exit(0, false);
+                        continue;
+                    }
+                }
+
                 if !thr.take_block_next_signal_check() {
                     while check_signals(thr, &mut uctx, None) {}
                 }
 
                 // Block if the process has been stopped (by this or another thread).
                 wait_if_stopped(thr, &mut uctx);
+
+                if thr.proc_data.should_exit_for_exec(tid) {
+                    if has_pending_fatal_signal(thr) {
+                        while check_signals(thr, &mut uctx, None) {}
+                    } else {
+                        do_exit(0, false);
+                        continue;
+                    }
+                }
 
                 set_timer_state(&curr, TimerState::User);
                 curr.clear_interrupt();
