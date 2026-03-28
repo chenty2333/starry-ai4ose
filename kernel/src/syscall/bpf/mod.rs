@@ -1,9 +1,10 @@
 //! BPF syscall dispatcher and command handlers.
 
 mod map_cmd;
+mod obj_cmd;
 mod prog_cmd;
 
-pub use self::{map_cmd::*, prog_cmd::*};
+pub use self::{map_cmd::*, obj_cmd::*, prog_cmd::*};
 
 use axerrno::{AxError, AxResult};
 
@@ -20,6 +21,8 @@ pub fn sys_bpf(cmd: u32, attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         BPF_MAP_GET_NEXT_KEY => bpf_map_get_next_key(attr_ptr, attr_size),
         BPF_PROG_LOAD => bpf_prog_load(attr_ptr, attr_size),
         BPF_PROG_TEST_RUN => bpf_prog_test_run(attr_ptr, attr_size),
+        BPF_OBJ_GET_INFO_BY_FD => bpf_obj_get_info_by_fd(attr_ptr, attr_size),
+        BPF_MAP_FREEZE => Ok(0), // no-op: all maps are already "unfrozen"
         _ => {
             warn!("sys_bpf: unsupported cmd {cmd}");
             Err(AxError::InvalidInput)
