@@ -3,9 +3,8 @@ use core::time::Duration;
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME,
-    CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME,
-    itimerspec, timespec,
+    CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_REALTIME_ALARM,
+    TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME, itimerspec, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -22,10 +21,12 @@ bitflags! {
     }
 }
 
-fn validate_clockid(clockid: i32) -> AxResult<()> {
+fn validate_clockid(clockid: i32) -> AxResult<crate::file::timerfd::TimerClock> {
     match clockid as u32 {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM | CLOCK_MONOTONIC
-        | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => Ok(()),
+        CLOCK_REALTIME | CLOCK_REALTIME_ALARM => Ok(crate::file::timerfd::TimerClock::Realtime),
+        CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
+            Ok(crate::file::timerfd::TimerClock::Monotonic)
+        }
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -49,10 +50,10 @@ fn duration_to_timespec(d: Duration) -> timespec {
 pub fn sys_timerfd_create(clockid: i32, flags: u32) -> AxResult<isize> {
     debug!("sys_timerfd_create <= clockid: {clockid}, flags: {flags:#x}");
 
-    validate_clockid(clockid)?;
+    let clock = validate_clockid(clockid)?;
     let flags = TimerFdCreateFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 
-    let tfd = TimerFd::new(clockid);
+    let tfd = TimerFd::new(clock);
     tfd.set_nonblocking(flags.contains(TimerFdCreateFlags::NONBLOCK))?;
     add_file_like(tfd as _, flags.contains(TimerFdCreateFlags::CLOEXEC)).map(|fd| fd as _)
 }
@@ -65,9 +66,14 @@ pub fn sys_timerfd_settime(
 ) -> AxResult<isize> {
     debug!("sys_timerfd_settime <= fd: {fd}, flags: {flags}");
 
+    let flags = flags as u32;
+    if flags & !TFD_TIMER_ABSTIME != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let absolute = (flags & TFD_TIMER_ABSTIME) != 0;
+
     let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
     let (interval, value) = itimerspec_to_durations(&new_value)?;
-    let absolute = (flags as u32 & TFD_TIMER_ABSTIME) != 0;
 
     let tfd = TimerFd::from_fd(fd)?;
     let (old_interval, old_value_dur) = tfd.settime(absolute, interval, value);

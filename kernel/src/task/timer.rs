@@ -23,6 +23,22 @@ fn time_value_from_nanos(nanos: usize) -> TimeValue {
     TimeValue::new(secs, nsecs as u32)
 }
 
+/// Clock domain used by alarms.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AlarmClock {
+    Realtime,
+    Monotonic,
+}
+
+impl AlarmClock {
+    fn now(self) -> Duration {
+        match self {
+            AlarmClock::Realtime => wall_time(),
+            AlarmClock::Monotonic => axhal::time::monotonic_time(),
+        }
+    }
+}
+
 /// The action to take when an alarm fires.
 enum AlarmAction {
     /// Interrupt a task and poll its itimers.
@@ -53,7 +69,8 @@ impl Ord for Entry {
 }
 
 lazy_static! {
-    static ref ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
+    static ref REALTIME_ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
+    static ref MONOTONIC_ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
     static ref EVENT_NEW_TIMER: Event = Event::new();
 }
 
@@ -113,17 +130,14 @@ impl ITimer {
 
     pub fn renew_timer(&self) {
         if self.remained_ns > 0 {
-            let deadline = wall_time() + Duration::from_nanos(self.remained_ns as u64);
-            let mut guard = ALARM_LIST.lock();
-            let should_wake = guard.peek().is_none_or(|it| it.deadline > deadline);
-            guard.push(Entry {
+            let deadline = wall_time()
+                .checked_add(Duration::from_nanos(self.remained_ns as u64))
+                .unwrap_or(Duration::MAX);
+            register_alarm(
+                AlarmClock::Realtime,
                 deadline,
-                action: AlarmAction::PollTask(Arc::downgrade(&current())),
-            });
-            drop(guard);
-            if should_wake {
-                EVENT_NEW_TIMER.notify(1);
-            }
+                AlarmAction::PollTask(Arc::downgrade(&current())),
+            );
         }
     }
 }
@@ -235,57 +249,30 @@ impl TimeManager {
 
 async fn alarm_task() {
     loop {
-        let guard = ALARM_LIST.lock();
-        let Some(entry) = guard.peek() else {
-            drop(guard);
+        let mut progressed = false;
+        progressed |= process_due(AlarmClock::Realtime);
+        progressed |= process_due(AlarmClock::Monotonic);
+        if progressed {
+            continue;
+        }
+
+        let next_realtime = queue_remaining(AlarmClock::Realtime);
+        let next_monotonic = queue_remaining(AlarmClock::Monotonic);
+
+        let Some(next_due) = (match (next_realtime, next_monotonic) {
+            (None, None) => None,
+            (Some(rt), None) => Some(rt),
+            (None, Some(mt)) => Some(mt),
+            (Some(rt), Some(mt)) => Some(rt.min(mt)),
+        }) else {
             listener!(EVENT_NEW_TIMER => listener);
-
-            if !ALARM_LIST.lock().is_empty() {
-                continue;
-            }
             listener.await;
-
             continue;
         };
 
-        let now = wall_time();
-        if entry.deadline <= now {
-            let entry_deadline = entry.deadline;
-            match &entry.action {
-                AlarmAction::PollTask(weak_task) => {
-                    if let Some(task) = weak_task.upgrade() {
-                        drop(guard);
-                        poll_timer(&task);
-                    } else {
-                        drop(guard);
-                    }
-                }
-                AlarmAction::WakePollSet(poll_set) => {
-                    let poll_set = poll_set.clone();
-                    drop(guard);
-                    poll_set.wake();
-                }
-            }
-            let mut guard = ALARM_LIST.lock();
-            // Pop the entry we just processed (it's still at the top).
-            if let Some(top) = guard.peek() {
-                if top.deadline == entry_deadline {
-                    guard.pop();
-                }
-            }
-        } else {
-            let deadline = entry.deadline;
-            drop(guard);
-            listener!(EVENT_NEW_TIMER => listener);
-            if ALARM_LIST
-                .lock()
-                .peek()
-                .is_none_or(|it| it.deadline != deadline)
-            {
-                continue;
-            }
-            let _ = timeout_at(Some(deadline), listener).await;
-        }
+        listener!(EVENT_NEW_TIMER => listener);
+        let deadline = wall_time().checked_add(next_due);
+        let _ = timeout_at(deadline, listener).await;
     }
 }
 
@@ -299,17 +286,64 @@ pub fn spawn_alarm_task() {
     );
 }
 
-/// Registers a one-shot alarm that wakes the given [`PollSet`] at the specified
-/// wall-clock deadline. Used by timerfd to get notified when the timer expires.
-pub fn register_pollset_alarm(deadline: Duration, poll_set: Arc<PollSet>) {
-    let mut guard = ALARM_LIST.lock();
+fn alarm_list(clock: AlarmClock) -> &'static Mutex<BinaryHeap<Entry>> {
+    match clock {
+        AlarmClock::Realtime => &REALTIME_ALARM_LIST,
+        AlarmClock::Monotonic => &MONOTONIC_ALARM_LIST,
+    }
+}
+
+fn register_alarm(clock: AlarmClock, deadline: Duration, action: AlarmAction) {
+    let list = alarm_list(clock);
+    let mut guard = list.lock();
     let should_wake = guard.peek().is_none_or(|it| it.deadline > deadline);
-    guard.push(Entry {
-        deadline,
-        action: AlarmAction::WakePollSet(poll_set),
-    });
+    guard.push(Entry { deadline, action });
     drop(guard);
     if should_wake {
         EVENT_NEW_TIMER.notify(1);
     }
+}
+
+/// Registers a one-shot alarm that wakes the given [`PollSet`] at the specified
+/// deadline in the selected clock domain. Used by timerfd to get notified when
+/// the timer expires.
+pub fn register_pollset_alarm(clock: AlarmClock, deadline: Duration, poll_set: Arc<PollSet>) {
+    register_alarm(clock, deadline, AlarmAction::WakePollSet(poll_set));
+}
+
+fn queue_remaining(clock: AlarmClock) -> Option<Duration> {
+    let list = alarm_list(clock);
+    let guard = list.lock();
+    let entry = guard.peek()?;
+    let now = clock.now();
+    Some(entry.deadline.saturating_sub(now))
+}
+
+fn pop_due(clock: AlarmClock) -> Option<AlarmAction> {
+    let list = alarm_list(clock);
+    let mut guard = list.lock();
+    let now = clock.now();
+    if guard.peek().is_some_and(|entry| entry.deadline <= now) {
+        guard.pop().map(|entry| entry.action)
+    } else {
+        None
+    }
+}
+
+fn process_due(clock: AlarmClock) -> bool {
+    let mut progressed = false;
+    while let Some(action) = pop_due(clock) {
+        progressed = true;
+        match action {
+            AlarmAction::PollTask(weak_task) => {
+                if let Some(task) = weak_task.upgrade() {
+                    poll_timer(&task);
+                }
+            }
+            AlarmAction::WakePollSet(poll_set) => {
+                poll_set.wake();
+            }
+        }
+    }
+    progressed
 }

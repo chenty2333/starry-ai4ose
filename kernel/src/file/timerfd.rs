@@ -1,5 +1,6 @@
 use alloc::{borrow::Cow, sync::Arc};
 use core::{
+    convert::TryFrom,
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
     time::Duration,
@@ -9,18 +10,32 @@ use axerrno::AxError;
 use axhal::time::{monotonic_time, wall_time};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::future::{block_on, poll_io};
-use linux_raw_sys::general::CLOCK_MONOTONIC;
 use spin::Mutex;
 
 use crate::{
     file::{FileLike, IoDst, IoSrc},
-    task::register_pollset_alarm,
+    task::{AlarmClock, register_pollset_alarm},
 };
 
-fn get_clock(clockid: i32) -> Duration {
-    match clockid as u32 {
-        CLOCK_MONOTONIC => monotonic_time(),
-        _ => wall_time(),
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TimerClock {
+    Realtime,
+    Monotonic,
+}
+
+impl TimerClock {
+    fn now(self) -> Duration {
+        match self {
+            Self::Realtime => wall_time(),
+            Self::Monotonic => monotonic_time(),
+        }
+    }
+
+    fn alarm_clock(self) -> AlarmClock {
+        match self {
+            Self::Realtime => AlarmClock::Realtime,
+            Self::Monotonic => AlarmClock::Monotonic,
+        }
     }
 }
 
@@ -58,24 +73,33 @@ impl TimerFdInner {
         } else {
             // Repeating timer: count how many intervals have elapsed.
             let elapsed = now - next;
-            let count = 1 + elapsed.as_nanos() / self.interval.as_nanos();
-            self.expirations += count as u64;
-            self.next_expiration = Some(next + self.interval * count as u32);
+            let interval_nanos = self.interval.as_nanos();
+            let count = 1 + elapsed.as_nanos() / interval_nanos;
+            self.expirations = self
+                .expirations
+                .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+
+            let next_nanos = interval_nanos.saturating_mul(count);
+            let next_nanos = u64::try_from(next_nanos).unwrap_or(u64::MAX);
+            self.next_expiration = Some(
+                next.checked_add(Duration::from_nanos(next_nanos))
+                    .unwrap_or(Duration::MAX),
+            );
         }
     }
 }
 
 pub struct TimerFd {
-    clockid: i32,
+    clock: TimerClock,
     inner: Mutex<TimerFdInner>,
     non_blocking: AtomicBool,
     poll_rx: Arc<PollSet>,
 }
 
 impl TimerFd {
-    pub fn new(clockid: i32) -> Arc<Self> {
+    pub fn new(clock: TimerClock) -> Arc<Self> {
         Arc::new(Self {
-            clockid,
+            clock,
             inner: Mutex::new(TimerFdInner::new()),
             non_blocking: AtomicBool::new(false),
             poll_rx: Arc::default(),
@@ -90,7 +114,7 @@ impl TimerFd {
         value: Duration,
     ) -> (Duration, Duration) {
         let mut inner = self.inner.lock();
-        let now = get_clock(self.clockid);
+        let now = self.clock.now();
 
         // Capture old state before modifying.
         inner.update_expirations(now);
@@ -109,11 +133,15 @@ impl TimerFd {
             inner.next_expiration = None;
         } else {
             inner.interval = interval;
-            let deadline = if absolute { value } else { now + value };
+            let deadline = if absolute {
+                value
+            } else {
+                now.checked_add(value).unwrap_or(Duration::MAX)
+            };
             inner.next_expiration = Some(deadline);
 
             // Register with the alarm system so epoll/poll can be woken.
-            register_pollset_alarm(deadline, self.poll_rx.clone());
+            register_pollset_alarm(self.clock.alarm_clock(), deadline, self.poll_rx.clone());
         }
 
         (old_interval, old_value)
@@ -122,7 +150,7 @@ impl TimerFd {
     /// Returns the current (interval, time-until-next-expiration).
     pub fn gettime(&self) -> (Duration, Duration) {
         let mut inner = self.inner.lock();
-        let now = get_clock(self.clockid);
+        let now = self.clock.now();
         inner.update_expirations(now);
 
         let value = inner
@@ -145,7 +173,7 @@ impl FileLike for TimerFd {
 
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
             let mut inner = self.inner.lock();
-            let now = get_clock(self.clockid);
+            let now = self.clock.now();
             inner.update_expirations(now);
 
             if inner.expirations > 0 {
@@ -154,17 +182,12 @@ impl FileLike for TimerFd {
 
                 // If repeating, register the next alarm.
                 if let Some(deadline) = inner.next_expiration {
-                    register_pollset_alarm(deadline, self.poll_rx.clone());
+                    register_pollset_alarm(self.clock.alarm_clock(), deadline, self.poll_rx.clone());
                 }
 
                 dst.write(&count.to_ne_bytes())?;
                 Ok(size_of::<u64>())
             } else {
-                // Not yet expired. Register with alarm system for the deadline
-                // so we get woken when it fires.
-                if let Some(deadline) = inner.next_expiration {
-                    register_pollset_alarm(deadline, self.poll_rx.clone());
-                }
                 Err(AxError::WouldBlock)
             }
         }))
@@ -192,7 +215,7 @@ impl FileLike for TimerFd {
 impl Pollable for TimerFd {
     fn poll(&self) -> IoEvents {
         let mut inner = self.inner.lock();
-        let now = get_clock(self.clockid);
+        let now = self.clock.now();
         inner.update_expirations(now);
 
         let mut events = IoEvents::empty();
@@ -205,7 +228,7 @@ impl Pollable for TimerFd {
             self.poll_rx.register(context.waker());
             // Ensure we get woken when the timer fires.
             if let Some(deadline) = self.next_deadline() {
-                register_pollset_alarm(deadline, self.poll_rx.clone());
+                register_pollset_alarm(self.clock.alarm_clock(), deadline, self.poll_rx.clone());
             }
         }
     }
