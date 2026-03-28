@@ -21,7 +21,7 @@ use starry_process::Process;
 
 use crate::{
     file::FD_TABLE,
-    mm::Backend,
+    mm::{Backend, system_memory_stats},
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
@@ -30,20 +30,20 @@ use crate::{
 };
 
 fn real_meminfo() -> String {
-    let alloc = axalloc::global_allocator();
-    let total = alloc.used_bytes() + alloc.available_bytes();
-    let free = alloc.available_bytes();
-    let used = alloc.used_bytes();
-    let total_kb = total / 1024;
-    let free_kb = free / 1024;
-    let available_kb = free_kb;
-    let used_kb = used / 1024;
+    let stats = system_memory_stats();
+    let total_kb = stats.total_bytes / 1024;
+    let free_kb = stats.free_bytes / 1024;
+    let available_kb = stats.available_bytes / 1024;
+    let used_kb = stats.used_bytes / 1024;
+    let cached_kb = stats.cached_bytes / 1024;
+    let mapped_kb = stats.mapped_bytes / 1024;
+    let page_tables_kb = stats.page_table_bytes / 1024;
     format!(
         "MemTotal:       {total_kb:>8} kB\n\
          MemFree:        {free_kb:>8} kB\n\
          MemAvailable:   {available_kb:>8} kB\n\
          Buffers:               0 kB\n\
-         Cached:                0 kB\n\
+         Cached:         {cached_kb:>8} kB\n\
          SwapCached:            0 kB\n\
          Active:         {used_kb:>8} kB\n\
          Inactive:              0 kB\n\
@@ -52,15 +52,19 @@ fn real_meminfo() -> String {
          Dirty:                 0 kB\n\
          Writeback:             0 kB\n\
          AnonPages:             0 kB\n\
-         Mapped:                0 kB\n\
+         Mapped:         {mapped_kb:>8} kB\n\
          Shmem:                 0 kB\n\
          Slab:                  0 kB\n\
-         PageTables:            0 kB\n\
+         PageTables:     {page_tables_kb:>8} kB\n\
          CommitLimit:    {total_kb:>8} kB\n\
          Committed_AS:   {used_kb:>8} kB\n\
          VmallocTotal:          0 kB\n\
          VmallocUsed:           0 kB\n"
     )
+}
+
+fn is_shared_user_mapping(backend: &Backend) -> bool {
+    matches!(backend, Backend::Shared(_) | Backend::File(_) | Backend::Linear(_))
 }
 
 pub fn new_procfs() -> Filesystem {
@@ -250,7 +254,7 @@ impl SimpleDirOps for ThreadDir {
                     } else {
                         '-'
                     };
-                    let shared = matches!(area.backend(), Backend::Shared(_));
+                    let shared = is_shared_user_mapping(area.backend());
                     let p = if shared { 's' } else { 'p' };
                     let name = match area.backend() {
                         Backend::Shared(_) => " [shared]",

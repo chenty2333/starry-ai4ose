@@ -6,10 +6,11 @@
 
 use alloc::{format, vec};
 
-use axerrno::AxResult;
-use axfs::{FS_CONTEXT, OpenOptions};
+use axerrno::{AxError, AxResult};
+use axfs::{FS_CONTEXT, File, OpenOptions};
 use axhal::paging::MappingFlags;
 use axhal::uspace::UserContext;
+use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CORE};
 use memory_addr::PAGE_SIZE_4K;
 
 use super::Thread;
@@ -133,6 +134,24 @@ const fn align4(v: usize) -> usize {
     (v + 3) & !3
 }
 
+fn truncate_len(limit: usize, offset: usize, size: usize) -> usize {
+    limit.saturating_sub(offset).min(size)
+}
+
+fn write_limited(file: &File, offset: u64, data: &[u8], limit: usize) -> AxResult<usize> {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let mut written = 0;
+    let target = truncate_len(limit, start, data.len());
+    while written < target {
+        let len = file.write_at(&data[written..target], offset + written as u64)?;
+        if len == 0 {
+            return Err(AxError::WriteZero);
+        }
+        written += len;
+    }
+    Ok(written)
+}
+
 fn mapping_flags_to_elf(flags: MappingFlags) -> u32 {
     let mut pf = 0u32;
     if flags.contains(MappingFlags::READ) {
@@ -205,6 +224,16 @@ fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS + 1]) {
 pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResult<()> {
     let proc_data = &thr.proc_data;
     let pid = proc_data.proc.pid();
+    let core_limit = proc_data.rlim.read()[RLIMIT_CORE].current;
+    if core_limit == 0 {
+        info!("Skipping core dump for pid {pid}: RLIMIT_CORE=0");
+        return Ok(());
+    }
+    let core_limit = if core_limit == RLIM_INFINITY as u64 {
+        usize::MAX
+    } else {
+        core_limit.try_into().unwrap_or(usize::MAX)
+    };
     let path = format!("/tmp/core.{}", pid);
 
     let aspace = proc_data.aspace.lock();
@@ -294,7 +323,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     let mut offset = 0u64;
 
     // ---- Write ELF header ----
-    file.write_at(unsafe { as_bytes(&ehdr) }, offset)?;
+    write_limited(&file, offset, unsafe { as_bytes(&ehdr) }, core_limit)?;
     offset += EHDR_SIZE as u64;
 
     // ---- Write PT_NOTE program header ----
@@ -304,11 +333,11 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         p_offset: note_offset as u64,
         p_vaddr: 0,
         p_paddr: 0,
-        p_filesz: note_total as u64,
+        p_filesz: truncate_len(core_limit, note_offset, note_total) as u64,
         p_memsz: note_total as u64,
         p_align: 4,
     };
-    file.write_at(unsafe { as_bytes(&note_phdr) }, offset)?;
+    write_limited(&file, offset, unsafe { as_bytes(&note_phdr) }, core_limit)?;
     offset += PHDR_SIZE as u64;
 
     // ---- Write PT_LOAD program headers ----
@@ -320,11 +349,11 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
             p_offset: cur_load_offset as u64,
             p_vaddr: start.as_usize() as u64,
             p_paddr: 0,
-            p_filesz: size as u64,
+            p_filesz: truncate_len(core_limit, cur_load_offset, size) as u64,
             p_memsz: size as u64,
             p_align: PAGE_SIZE_4K as u64,
         };
-        file.write_at(unsafe { as_bytes(&phdr) }, offset)?;
+        write_limited(&file, offset, unsafe { as_bytes(&phdr) }, core_limit)?;
         offset += PHDR_SIZE as u64;
         cur_load_offset += size;
     }
@@ -336,31 +365,37 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         n_type: NT_PRSTATUS,
     };
     let mut note_off = note_offset as u64;
-    file.write_at(unsafe { as_bytes(&nhdr) }, note_off)?;
+    write_limited(&file, note_off, unsafe { as_bytes(&nhdr) }, core_limit)?;
     note_off += NHDR_SIZE as u64;
 
     // Write name + padding.
     let mut name_buf = [0u8; 8]; // name_aligned is at most 8
     name_buf[..note_name.len()].copy_from_slice(note_name);
-    file.write_at(&name_buf[..name_aligned], note_off)?;
+    write_limited(&file, note_off, &name_buf[..name_aligned], core_limit)?;
     note_off += name_aligned as u64;
 
     // Write prstatus descriptor.
-    file.write_at(unsafe { as_bytes(&prstatus) }, note_off)?;
+    write_limited(&file, note_off, unsafe { as_bytes(&prstatus) }, core_limit)?;
 
     // ---- Write LOAD segment data (memory contents) ----
     let mut file_offset = load_offset as u64;
     let mut buf = vec![0u8; PAGE_SIZE_4K];
     for &(start, size, _) in &areas {
+        if file_offset as usize >= core_limit {
+            break;
+        }
         let mut remaining = size;
         let mut vaddr = start;
         while remaining > 0 {
+            if file_offset as usize >= core_limit {
+                break;
+            }
             let chunk = remaining.min(PAGE_SIZE_4K);
             buf[..chunk].fill(0);
             // Read from the address space; unmapped pages stay as zeros.
             let _ = aspace.read(vaddr, &mut buf[..chunk]);
-            file.write_at(&buf[..chunk], file_offset)?;
-            file_offset += chunk as u64;
+            let written = write_limited(&file, file_offset, &buf[..chunk], core_limit)?;
+            file_offset += written as u64;
             vaddr += chunk;
             remaining -= chunk;
         }
@@ -368,6 +403,10 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
 
     drop(aspace);
 
-    info!("Core dump written to {path} ({file_offset} bytes)");
+    if file_offset as usize >= core_limit {
+        info!("Core dump written to {path} (truncated to {core_limit} bytes)");
+    } else {
+        info!("Core dump written to {path} ({file_offset} bytes)");
+    }
     Ok(())
 }

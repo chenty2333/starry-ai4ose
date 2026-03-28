@@ -10,7 +10,7 @@ use linux_raw_sys::{
 };
 use starry_vm::{VmMutPtr, vm_write_slice};
 
-use crate::task::processes;
+use crate::{mm::system_memory_stats, task::processes};
 
 pub fn sys_getuid() -> AxResult<isize> {
     Ok(0)
@@ -78,7 +78,11 @@ pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
 pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
     // FIXME: Zeroable
     let mut kinfo: sysinfo = unsafe { core::mem::zeroed() };
+    let stats = system_memory_stats();
     kinfo.procs = processes().len() as _;
+    kinfo.totalram = stats.total_bytes as _;
+    kinfo.freeram = stats.free_bytes as _;
+    kinfo.bufferram = stats.cached_bytes as _;
     kinfo.mem_unit = 1;
     info.vm_write(kinfo)?;
     Ok(0)
