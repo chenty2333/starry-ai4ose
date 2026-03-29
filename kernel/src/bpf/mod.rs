@@ -34,7 +34,7 @@ pub fn read_bpf_attr<T: bytemuck::AnyBitPattern>(
     let attr_size = attr_size as usize;
     let want = core::mem::size_of::<T>();
     if attr_size > BPF_ATTR_MAX_SIZE {
-        return Err(AxError::InvalidInput);
+        return Err(AxError::ArgumentListTooLong);
     }
 
     let copy_len = attr_size.min(want);
@@ -49,7 +49,7 @@ pub fn read_bpf_attr<T: bytemuck::AnyBitPattern>(
         let tail = starry_vm::vm_load(tail_ptr as *const u8, attr_size - want)
             .map_err(|_| AxError::BadAddress)?;
         if tail.iter().any(|&byte| byte != 0) {
-            return Err(AxError::InvalidInput);
+            return Err(AxError::ArgumentListTooLong);
         }
     }
     let mut buf = vec![0u8; want];
