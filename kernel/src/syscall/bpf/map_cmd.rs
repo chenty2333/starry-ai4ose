@@ -154,7 +154,6 @@ fn validate_map_elem_common(attr: &BpfAttrMapElem) -> AxResult<()> {
     if attr._pad0 != 0 {
         return Err(AxError::InvalidInput);
     }
-
     Ok(())
 }
 

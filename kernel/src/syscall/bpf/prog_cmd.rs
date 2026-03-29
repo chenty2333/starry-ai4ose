@@ -21,6 +21,10 @@ const BPF_PROG_TEST_RUN_MAX_TOTAL_CTX_BYTES: u64 = 4 * 1024 * 1024;
 const BPF_PROG_TEST_RUN_MAX_TOTAL_INSNS: u64 = BPF_MAX_EXEC_INSNS as u64;
 
 pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
+    require_bpf_attr_range::<BpfAttrProgLoad>(
+        attr_size,
+        offset_of!(BpfAttrProgLoad, kern_version) + size_of::<u32>(),
+    )?;
     let attr: BpfAttrProgLoad = read_bpf_attr(attr_ptr, attr_size)?;
     debug!(
         "bpf_prog_load: type={}, insn_cnt={}, log_level={}",
@@ -39,27 +43,21 @@ pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         .map_err(|_| AxError::BadAddress)?;
 
     // Read license string (for GPL check)
-    let license = if attr.license != 0 {
-        starry_vm::vm_load_until_nul(attr.license as *const u8).unwrap_or_default()
-    } else {
-        alloc::vec::Vec::new()
-    };
+    let license =
+        starry_vm::vm_load_until_nul(attr.license as *const u8).map_err(|_| AxError::BadAddress)?;
     let gpl_compatible = license_is_gpl(&license);
 
     // Run the verifier
-    let verified = verifier::verify_program(&insns, attr.prog_type, attr.log_level)?;
-
-    // Write verifier log to user buffer if requested
-    if attr.log_level > 0 && attr.log_buf != 0 && attr.log_size > 0 {
-        let log_bytes = verified.log.as_bytes();
-        let copy_len = log_bytes.len().min(attr.log_size as usize - 1);
-        if copy_len > 0 {
-            let _ = starry_vm::vm_write_slice(attr.log_buf as *mut u8, &log_bytes[..copy_len]);
-            // Null-terminate
-            let _ =
-                starry_vm::vm_write_slice((attr.log_buf as usize + copy_len) as *mut u8, &[0u8]);
+    let verified = match verifier::verify_program(&insns, attr.prog_type, attr.log_level) {
+        Ok(verified) => {
+            write_verifier_log(attr_ptr, attr_size, &attr, &verified.log)?;
+            verified
         }
-    }
+        Err(err) => {
+            write_verifier_log(attr_ptr, attr_size, &attr, &err.log)?;
+            return Err(err.err);
+        }
+    };
 
     // Create program object
     let prog_id = alloc_prog_id();
@@ -174,7 +172,8 @@ fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
         return Err(AxError::InvalidInput);
     }
 
-    if attr.prog_flags != 0
+    if attr.kern_version != 0
+        || attr.prog_flags != 0
         || attr.expected_attach_type != 0
         || attr.prog_ifindex != 0
         || attr.prog_btf_fd != 0
@@ -190,7 +189,20 @@ fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
         || attr.fd_array != 0
         || attr.core_relos != 0
         || attr.core_relo_rec_size != 0
+        || attr.prog_token_fd != 0
+        || attr.fd_array_cnt != 0
+        || attr.signature != 0
+        || attr.signature_size != 0
+        || attr.keyring_id != 0
     {
+        return Err(AxError::InvalidInput);
+    }
+
+    if attr.log_level == 0 {
+        if attr.log_buf != 0 || attr.log_size != 0 {
+            return Err(AxError::InvalidInput);
+        }
+    } else if attr.log_buf == 0 || attr.log_size == 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -249,4 +261,46 @@ fn validate_prog_test_run_attr(
 fn license_is_gpl(license: &[u8]) -> bool {
     let s = core::str::from_utf8(license).unwrap_or("");
     s.starts_with("GPL") || s.starts_with("Dual MIT/GPL") || s.starts_with("Dual BSD/GPL")
+}
+
+fn write_verifier_log(
+    attr_ptr: usize,
+    attr_size: u32,
+    attr: &BpfAttrProgLoad,
+    log: &str,
+) -> AxResult<()> {
+    let true_size = if attr.log_level == 0 {
+        0
+    } else {
+        log.len().saturating_add(1).min(u32::MAX as usize) as u32
+    };
+    let log_true_size_end =
+        offset_of!(BpfAttrProgLoad, log_true_size) + size_of::<u32>();
+    if (attr_size as usize) >= log_true_size_end {
+        write_bpf_attr_value::<BpfAttrProgLoad, _>(
+            attr_ptr,
+            attr_size,
+            offset_of!(BpfAttrProgLoad, log_true_size),
+            &true_size,
+        )?;
+    }
+
+    if attr.log_level == 0 {
+        return Ok(());
+    }
+
+    let log_bytes = log.as_bytes();
+    let copy_len = log_bytes.len().min(attr.log_size.saturating_sub(1) as usize);
+    if copy_len > 0 {
+        starry_vm::vm_write_slice(attr.log_buf as *mut u8, &log_bytes[..copy_len])
+            .map_err(|_| AxError::BadAddress)?;
+    }
+    starry_vm::vm_write_slice((attr.log_buf as usize + copy_len) as *mut u8, &[0u8])
+        .map_err(|_| AxError::BadAddress)?;
+
+    if true_size > attr.log_size {
+        return Err(AxError::StorageFull);
+    }
+
+    Ok(())
 }

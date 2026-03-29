@@ -150,6 +150,26 @@ pub struct VerifiedProgram {
     pub log: String,
 }
 
+/// Verification failure with optional log output.
+pub struct VerifierFailure {
+    pub err: AxError,
+    pub log: String,
+}
+
+macro_rules! try_with_log {
+    ($expr:expr, $log:ident) => {
+        match $expr {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(VerifierFailure {
+                    err,
+                    log: $log.buf,
+                });
+            }
+        }
+    };
+}
+
 /// Verify a BPF program.
 ///
 /// `insns` is the raw instruction stream from user space.
@@ -158,33 +178,39 @@ pub fn verify_program(
     insns: &[BpfInsn],
     prog_type: u32,
     log_level: u32,
-) -> AxResult<VerifiedProgram> {
+) -> Result<VerifiedProgram, VerifierFailure> {
     let mut log = VerifierLog::new(log_level > 0);
 
     if !uses_raw_ctx_prog_type(prog_type) {
         log.log("unsupported program type for current verifier/VM model");
-        return Err(AxError::InvalidInput);
+        return Err(VerifierFailure {
+            err: AxError::InvalidInput,
+            log: log.buf,
+        });
     }
 
     if insns.is_empty() || insns.len() > BPF_MAX_INSNS {
         log.log("program length out of range");
-        return Err(AxError::InvalidInput);
+        return Err(VerifierFailure {
+            err: AxError::InvalidInput,
+            log: log.buf,
+        });
     }
 
     // Pass 0: Decode raw instructions into a verifier/VM-shared shape.
-    let mut decoded_insns = decode_program(insns, &mut log)?;
+    let mut decoded_insns = try_with_log!(decode_program(insns, &mut log), log);
 
     // Pass 1: Structural validation.
-    pass_structural(insns, &decoded_insns, &mut log)?;
+    try_with_log!(pass_structural(insns, &decoded_insns, &mut log), log);
 
     // Pass 2: Resolve map fd references in LD_IMM_DW instructions.
-    let maps = pass_resolve_maps(&mut decoded_insns, &mut log)?;
+    let maps = try_with_log!(pass_resolve_maps(&mut decoded_insns, &mut log), log);
 
     // Pass 3: CFG / DAG check (no loops).
-    pass_cfg(insns, &decoded_insns, &mut log)?;
+    try_with_log!(pass_cfg(insns, &decoded_insns, &mut log), log);
 
     // Pass 4: Abstract interpretation (register state tracking).
-    pass_abstract_interp(insns, &decoded_insns, &mut log)?;
+    try_with_log!(pass_abstract_interp(insns, &decoded_insns, &mut log), log);
 
     Ok(VerifiedProgram {
         maps,

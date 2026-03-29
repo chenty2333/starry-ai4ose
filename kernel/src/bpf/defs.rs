@@ -281,6 +281,10 @@ pub struct BpfAttrMapCreate {
     pub btf_value_type_id: u32,
     pub btf_vmlinux_value_type_id: u32,
     pub map_extra: u64,
+    pub value_type_btf_obj_fd: i32,
+    pub map_token_fd: i32,
+    pub excl_prog_hash: u64,
+    pub excl_prog_hash_size: u32,
 }
 
 /// Attribute for `BPF_MAP_LOOKUP_ELEM`, `BPF_MAP_UPDATE_ELEM`,
