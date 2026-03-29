@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_MAP_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_PROG_ID: AtomicU32 = AtomicU32::new(1);
+const BPF_ATTR_MAX_SIZE: usize = 4096;
 
 pub fn alloc_map_id() -> u32 {
     NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed)
@@ -30,14 +31,27 @@ pub fn read_bpf_attr<T: bytemuck::AnyBitPattern>(
 
     use axerrno::AxError;
 
+    let attr_size = attr_size as usize;
     let want = core::mem::size_of::<T>();
-    let copy_len = (attr_size as usize).min(want);
+    if attr_size > BPF_ATTR_MAX_SIZE {
+        return Err(AxError::InvalidInput);
+    }
+
+    let copy_len = attr_size.min(want);
     if copy_len == 0 {
         return Err(AxError::InvalidInput);
     }
 
     let src =
         starry_vm::vm_load(attr_ptr as *const u8, copy_len).map_err(|_| AxError::BadAddress)?;
+    if attr_size > want {
+        let tail_ptr = attr_ptr.checked_add(want).ok_or(AxError::InvalidInput)?;
+        let tail = starry_vm::vm_load(tail_ptr as *const u8, attr_size - want)
+            .map_err(|_| AxError::BadAddress)?;
+        if tail.iter().any(|&byte| byte != 0) {
+            return Err(AxError::InvalidInput);
+        }
+    }
     let mut buf = vec![0u8; want];
     buf[..copy_len].copy_from_slice(&src);
     Ok(bytemuck::pod_read_unaligned(&buf))

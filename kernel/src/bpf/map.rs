@@ -152,9 +152,14 @@ impl BpfMap for ArrayMap {
         Some(data[range].to_vec())
     }
 
-    fn update(&self, key: &[u8], value: &[u8], _flags: u64) -> AxResult<()> {
+    fn update(&self, key: &[u8], value: &[u8], flags: u64) -> AxResult<()> {
         if self.frozen.load(Ordering::Acquire) {
             return Err(AxError::OperationNotPermitted);
+        }
+        match flags {
+            BPF_ANY | BPF_EXIST => {}
+            BPF_NOEXIST => return Err(AxError::AlreadyExists),
+            _ => return Err(AxError::InvalidInput),
         }
         let index = Self::key_to_index(key).ok_or(AxError::InvalidInput)?;
         let range = self.index_range(index).ok_or(AxError::InvalidInput)?;
@@ -167,21 +172,17 @@ impl BpfMap for ArrayMap {
     }
 
     fn delete(&self, key: &[u8]) -> AxResult<()> {
-        if self.frozen.load(Ordering::Acquire) {
-            return Err(AxError::OperationNotPermitted);
-        }
-        // Array maps: delete = zero the entry.
-        let index = Self::key_to_index(key).ok_or(AxError::InvalidInput)?;
-        let range = self.index_range(index).ok_or(AxError::InvalidInput)?;
-        let mut data = self.data.lock();
-        data[range].fill(0);
-        Ok(())
+        let _ = key;
+        Err(AxError::InvalidInput)
     }
 
     fn get_next_key(&self, key: Option<&[u8]>) -> Option<Vec<u8>> {
         let next = match key {
             None => 0u32,
-            Some(k) => Self::key_to_index(k)?.wrapping_add(1),
+            Some(k) => match Self::key_to_index(k) {
+                Some(index) if index < self.max_entries => index.wrapping_add(1),
+                _ => 0,
+            },
         };
         if next < self.max_entries {
             Some(next.to_ne_bytes().to_vec())
@@ -267,6 +268,9 @@ impl BpfMap for BpfHashMap {
             return Err(AxError::OperationNotPermitted);
         }
         if key.len() != self.key_size as usize || value.len() != self.value_size as usize {
+            return Err(AxError::InvalidInput);
+        }
+        if !matches!(flags, BPF_ANY | BPF_NOEXIST | BPF_EXIST) {
             return Err(AxError::InvalidInput);
         }
         let mut data = self.data.lock();
