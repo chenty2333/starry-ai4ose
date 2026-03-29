@@ -113,6 +113,26 @@ fn range_is_free(aspace: &AddrSpace, start: VirtAddr, size: usize, align: usize)
     aspace.find_free_area(start, size, limit, align) == Some(start)
 }
 
+fn validate_fixed_remap_dst(
+    aspace: &AddrSpace,
+    src: VirtAddr,
+    src_size: usize,
+    dst: VirtAddr,
+    dst_size: usize,
+) -> AxResult<()> {
+    let src_range =
+        VirtAddrRange::try_from_start_size(src, src_size).ok_or(AxError::InvalidInput)?;
+    let dst_range =
+        VirtAddrRange::try_from_start_size(dst, dst_size).ok_or(AxError::InvalidInput)?;
+    if src_range.overlaps(dst_range) {
+        return Err(AxError::InvalidInput);
+    }
+    if !aspace.contains_range(dst, dst_size) {
+        return Err(AxError::NoMemory);
+    }
+    Ok(())
+}
+
 fn map_relocated_segments(
     aspace: &mut AddrSpace,
     aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
@@ -436,12 +456,7 @@ pub fn sys_mremap(
             if !dst.is_aligned(page_size) {
                 return Err(AxError::InvalidInput);
             }
-            if dst == addr {
-                return Err(AxError::BadAddress);
-            }
-            if !aspace.contains_range(dst, new_size) {
-                return Err(AxError::NoMemory);
-            }
+            validate_fixed_remap_dst(&aspace, addr, new_size, dst, new_size)?;
             aspace.unmap(dst, new_size)?;
             dst
         } else {
@@ -510,16 +525,7 @@ pub fn sys_mremap(
 
     let dst = if fixed {
         let dst = VirtAddr::from(new_addr);
-        let old_range =
-            VirtAddrRange::try_from_start_size(addr, old_size).ok_or(AxError::InvalidInput)?;
-        let dst_range =
-            VirtAddrRange::try_from_start_size(dst, new_size).ok_or(AxError::InvalidInput)?;
-        if old_range.overlaps(dst_range) {
-            return Err(AxError::InvalidInput);
-        }
-        if !aspace.contains_range(dst, new_size) {
-            return Err(AxError::NoMemory);
-        }
+        validate_fixed_remap_dst(&aspace, addr, old_size, dst, new_size)?;
         dst
     } else {
         aspace
