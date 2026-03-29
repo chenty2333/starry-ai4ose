@@ -11,7 +11,7 @@ use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 
-use super::{defs::*, map::BpfMap};
+use super::{defs::*, helpers::HelperMemMask, map::BpfMap};
 use crate::file::{FileLike, bpf::BpfMapFd};
 
 // ---------------------------------------------------------------------------
@@ -448,7 +448,13 @@ fn pass_abstract_interp(
                     if insn.code & BPF_SRC_X != 0 {
                         check_reg_init(&regs, src, i, log)?;
                     }
-                    regs[dst] = RegState::scalar();
+                    if preserves_mem_ptr(insn, regs[dst].ty) {
+                        // Preserve pointer provenance for 64-bit add/sub by
+                        // an immediate. Runtime bounds checks still validate
+                        // the resulting address before any memory access.
+                    } else {
+                        regs[dst] = RegState::scalar();
+                    }
                 }
             }
             BPF_CLASS_LDX => {
@@ -577,68 +583,167 @@ fn verify_call(
     insn_idx: usize,
     log: &mut VerifierLog,
 ) -> AxResult<()> {
-    match helper_id {
-        BPF_FUNC_MAP_LOOKUP_ELEM => {
-            check_reg_init(regs, 1, insn_idx, log)?;
-            check_reg_init(regs, 2, insn_idx, log)?;
-            if regs[1].ty != RegType::MapPtr {
-                log.log(&alloc::format!(
-                    "insn {insn_idx}: map_lookup_elem R1 is not a map pointer"
-                ));
-                return Err(AxError::InvalidInput);
+    let Some(proto) = helper_proto(helper_id) else {
+        log.log(&alloc::format!(
+            "insn {insn_idx}: unknown helper function {helper_id}"
+        ));
+        return Err(AxError::InvalidInput);
+    };
+
+    for (arg_idx, arg_kind) in proto.args.iter().enumerate() {
+        let reg = arg_idx + 1;
+        match *arg_kind {
+            HelperArgKind::Unused => {}
+            HelperArgKind::Init => {
+                check_reg_init(regs, reg, insn_idx, log)?;
             }
-            clobber_caller_saved(regs);
-            regs[0] = RegState::map_value();
+            HelperArgKind::Scalar => {
+                check_reg_init(regs, reg, insn_idx, log)?;
+                if regs[reg].ty != RegType::Scalar {
+                    log.log(&alloc::format!(
+                        "insn {insn_idx}: helper arg R{reg} must be scalar"
+                    ));
+                    return Err(AxError::InvalidInput);
+                }
+            }
+            HelperArgKind::MapPtr => {
+                check_reg_init(regs, reg, insn_idx, log)?;
+                if regs[reg].ty != RegType::MapPtr {
+                    log.log(&alloc::format!(
+                        "insn {insn_idx}: helper arg R{reg} must be a map pointer"
+                    ));
+                    return Err(AxError::InvalidInput);
+                }
+            }
+            HelperArgKind::Mem(mask) => {
+                check_reg_init(regs, reg, insn_idx, log)?;
+                if !mem_ptr_allowed(regs[reg].ty, mask) {
+                    log.log(&alloc::format!(
+                        "insn {insn_idx}: helper arg R{reg} has invalid memory pointer type"
+                    ));
+                    return Err(AxError::InvalidInput);
+                }
+            }
         }
-        BPF_FUNC_MAP_UPDATE_ELEM => {
-            check_reg_init(regs, 1, insn_idx, log)?;
-            check_reg_init(regs, 2, insn_idx, log)?;
-            check_reg_init(regs, 3, insn_idx, log)?;
-            check_reg_init(regs, 4, insn_idx, log)?;
-            clobber_caller_saved(regs);
-            regs[0] = RegState::scalar();
-        }
-        BPF_FUNC_MAP_DELETE_ELEM => {
-            check_reg_init(regs, 1, insn_idx, log)?;
-            check_reg_init(regs, 2, insn_idx, log)?;
-            clobber_caller_saved(regs);
-            regs[0] = RegState::scalar();
-        }
+    }
+
+    clobber_caller_saved(regs);
+    regs[0] = match proto.ret {
+        HelperReturnKind::Scalar => RegState::scalar(),
+        HelperReturnKind::MapValuePtr => RegState::map_value(),
+    };
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum HelperArgKind {
+    Unused,
+    Init,
+    Scalar,
+    MapPtr,
+    Mem(HelperMemMask),
+}
+
+#[derive(Clone, Copy)]
+enum HelperReturnKind {
+    Scalar,
+    MapValuePtr,
+}
+
+#[derive(Clone, Copy)]
+struct HelperProto {
+    args: [HelperArgKind; 5],
+    ret: HelperReturnKind,
+}
+
+fn helper_proto(helper_id: u32) -> Option<HelperProto> {
+    let proto = match helper_id {
+        BPF_FUNC_MAP_LOOKUP_ELEM => HelperProto {
+            args: [
+                HelperArgKind::MapPtr,
+                HelperArgKind::Mem(HelperMemMask::READABLE),
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::MapValuePtr,
+        },
+        BPF_FUNC_MAP_UPDATE_ELEM => HelperProto {
+            args: [
+                HelperArgKind::MapPtr,
+                HelperArgKind::Mem(HelperMemMask::READABLE),
+                HelperArgKind::Mem(HelperMemMask::READABLE),
+                HelperArgKind::Scalar,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::Scalar,
+        },
+        BPF_FUNC_MAP_DELETE_ELEM => HelperProto {
+            args: [
+                HelperArgKind::MapPtr,
+                HelperArgKind::Mem(HelperMemMask::READABLE),
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::Scalar,
+        },
         BPF_FUNC_KTIME_GET_NS
         | BPF_FUNC_GET_PRANDOM_U32
         | BPF_FUNC_GET_SMP_PROCESSOR_ID
         | BPF_FUNC_GET_CURRENT_PID_TGID
-        | BPF_FUNC_GET_CURRENT_UID_GID => {
-            clobber_caller_saved(regs);
-            regs[0] = RegState::scalar();
-        }
-        BPF_FUNC_GET_CURRENT_COMM => {
-            check_reg_init(regs, 1, insn_idx, log)?;
-            check_reg_init(regs, 2, insn_idx, log)?;
-            clobber_caller_saved(regs);
-            regs[0] = RegState::scalar();
-        }
-        BPF_FUNC_TRACE_PRINTK => {
-            check_reg_init(regs, 1, insn_idx, log)?;
-            check_reg_init(regs, 2, insn_idx, log)?;
-            clobber_caller_saved(regs);
-            regs[0] = RegState::scalar();
-        }
-        BPF_FUNC_PROBE_READ => {
-            check_reg_init(regs, 1, insn_idx, log)?;
-            check_reg_init(regs, 2, insn_idx, log)?;
-            check_reg_init(regs, 3, insn_idx, log)?;
-            clobber_caller_saved(regs);
-            regs[0] = RegState::scalar();
-        }
-        _ => {
-            log.log(&alloc::format!(
-                "insn {insn_idx}: unknown helper function {helper_id}"
-            ));
-            return Err(AxError::InvalidInput);
-        }
+        | BPF_FUNC_GET_CURRENT_UID_GID => HelperProto {
+            args: [
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::Scalar,
+        },
+        BPF_FUNC_GET_CURRENT_COMM => HelperProto {
+            args: [
+                HelperArgKind::Mem(HelperMemMask::WRITABLE),
+                HelperArgKind::Scalar,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::Scalar,
+        },
+        BPF_FUNC_TRACE_PRINTK => HelperProto {
+            args: [
+                HelperArgKind::Mem(HelperMemMask::READABLE),
+                HelperArgKind::Scalar,
+                HelperArgKind::Init,
+                HelperArgKind::Init,
+                HelperArgKind::Init,
+            ],
+            ret: HelperReturnKind::Scalar,
+        },
+        _ => return None,
+    };
+    Some(proto)
+}
+
+fn mem_ptr_allowed(reg_ty: RegType, mask: HelperMemMask) -> bool {
+    match reg_ty {
+        RegType::StackPtr => mask.contains(HelperMemMask::STACK),
+        RegType::CtxPtr => mask.contains(HelperMemMask::CTX),
+        RegType::MapValuePtr => mask.contains(HelperMemMask::MAP_VALUE),
+        _ => false,
     }
-    Ok(())
+}
+
+fn preserves_mem_ptr(insn: &BpfInsn, reg_ty: RegType) -> bool {
+    insn.class() == BPF_CLASS_ALU64
+        && (insn.code & BPF_SRC_X) == 0
+        && matches!(insn.op(), BPF_OP_ADD | BPF_OP_SUB)
+        && matches!(
+            reg_ty,
+            RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr
+        )
 }
 
 fn clobber_caller_saved(regs: &mut [RegState; BPF_MAX_REGS]) {

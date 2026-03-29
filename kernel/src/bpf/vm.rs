@@ -10,7 +10,7 @@ use axerrno::{AxError, AxResult};
 
 use super::{
     defs::*,
-    helpers::{self, HelperContext},
+    helpers::{self, HelperContext, MapValueRegion},
     map::BpfMap,
 };
 
@@ -22,8 +22,8 @@ pub struct BpfVm<'a> {
     decoded_insns: &'a [BpfInsnAux],
     pc: usize,
     maps: &'a [Arc<dyn BpfMap>],
-    /// Scratch buffer for helper return values (e.g., map_lookup_elem).
-    scratch: Vec<u8>,
+    /// Stable regions backing pointers returned by map lookup helpers.
+    map_value_regions: Vec<MapValueRegion>,
     /// Context buffer base address and size.
     ctx_base: u64,
     ctx_size: usize,
@@ -42,7 +42,7 @@ impl<'a> BpfVm<'a> {
             decoded_insns,
             pc: 0,
             maps,
-            scratch: Vec::new(),
+            map_value_regions: Vec::new(),
             ctx_base: 0,
             ctx_size: 0,
         }
@@ -55,7 +55,7 @@ impl<'a> BpfVm<'a> {
         // Set up initial state
         self.regs = [0; BPF_MAX_REGS];
         self.pc = 0;
-        self.scratch.clear();
+        self.map_value_regions.clear();
 
         let stack_top = self.stack.as_ptr() as u64 + BPF_STACK_SIZE as u64;
         self.regs[1] = ctx.as_ptr() as u64; // R1 = context pointer
@@ -248,8 +248,8 @@ impl<'a> BpfVm<'a> {
             let helper_id = insn.imm as u32;
             let mut hctx = HelperContext {
                 maps: self.maps,
-                scratch: &mut self.scratch,
-                stack_base: self.stack.as_ptr() as u64,
+                map_value_regions: &mut self.map_value_regions,
+                stack: &mut self.stack,
                 ctx_base: self.ctx_base,
                 ctx_size: self.ctx_size,
             };
@@ -500,12 +500,10 @@ impl<'a> BpfVm<'a> {
             return Ok(unsafe { core::ptr::read_unaligned(ptr as *const T) });
         }
 
-        // Check scratch buffer (map value pointers)
-        if !self.scratch.is_empty() {
-            let scratch_base = self.scratch.as_ptr() as usize;
-            let scratch_end = scratch_base + self.scratch.len();
-            if ptr >= scratch_base && ptr + size <= scratch_end {
-                return Ok(unsafe { core::ptr::read_unaligned(ptr as *const T) });
+        // Check helper-managed map value regions.
+        for region in &self.map_value_regions {
+            if let Some(bytes) = region.read_bytes(ptr, size) {
+                return Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) });
             }
         }
 
@@ -527,14 +525,10 @@ impl<'a> BpfVm<'a> {
             return Ok(());
         }
 
-        // Check scratch buffer (map value pointers are writable)
-        if !self.scratch.is_empty() {
-            let scratch_base = self.scratch.as_ptr() as usize;
-            let scratch_end = scratch_base + self.scratch.len();
-            if ptr >= scratch_base && ptr + size <= scratch_end {
-                unsafe {
-                    core::ptr::write_unaligned(ptr as *mut T, val);
-                }
+        let bytes = unsafe { core::slice::from_raw_parts((&val as *const T) as *const u8, size) };
+        for region in &mut self.map_value_regions {
+            if region.contains_range(ptr, size) {
+                region.write_bytes(ptr, bytes)?;
                 return Ok(());
             }
         }
