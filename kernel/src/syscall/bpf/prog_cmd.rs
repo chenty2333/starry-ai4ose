@@ -19,6 +19,7 @@ use crate::{
 
 const BPF_PROG_TEST_RUN_MAX_TOTAL_CTX_BYTES: u64 = 4 * 1024 * 1024;
 const BPF_PROG_TEST_RUN_MAX_TOTAL_INSNS: u64 = BPF_MAX_EXEC_INSNS as u64;
+const BPF_PROG_TEST_RUN_MAX_TOTAL_AUX_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
     require_bpf_attr_range::<BpfAttrProgLoad>(
@@ -95,7 +96,7 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         .iter()
         .filter(|aux| !aux.is_continuation())
         .count();
-    let repeat = validate_prog_test_run_attr(&attr, prog.prog_type, exec_insn_cnt)?;
+    let repeat = validate_prog_test_run_attr(&attr, prog, exec_insn_cnt)?;
 
     // Read context from user space (if provided)
     let ctx_size = attr.ctx_size_in as usize;
@@ -109,13 +110,20 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
     // Run the program
     let mut retval = 0u64;
     let start = axhal::time::monotonic_time_nanos();
+    let mut aux_budget_remaining = BPF_PROG_TEST_RUN_MAX_TOTAL_AUX_BYTES;
 
     for iter in 0..repeat {
         if iter != 0 && !ctx.is_empty() {
             ctx.copy_from_slice(&ctx_template);
         }
-        let mut vm = BpfVm::new(&prog.insns, &prog.decoded_insns, &prog.maps);
+        let mut vm = BpfVm::with_aux_budget(
+            &prog.insns,
+            &prog.decoded_insns,
+            &prog.maps,
+            aux_budget_remaining,
+        );
         retval = vm.execute(&mut ctx)?;
+        aux_budget_remaining = vm.remaining_aux_budget();
     }
 
     let duration = axhal::time::monotonic_time_nanos()
@@ -211,9 +219,10 @@ fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
 
 fn validate_prog_test_run_attr(
     attr: &BpfAttrTestRun,
-    prog_type: u32,
+    prog: &BpfProgram,
     insn_cnt: usize,
 ) -> AxResult<u32> {
+    let prog_type = prog.prog_type;
     if !uses_raw_ctx_prog_type(prog_type) {
         return Err(AxError::InvalidInput);
     }

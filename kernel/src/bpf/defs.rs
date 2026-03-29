@@ -330,6 +330,11 @@ pub struct BpfAttrProgLoad {
     pub core_relos: u64,
     pub core_relo_rec_size: u32,
     pub log_true_size: u32,
+    pub prog_token_fd: i32,
+    pub fd_array_cnt: u32,
+    pub signature: u64,
+    pub signature_size: u32,
+    pub keyring_id: i32,
 }
 
 /// Attribute for `BPF_PROG_TEST_RUN`.

@@ -27,6 +27,8 @@ pub struct BpfVm<'a> {
     /// Context buffer base address and size.
     ctx_base: u64,
     ctx_size: usize,
+    /// Remaining auxiliary copy/allocation budget for this execution.
+    aux_budget_remaining: u64,
 }
 
 impl<'a> BpfVm<'a> {
@@ -45,7 +47,23 @@ impl<'a> BpfVm<'a> {
             map_value_regions: Vec::new(),
             ctx_base: 0,
             ctx_size: 0,
+            aux_budget_remaining: u64::MAX,
         }
+    }
+
+    pub fn with_aux_budget(
+        insns: &'a [BpfInsn],
+        decoded_insns: &'a [BpfInsnAux],
+        maps: &'a [Arc<dyn BpfMap>],
+        aux_budget_remaining: u64,
+    ) -> Self {
+        let mut vm = Self::new(insns, decoded_insns, maps);
+        vm.aux_budget_remaining = aux_budget_remaining;
+        vm
+    }
+
+    pub fn remaining_aux_budget(&self) -> u64 {
+        self.aux_budget_remaining
     }
 
     /// Execute the BPF program with the given context buffer.
@@ -252,6 +270,7 @@ impl<'a> BpfVm<'a> {
                 stack: &mut self.stack,
                 ctx_base: self.ctx_base,
                 ctx_size: self.ctx_size,
+                aux_budget_remaining: &mut self.aux_budget_remaining,
             };
             self.regs[0] = helpers::call_helper(
                 helper_id,
@@ -261,7 +280,7 @@ impl<'a> BpfVm<'a> {
                 self.regs[4],
                 self.regs[5],
                 &mut hctx,
-            );
+            )?;
             self.pc += 1;
             return Ok(None);
         }
@@ -501,6 +520,7 @@ impl<'a> BpfVm<'a> {
         // Check helper-managed map value regions.
         for region in &self.map_value_regions {
             if let Some(bytes) = region.read_bytes(ptr, size) {
+                helpers::charge_aux_budget(&mut self.aux_budget_remaining, bytes.len())?;
                 return Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) });
             }
         }
@@ -525,7 +545,7 @@ impl<'a> BpfVm<'a> {
         let bytes = unsafe { core::slice::from_raw_parts((&val as *const T) as *const u8, size) };
         for region in &mut self.map_value_regions {
             if region.contains_range(ptr, size) {
-                region.write_bytes(ptr, bytes)?;
+                region.write_bytes(ptr, bytes, &mut self.aux_budget_remaining)?;
                 return Ok(());
             }
         }

@@ -30,6 +30,15 @@ impl HelperMemMask {
     }
 }
 
+pub fn charge_aux_budget(remaining: &mut u64, bytes: usize) -> AxResult<()> {
+    let bytes = bytes as u64;
+    if *remaining < bytes {
+        return Err(AxError::ResourceBusy);
+    }
+    *remaining -= bytes;
+    Ok(())
+}
+
 /// Stable VM region backing a pointer returned by `bpf_map_lookup_elem`.
 pub struct MapValueRegion {
     map: Arc<dyn BpfMap>,
@@ -75,11 +84,17 @@ impl MapValueRegion {
         Some(self.data[range].to_vec())
     }
 
-    pub fn write_bytes(&mut self, ptr: usize, bytes: &[u8]) -> AxResult<()> {
+    pub fn write_bytes(
+        &mut self,
+        ptr: usize,
+        bytes: &[u8],
+        aux_budget_remaining: &mut u64,
+    ) -> AxResult<()> {
         let range = self
             .range_for(ptr, bytes.len())
             .ok_or(AxError::BadAddress)?;
         self.data[range].copy_from_slice(bytes);
+        charge_aux_budget(aux_budget_remaining, self.key.len() + self.data.len())?;
         self.map.update(&self.key, &self.data, BPF_ANY)
     }
 }
@@ -97,6 +112,8 @@ pub struct HelperContext<'a> {
     pub ctx_base: u64,
     /// Size of the context buffer.
     pub ctx_size: usize,
+    /// Remaining auxiliary copy/allocation budget for this execution.
+    pub aux_budget_remaining: &'a mut u64,
 }
 
 impl<'a> HelperContext<'a> {
@@ -104,7 +121,7 @@ impl<'a> HelperContext<'a> {
         self.maps.get(map_idx as usize)
     }
 
-    pub fn read_bytes(&self, ptr: u64, len: usize, allowed: HelperMemMask) -> AxResult<Vec<u8>> {
+    pub fn read_bytes(&mut self, ptr: u64, len: usize, allowed: HelperMemMask) -> AxResult<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -112,16 +129,19 @@ impl<'a> HelperContext<'a> {
         let ptr = ptr as usize;
         if allowed.contains(HelperMemMask::STACK) {
             if let Some(bytes) = self.read_stack_bytes(ptr, len) {
+                charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
                 return Ok(bytes);
             }
         }
         if allowed.contains(HelperMemMask::CTX) {
             if let Some(bytes) = self.read_ctx_bytes(ptr, len) {
+                charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
                 return Ok(bytes);
             }
         }
         if allowed.contains(HelperMemMask::MAP_VALUE) {
             if let Some(bytes) = self.read_map_value_bytes(ptr, len) {
+                charge_aux_budget(self.aux_budget_remaining, bytes.len())?;
                 return Ok(bytes);
             }
         }
@@ -217,7 +237,7 @@ impl<'a> HelperContext<'a> {
     fn write_map_value_bytes(&mut self, ptr: usize, bytes: &[u8]) -> AxResult<bool> {
         for region in self.map_value_regions.iter_mut() {
             if region.range_for(ptr, bytes.len()).is_some() {
-                region.write_bytes(ptr, bytes)?;
+                region.write_bytes(ptr, bytes, self.aux_budget_remaining)?;
                 return Ok(true);
             }
         }
@@ -236,19 +256,19 @@ pub fn call_helper(
     r4: u64,
     r5: u64,
     hctx: &mut HelperContext,
-) -> u64 {
+) -> AxResult<u64> {
     match helper_id {
         BPF_FUNC_MAP_LOOKUP_ELEM => helper_map_lookup_elem(r1, r2, hctx),
         BPF_FUNC_MAP_UPDATE_ELEM => helper_map_update_elem(r1, r2, r3, r4, hctx),
         BPF_FUNC_MAP_DELETE_ELEM => helper_map_delete_elem(r1, r2, hctx),
-        BPF_FUNC_KTIME_GET_NS => monotonic_time_nanos() as u64,
-        BPF_FUNC_GET_CURRENT_PID_TGID => helper_get_current_pid_tgid(),
-        BPF_FUNC_GET_CURRENT_UID_GID => helper_get_current_uid_gid(),
+        BPF_FUNC_KTIME_GET_NS => Ok(monotonic_time_nanos() as u64),
+        BPF_FUNC_GET_CURRENT_PID_TGID => Ok(helper_get_current_pid_tgid()),
+        BPF_FUNC_GET_CURRENT_UID_GID => Ok(helper_get_current_uid_gid()),
         BPF_FUNC_GET_CURRENT_COMM => helper_get_current_comm(r1, r2, hctx),
         BPF_FUNC_TRACE_PRINTK => helper_trace_printk(r1, r2, r3, r4, r5, hctx),
-        BPF_FUNC_GET_PRANDOM_U32 => helper_get_prandom_u32(),
-        BPF_FUNC_GET_SMP_PROCESSOR_ID => 0, // unikernel: always CPU 0
-        _ => helper_error(),
+        BPF_FUNC_GET_PRANDOM_U32 => Ok(helper_get_prandom_u32()),
+        BPF_FUNC_GET_SMP_PROCESSOR_ID => Ok(0), // unikernel: always CPU 0
+        _ => Ok(helper_error()),
     }
 }
 
@@ -256,19 +276,22 @@ pub fn call_helper(
 // Map helpers
 // ---------------------------------------------------------------------------
 
-fn helper_map_lookup_elem(map_idx: u64, key_ptr: u64, hctx: &mut HelperContext) -> u64 {
+fn helper_map_lookup_elem(map_idx: u64, key_ptr: u64, hctx: &mut HelperContext) -> AxResult<u64> {
     let Some(map) = hctx.map(map_idx).cloned() else {
-        return 0;
+        return Ok(0);
     };
 
     let key_size = map.key_size() as usize;
     let Ok(key) = hctx.read_bytes(key_ptr, key_size, HelperMemMask::READABLE) else {
-        return 0;
+        return Ok(0);
     };
 
     match map.lookup(&key) {
-        Some(value) => hctx.push_map_value_region(map, key, value),
-        None => 0,
+        Some(value) => {
+            charge_aux_budget(hctx.aux_budget_remaining, value.len())?;
+            Ok(hctx.push_map_value_region(map, key, value))
+        }
+        None => Ok(0),
     }
 }
 
@@ -278,45 +301,46 @@ fn helper_map_update_elem(
     value_ptr: u64,
     flags: u64,
     hctx: &mut HelperContext,
-) -> u64 {
+) -> AxResult<u64> {
     let Some(map) = hctx.map(map_idx) else {
-        return helper_error();
+        return Ok(helper_error());
     };
 
     let key_size = map.key_size() as usize;
     let value_size = map.value_size() as usize;
     let Ok(key) = hctx.read_bytes(key_ptr, key_size, HelperMemMask::READABLE) else {
-        return helper_error();
+        return Ok(helper_error());
     };
     let Ok(value) = hctx.read_bytes(value_ptr, value_size, HelperMemMask::READABLE) else {
-        return helper_error();
+        return Ok(helper_error());
     };
+    charge_aux_budget(hctx.aux_budget_remaining, key.len() + value.len())?;
 
     match map.update(&key, &value, flags) {
         Ok(()) => {
             hctx.invalidate_all_map_value_regions();
-            0
+            Ok(0)
         }
-        Err(_) => helper_error(),
+        Err(_) => Ok(helper_error()),
     }
 }
 
-fn helper_map_delete_elem(map_idx: u64, key_ptr: u64, hctx: &mut HelperContext) -> u64 {
+fn helper_map_delete_elem(map_idx: u64, key_ptr: u64, hctx: &mut HelperContext) -> AxResult<u64> {
     let Some(map) = hctx.map(map_idx) else {
-        return helper_error();
+        return Ok(helper_error());
     };
 
     let key_size = map.key_size() as usize;
     let Ok(key) = hctx.read_bytes(key_ptr, key_size, HelperMemMask::READABLE) else {
-        return helper_error();
+        return Ok(helper_error());
     };
 
     match map.delete(&key) {
         Ok(()) => {
             hctx.invalidate_all_map_value_regions();
-            0
+            Ok(0)
         }
-        Err(_) => helper_error(),
+        Err(_) => Ok(helper_error()),
     }
 }
 
@@ -340,13 +364,14 @@ fn helper_get_current_uid_gid() -> u64 {
     0
 }
 
-fn helper_get_current_comm(buf_ptr: u64, buf_size: u64, hctx: &mut HelperContext) -> u64 {
+fn helper_get_current_comm(buf_ptr: u64, buf_size: u64, hctx: &mut HelperContext) -> AxResult<u64> {
     let curr = current();
     let name = curr.name();
     let name_bytes = name.as_bytes();
 
     let out_size = (buf_size as usize).min(16); // TASK_COMM_LEN = 16
     let copy_len = name_bytes.len().min(out_size.saturating_sub(1));
+    charge_aux_budget(hctx.aux_budget_remaining, out_size)?;
     let mut out = vec![0u8; out_size];
     out[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
@@ -354,10 +379,10 @@ fn helper_get_current_comm(buf_ptr: u64, buf_size: u64, hctx: &mut HelperContext
         .write_bytes(buf_ptr, &out, HelperMemMask::WRITABLE)
         .is_err()
     {
-        return helper_error();
+        return Ok(helper_error());
     }
 
-    0
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,20 +396,20 @@ fn helper_trace_printk(
     arg2: u64,
     arg3: u64,
     hctx: &mut HelperContext,
-) -> u64 {
+) -> AxResult<u64> {
     let fmt_len = (fmt_size as usize).min(256);
     if fmt_len > 0
         && hctx
             .read_bytes(fmt_ptr, fmt_len, HelperMemMask::READABLE)
             .is_err()
     {
-        return helper_error();
+        return Ok(helper_error());
     }
 
     // Simplified: just print the arguments since parsing format strings from
     // BPF memory is complex and error-prone.
     warn!("bpf_trace_printk: arg1={arg1:#x}, arg2={arg2:#x}, arg3={arg3:#x}");
-    0
+    Ok(0)
 }
 
 fn helper_get_prandom_u32() -> u64 {
