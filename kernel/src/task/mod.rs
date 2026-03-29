@@ -312,6 +312,9 @@ pub struct ProcessData {
     exec_ctl: SpinNoIrq<ExecControlState>,
     /// Woken when threads should resume from stopped state.
     pub stop_event: Arc<PollSet>,
+
+    /// The network namespace (network stack) for this process.
+    pub net_ns: Arc<axnet::NetStack>,
 }
 
 impl ProcessData {
@@ -323,6 +326,7 @@ impl ProcessData {
         aspace: Arc<Mutex<AddrSpace>>,
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
         exit_signal: Option<Signo>,
+        net_ns: Arc<axnet::NetStack>,
     ) -> Arc<Self> {
         Arc::new(Self {
             proc,
@@ -351,6 +355,8 @@ impl ProcessData {
             job_ctl: SpinNoIrq::new(JobControlState::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
             stop_event: Arc::default(),
+
+            net_ns,
         })
     }
 

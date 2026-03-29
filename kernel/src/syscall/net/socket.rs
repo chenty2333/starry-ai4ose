@@ -28,18 +28,19 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     let ty = raw_ty & 0xFF;
 
     let pid = current().as_thread().proc_data.proc.pid();
+    let net_ns = current().as_thread().proc_data.net_ns.clone();
     let socket = match (domain, ty) {
         (AF_INET, SOCK_STREAM) => {
             if proto != 0 && proto != IPPROTO_TCP as _ {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
-            SocketInner::Tcp(TcpSocket::new())
+            SocketInner::Tcp(TcpSocket::new(net_ns))
         }
         (AF_INET, SOCK_DGRAM) => {
             if proto != 0 && proto != IPPROTO_UDP as _ {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
-            SocketInner::Udp(UdpSocket::new())
+            SocketInner::Udp(UdpSocket::new(net_ns))
         }
         (AF_UNIX, SOCK_STREAM) => SocketInner::Unix(UnixSocket::new(StreamTransport::new(pid))),
         (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new(pid))),
