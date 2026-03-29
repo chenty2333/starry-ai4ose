@@ -42,6 +42,9 @@ pub struct TcpSocket {
     poll_rx_closed: PollSet,
 }
 
+// SAFETY: All access to the underlying smoltcp socket goes through
+// `SocketSetWrapper`'s mutex, so shared references to `TcpSocket` do not allow
+// concurrent unsynchronized access to the socket state.
 unsafe impl Sync for TcpSocket {}
 
 impl TcpSocket {
@@ -70,14 +73,9 @@ impl TcpSocket {
             rx_closed: AtomicBool::new(false),
             poll_rx_closed: PollSet::new(),
         };
-        result.with_smol_socket(|socket| {
-            result.general.set_device_mask(
-                result
-                    .stack
-                    .get_service()
-                    .device_mask_for(&socket.get_bound_endpoint()),
-            );
-        });
+        let bound_endpoint = result.with_smol_socket(|socket| socket.get_bound_endpoint());
+        let device_mask = result.stack.get_service().device_mask_for(&bound_endpoint);
+        result.general.set_device_mask(device_mask);
         result
     }
 }
@@ -97,6 +95,13 @@ impl TcpSocket {
         self.stack
             .socket_set
             .with_socket_mut::<smol::Socket, _, _>(self.handle, f)
+    }
+
+    fn with_service_and_smol_socket<R>(
+        &self,
+        f: impl FnOnce(&mut crate::service::Service, &mut smol::Socket) -> R,
+    ) -> R {
+        self.stack.with_service_and_socket_mut(self.handle, f)
     }
 
     fn bound_endpoint(&self) -> AxResult<IpListenEndpoint> {
@@ -227,24 +232,24 @@ impl SocketOps for TcpSocket {
                         .socket_set
                         .bind_check(local_addr.ip().into(), local_addr.port())?;
                 }
+                let endpoint = IpListenEndpoint {
+                    addr: if local_addr.ip().is_unspecified() {
+                        None
+                    } else {
+                        Some(local_addr.ip().into())
+                    },
+                    port: local_addr.port(),
+                };
+                let device_mask = self.stack.get_service().device_mask_for(&endpoint);
 
                 self.with_smol_socket(|socket| {
                     if socket.get_bound_endpoint().port != 0 {
                         return Err(AxError::InvalidInput);
                     }
-                    let endpoint = IpListenEndpoint {
-                        addr: if local_addr.ip().is_unspecified() {
-                            None
-                        } else {
-                            Some(local_addr.ip().into())
-                        },
-                        port: local_addr.port(),
-                    };
                     socket.set_bound_endpoint(endpoint);
-                    self.general
-                        .set_device_mask(self.stack.get_service().device_mask_for(&endpoint));
                     Ok(())
                 })?;
+                self.general.set_device_mask(device_mask);
                 debug!("TCP socket {}: binding to {}", self.handle, local_addr);
                 Ok(())
             })
@@ -267,12 +272,12 @@ impl SocketOps for TcpSocket {
                 let remote_endpoint = IpEndpoint::from(remote_addr);
                 let mut bound_endpoint =
                     self.with_smol_socket(|socket| socket.get_bound_endpoint());
+                let outbound = self
+                    .stack
+                    .get_service()
+                    .resolve_outbound(&remote_endpoint.addr, bound_endpoint.addr)?;
                 if bound_endpoint.addr.is_none() {
-                    bound_endpoint.addr = Some(
-                        self.stack
-                            .get_service()
-                            .get_source_address(&remote_endpoint.addr)?,
-                    );
+                    bound_endpoint.addr = Some(outbound.src_addr);
                 }
                 if bound_endpoint.port == 0 {
                     bound_endpoint.port = self.stack.tcp_ephemeral_port()?;
@@ -282,19 +287,10 @@ impl SocketOps for TcpSocket {
                     bound_endpoint, remote_endpoint
                 );
 
-                self.with_smol_socket(|socket| {
+                self.with_service_and_smol_socket(|service, socket| {
                     socket.set_bound_endpoint(bound_endpoint);
-                    self.general.set_device_mask(
-                        self.stack
-                            .get_service()
-                            .device_mask_for(&bound_endpoint),
-                    );
                     socket
-                        .connect(
-                            self.stack.get_service().iface.context(),
-                            remote_endpoint,
-                            bound_endpoint,
-                        )
+                        .connect(service.iface.context(), remote_endpoint, bound_endpoint)
                         .map_err(|e| match e {
                             smol::ConnectError::InvalidState => {
                                 ax_err_type!(AlreadyConnected)
@@ -303,11 +299,14 @@ impl SocketOps for TcpSocket {
                                 ax_err_type!(ConnectionRefused, "unaddressable")
                             }
                         })?;
-                    Ok(())
-                })
+                    Ok::<(), AxError>(())
+                })?;
+                self.general.set_device_mask(outbound.device_mask);
+                Ok(())
             })?;
 
-        // Hack: let the server listen
+        // Yield once so a newly started listener can run before we poll the
+        // connection state.
         axtask::yield_now();
 
         // Here our state must be `CONNECTING`, and only one thread can run here.

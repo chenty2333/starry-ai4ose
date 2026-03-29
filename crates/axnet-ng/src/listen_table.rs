@@ -67,7 +67,7 @@ impl ListenTable {
         self.tcp[port as usize].lock().is_none()
     }
 
-    pub fn listen(
+    pub(crate) fn listen(
         &self,
         listen_endpoint: IpListenEndpoint,
         socket_set: &Arc<SocketSetWrapper<'static>>,
@@ -96,7 +96,7 @@ impl ListenTable {
         self.tcp[port as usize].clone()
     }
 
-    pub fn can_accept(&self, port: u16, socket_set: &SocketSetWrapper) -> AxResult<bool> {
+    pub(crate) fn can_accept(&self, port: u16, socket_set: &SocketSetWrapper) -> AxResult<bool> {
         if let Some(entry) = self.listen_entry(port).lock().as_ref() {
             Ok(entry
                 .syn_queue
@@ -108,7 +108,11 @@ impl ListenTable {
         }
     }
 
-    pub fn accept(&self, port: u16, socket_set: &SocketSetWrapper) -> AxResult<SocketHandle> {
+    pub(crate) fn accept(
+        &self,
+        port: u16,
+        socket_set: &SocketSetWrapper,
+    ) -> AxResult<SocketHandle> {
         let entry = self.listen_entry(port);
         let mut table = entry.lock();
         let Some(entry) = table.deref_mut() else {

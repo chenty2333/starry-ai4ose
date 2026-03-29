@@ -235,7 +235,11 @@ impl TransportOps for DgramTransport {
             };
             let count = dst.write(&data)?;
             if count < data.len() {
-                warn!("UDP message truncated: {} -> {} bytes", data.len(), count);
+                warn!(
+                    "Unix datagram message truncated: {} -> {} bytes",
+                    data.len(),
+                    count
+                );
             }
 
             if let Some(from) = options.from.as_mut() {

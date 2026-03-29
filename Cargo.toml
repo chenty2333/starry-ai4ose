@@ -85,5 +85,7 @@ optional = true
 platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none-softfloat"]
 all-features = true
 
+# Force all direct and transitive users onto the vendored axnet-ng so feature
+# selection stays consistent across axruntime and the kernel.
 [patch.crates-io]
 axnet-ng = { path = "crates/axnet-ng" }

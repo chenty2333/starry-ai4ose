@@ -118,7 +118,15 @@ impl Router {
                             warn!("No route found for destination: {}", dst_addr);
                             continue;
                         };
-                        assert_eq!(rule.src, IpAddress::Ipv4(packet.src_addr()));
+                        let src_addr = IpAddress::Ipv4(packet.src_addr());
+                        if rule.src != src_addr {
+                            warn!(
+                                "Dropping IPv4 packet to {} with mismatched source address: \
+                                 expected {}, got {}",
+                                dst_addr, rule.src, src_addr,
+                            );
+                            continue;
+                        }
 
                         let next_hop = rule.via.unwrap_or(dst_addr);
                         let dev = &mut self.devices[rule.dev];
@@ -139,7 +147,15 @@ impl Router {
                             warn!("No route found for destination: {}", dst_addr);
                             continue;
                         };
-                        assert_eq!(rule.src, IpAddress::Ipv6(packet.src_addr()));
+                        let src_addr = IpAddress::Ipv6(packet.src_addr());
+                        if rule.src != src_addr {
+                            warn!(
+                                "Dropping IPv6 packet to {} with mismatched source address: \
+                                 expected {}, got {}",
+                                dst_addr, rule.src, src_addr,
+                            );
+                            continue;
+                        }
 
                         let next_hop = rule.via.unwrap_or(dst_addr);
                         let dev = &mut self.devices[rule.dev];

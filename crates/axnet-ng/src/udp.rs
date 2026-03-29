@@ -70,6 +70,13 @@ impl UdpSocket {
             None => Err(AxError::NotConnected),
         }
     }
+
+    fn bound_source_addr(&self) -> Option<IpAddress> {
+        self.local_addr
+            .read()
+            .as_ref()
+            .and_then(|endpoint| (!endpoint.addr.is_unspecified()).then_some(endpoint.addr))
+    }
 }
 
 impl Configurable for UdpSocket {
@@ -163,11 +170,12 @@ impl SocketOps for UdpSocket {
         }
 
         let remote_addr = IpEndpoint::from(remote_addr);
-        let src = self
+        let outbound = self
             .stack
             .get_service()
-            .get_source_address(&remote_addr.addr)?;
-        *guard = Some((remote_addr, src));
+            .resolve_outbound(&remote_addr.addr, self.bound_source_addr())?;
+        self.general.set_device_mask(outbound.device_mask);
+        *guard = Some((remote_addr, outbound.src_addr));
         debug!("UDP socket {}: connected to {}", self.handle, remote_addr);
         Ok(())
     }
@@ -176,11 +184,11 @@ impl SocketOps for UdpSocket {
         let (remote_addr, source_addr) = match options.to {
             Some(addr) => {
                 let addr = IpEndpoint::from(addr.into_ip()?);
-                let src = self
+                let outbound = self
                     .stack
                     .get_service()
-                    .get_source_address(&addr.addr)?;
-                (addr, src)
+                    .resolve_outbound(&addr.addr, self.bound_source_addr())?;
+                (addr, outbound.src_addr)
             }
             None => self.remote_endpoint()?,
         };

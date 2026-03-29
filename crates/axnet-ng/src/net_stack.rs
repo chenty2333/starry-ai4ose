@@ -2,7 +2,11 @@ use alloc::{boxed::Box, sync::Arc};
 
 use axerrno::{AxResult, ax_bail, ax_err_type};
 use axsync::Mutex;
-use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::{
+    iface::SocketHandle,
+    socket::AnySocket,
+    wire::{IpCidr, Ipv4Address, Ipv4Cidr},
+};
 
 use crate::{
     device::{Device, LoopbackDevice},
@@ -34,7 +38,7 @@ const PORT_END: u16 = 0xffff;
 
 impl NetStack {
     /// Create a new `NetStack` from pre-built components.
-    pub fn new(
+    pub(crate) fn new(
         listen_table: Arc<ListenTable>,
         socket_set: Arc<SocketSetWrapper<'static>>,
         service: Service,
@@ -109,6 +113,21 @@ impl NetStack {
     /// Acquire a lock on the Service.
     pub(crate) fn get_service(&self) -> axsync::MutexGuard<'_, Service> {
         self.service.lock()
+    }
+
+    /// Lock the service before the socket set to avoid AB-BA deadlocks.
+    pub(crate) fn with_service_and_socket_mut<T, R>(
+        &self,
+        handle: SocketHandle,
+        f: impl FnOnce(&mut Service, &mut T) -> R,
+    ) -> R
+    where
+        T: AnySocket<'static>,
+    {
+        let mut service = self.service.lock();
+        let mut sockets = self.socket_set.inner.lock();
+        let socket = sockets.get_mut(handle);
+        f(&mut service, socket)
     }
 
     /// Allocate a TCP ephemeral port.

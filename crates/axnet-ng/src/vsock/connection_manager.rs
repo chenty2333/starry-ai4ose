@@ -70,7 +70,7 @@ impl Connection {
         }
     }
 
-    /// Register a waker for transmit events
+    /// Register a waker for accept events.
     pub fn register_accept_poll(&mut self, context: &mut core::task::Context<'_>) {
         // found listen queue
         let manager = VSOCK_CONN_MANAGER.lock();
@@ -81,12 +81,12 @@ impl Connection {
         queue.lock().register_poll(context);
     }
 
-    /// Register a waker for receive Events
+    /// Register a waker for receive events.
     pub fn register_rx_poll(&mut self, context: &mut core::task::Context<'_>) {
         self.rx_wakers.register(context.waker());
     }
 
-    /// Register a waker for connect Events
+    /// Register a waker for connect events.
     pub fn register_connect_poll(&mut self, _context: &mut core::task::Context<'_>) {
         self.connect_wakers.register(_context.waker());
     }
