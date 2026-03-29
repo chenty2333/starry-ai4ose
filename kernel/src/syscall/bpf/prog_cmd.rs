@@ -17,6 +17,9 @@ use crate::{
     file::{FileLike, bpf::BpfProgFd},
 };
 
+const BPF_PROG_TEST_RUN_MAX_TOTAL_CTX_BYTES: u64 = 4 * 1024 * 1024;
+const BPF_PROG_TEST_RUN_MAX_TOTAL_INSNS: u64 = BPF_MAX_EXEC_INSNS as u64;
+
 pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
     let attr: BpfAttrProgLoad = read_bpf_attr(attr_ptr, attr_size)?;
     debug!(
@@ -89,27 +92,42 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
     let prog_fd = BpfProgFd::from_fd(attr.prog_fd as _)?;
     let prog = &prog_fd.prog;
 
-    validate_prog_test_run_attr(&attr, prog.prog_type)?;
+    let exec_insn_cnt = prog
+        .decoded_insns
+        .iter()
+        .filter(|aux| !aux.is_continuation())
+        .count();
+    let repeat = validate_prog_test_run_attr(&attr, prog.prog_type, exec_insn_cnt)?;
 
     // Read context from user space (if provided)
     let ctx_size = attr.ctx_size_in as usize;
-    let mut ctx = if ctx_size > 0 && attr.ctx_in != 0 {
+    let ctx_template = if ctx_size > 0 {
         starry_vm::vm_load(attr.ctx_in as *const u8, ctx_size).map_err(|_| AxError::BadAddress)?
     } else {
         Vec::new()
     };
+    let mut ctx = ctx_template.clone();
 
     // Run the program
-    let repeat = if attr.repeat == 0 { 1 } else { attr.repeat };
     let mut retval = 0u64;
     let start = axhal::time::monotonic_time_nanos();
 
-    for _ in 0..repeat {
+    for iter in 0..repeat {
+        if iter != 0 && !ctx.is_empty() {
+            ctx.copy_from_slice(&ctx_template);
+        }
         let mut vm = BpfVm::new(&prog.insns, &prog.decoded_insns, &prog.maps);
         retval = vm.execute(&mut ctx)?;
     }
 
-    let duration = (axhal::time::monotonic_time_nanos() - start) as u32;
+    let duration = axhal::time::monotonic_time_nanos()
+        .saturating_sub(start)
+        .min(u32::MAX as u64) as u32;
+    let ctx_size_out = if attr.ctx_out != 0 {
+        ctx.len() as u32
+    } else {
+        0
+    };
 
     write_bpf_attr_value::<BpfAttrTestRun, _>(
         attr_ptr,
@@ -128,7 +146,7 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         attr_ptr,
         attr_size,
         offset_of!(BpfAttrTestRun, ctx_size_out),
-        &0u32,
+        &ctx_size_out,
     )?;
 
     write_bpf_attr_value::<BpfAttrTestRun, _>(
@@ -137,6 +155,16 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         offset_of!(BpfAttrTestRun, data_size_out),
         &0u32,
     )?;
+
+    if attr.ctx_out != 0 {
+        if attr.ctx_size_out < ctx_size_out {
+            return Err(AxError::StorageFull);
+        }
+        if !ctx.is_empty() {
+            starry_vm::vm_write_slice(attr.ctx_out as *mut u8, &ctx)
+                .map_err(|_| AxError::BadAddress)?;
+        }
+    }
 
     Ok(0)
 }
@@ -169,7 +197,11 @@ fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
     Ok(())
 }
 
-fn validate_prog_test_run_attr(attr: &BpfAttrTestRun, prog_type: u32) -> AxResult<()> {
+fn validate_prog_test_run_attr(
+    attr: &BpfAttrTestRun,
+    prog_type: u32,
+    insn_cnt: usize,
+) -> AxResult<u32> {
     if !uses_raw_ctx_prog_type(prog_type) {
         return Err(AxError::InvalidInput);
     }
@@ -183,14 +215,35 @@ fn validate_prog_test_run_attr(attr: &BpfAttrTestRun, prog_type: u32) -> AxResul
         return Err(AxError::InvalidInput);
     }
 
-    if attr.ctx_size_in > 0 && attr.ctx_in == 0 {
+    if (attr.ctx_in == 0) != (attr.ctx_size_in == 0) {
         return Err(AxError::InvalidInput);
     }
-    if attr.ctx_out != 0 || attr.ctx_size_out != 0 {
+    if (attr.ctx_out == 0) != (attr.ctx_size_out == 0) {
         return Err(AxError::InvalidInput);
     }
 
-    Ok(())
+    if prog_type == BPF_PROG_TYPE_RAW_TRACEPOINT {
+        if attr.ctx_out != 0 || attr.repeat != 0 {
+            return Err(AxError::InvalidInput);
+        }
+    }
+
+    let repeat = attr.repeat.max(1);
+    let total_insns = (insn_cnt as u64)
+        .checked_mul(repeat as u64)
+        .ok_or(AxError::InvalidInput)?;
+    if total_insns > BPF_PROG_TEST_RUN_MAX_TOTAL_INSNS {
+        return Err(AxError::InvalidInput);
+    }
+
+    let total_ctx_bytes = (attr.ctx_size_in as u64)
+        .checked_mul(repeat as u64)
+        .ok_or(AxError::InvalidInput)?;
+    if total_ctx_bytes > BPF_PROG_TEST_RUN_MAX_TOTAL_CTX_BYTES {
+        return Err(AxError::InvalidInput);
+    }
+
+    Ok(repeat)
 }
 
 fn license_is_gpl(license: &[u8]) -> bool {
