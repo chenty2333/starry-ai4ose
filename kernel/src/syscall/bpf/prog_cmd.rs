@@ -20,6 +20,7 @@ use crate::{
 const BPF_PROG_TEST_RUN_MAX_TOTAL_CTX_BYTES: u64 = 4 * 1024 * 1024;
 const BPF_PROG_TEST_RUN_MAX_TOTAL_INSNS: u64 = BPF_MAX_EXEC_INSNS as u64;
 const BPF_PROG_TEST_RUN_MAX_TOTAL_AUX_BYTES: u64 = 64 * 1024 * 1024;
+const BPF_PROG_LICENSE_MAX_LEN: usize = 128;
 
 pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
     require_bpf_attr_range::<BpfAttrProgLoad>(
@@ -44,7 +45,7 @@ pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         .map_err(|_| AxError::BadAddress)?;
 
     // Read license string (for GPL check)
-    let license = starry_vm::vm_load_until_nul(attr.license as *const u8)?;
+    let license = load_bpf_license(attr.license as *const u8)?;
     let gpl_compatible = license_is_gpl(&license);
 
     // Run the verifier
@@ -79,7 +80,10 @@ pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
 }
 
 pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
-    require_bpf_attr_range::<BpfAttrTestRun>(attr_size, size_of::<BpfAttrTestRun>())?;
+    require_bpf_attr_range::<BpfAttrTestRun>(
+        attr_size,
+        offset_of!(BpfAttrTestRun, batch_size) + size_of::<u32>(),
+    )?;
     let attr: BpfAttrTestRun = read_bpf_attr(attr_ptr, attr_size)?;
     debug!(
         "bpf_prog_test_run: prog_fd={}, data_in={}, ctx_in={}, repeat={}",
@@ -314,4 +318,19 @@ fn write_verifier_log(
     }
 
     Ok(())
+}
+
+fn load_bpf_license(ptr: *const u8) -> AxResult<Vec<u8>> {
+    let mut license = Vec::new();
+
+    for idx in 0..(BPF_PROG_LICENSE_MAX_LEN - 1) {
+        let byte = starry_vm::vm_load(ptr.wrapping_add(idx), 1)
+            .map_err(|_| AxError::BadAddress)?[0];
+        if byte == 0 {
+            break;
+        }
+        license.push(byte);
+    }
+
+    Ok(license)
 }
