@@ -275,6 +275,10 @@ fn pass_structural(
             log.log(&alloc::format!("insn {i}: write to R10 (frame pointer)"));
             return Err(AxError::InvalidInput);
         }
+        if writes_src_reg(insn) && insn.src_reg() == BPF_REG_FP as u8 {
+            log.log(&alloc::format!("insn {i}: write to R10 (frame pointer)"));
+            return Err(AxError::InvalidInput);
+        }
 
         match insn.class() {
             BPF_CLASS_LD => {
@@ -496,11 +500,22 @@ fn pass_abstract_interp(
                     log.log(&alloc::format!("insn {i}: STX dst R{dst} is not a pointer"));
                     return Err(AxError::InvalidInput);
                 }
+                if !mem_ptr_writable(regs[dst].ty) {
+                    log.log(&alloc::format!("insn {i}: STX dst R{dst} is not writable"));
+                    return Err(AxError::InvalidInput);
+                }
+                if (insn.code & 0xe0) == BPF_MODE_ATOMIC {
+                    verify_atomic(&mut regs, insn, i, log)?;
+                }
             }
             BPF_CLASS_ST => {
                 check_reg_init(&regs, dst, i, log)?;
                 if !regs[dst].is_mem_ptr() {
                     log.log(&alloc::format!("insn {i}: ST dst R{dst} is not a pointer"));
+                    return Err(AxError::InvalidInput);
+                }
+                if !mem_ptr_writable(regs[dst].ty) {
+                    log.log(&alloc::format!("insn {i}: ST dst R{dst} is not writable"));
                     return Err(AxError::InvalidInput);
                 }
             }
@@ -778,6 +793,10 @@ fn mem_ptr_allowed(reg_ty: RegType, mask: HelperMemMask) -> bool {
     }
 }
 
+fn mem_ptr_writable(reg_ty: RegType) -> bool {
+    !matches!(reg_ty, RegType::CtxPtr)
+}
+
 fn preserves_mem_ptr(insn: &BpfInsn, reg_ty: RegType) -> bool {
     insn.class() == BPF_CLASS_ALU64
         && (insn.code & BPF_SRC_X) == 0
@@ -953,12 +972,48 @@ fn is_supported_atomic_op(op: i32) -> bool {
     ) || matches!(op, BPF_ATOMIC_XCHG | BPF_ATOMIC_CMPXCHG)
 }
 
+fn verify_atomic(
+    regs: &mut [RegState; BPF_MAX_REGS],
+    insn: &BpfInsn,
+    insn_idx: usize,
+    log: &mut VerifierLog,
+) -> AxResult<()> {
+    let src = insn.src_reg() as usize;
+    if regs[src].ty != RegType::Scalar {
+        log.log(&alloc::format!("insn {insn_idx}: atomic src R{src} must be scalar"));
+        return Err(AxError::InvalidInput);
+    }
+
+    if insn.imm == BPF_ATOMIC_CMPXCHG {
+        check_reg_init(regs, 0, insn_idx, log)?;
+        if regs[0].ty != RegType::Scalar {
+            log.log(&alloc::format!(
+                "insn {insn_idx}: CMPXCHG R0 must be scalar"
+            ));
+            return Err(AxError::InvalidInput);
+        }
+        regs[0] = RegState::scalar();
+    }
+
+    if (insn.imm & BPF_ATOMIC_FETCH) != 0 {
+        regs[src] = RegState::scalar();
+    }
+
+    Ok(())
+}
+
 fn writes_dst_reg(insn: &BpfInsn, aux: BpfInsnAux) -> bool {
     match insn.class() {
         BPF_CLASS_ALU | BPF_CLASS_ALU64 | BPF_CLASS_LDX => true,
         BPF_CLASS_LD => matches!(aux, BpfInsnAux::LdImm64Head(_)),
         _ => false,
     }
+}
+
+fn writes_src_reg(insn: &BpfInsn) -> bool {
+    insn.class() == BPF_CLASS_STX
+        && (insn.code & 0xe0) == BPF_MODE_ATOMIC
+        && (insn.imm & BPF_ATOMIC_FETCH) != 0
 }
 
 fn calc_jump_target(pc: usize, insn: &BpfInsn) -> i64 {
