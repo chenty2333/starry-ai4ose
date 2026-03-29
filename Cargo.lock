@@ -753,36 +753,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axnet-ng"
-version = "0.3.0-preview.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3a33a22c3b07301d1cf096021a1f048c0d48b02d5fc034c237fb9968dc06da2"
-dependencies = [
- "async-channel",
- "async-trait",
- "axconfig",
- "axdriver",
- "axerrno 0.2.2",
- "axfs-ng",
- "axfs-ng-vfs",
- "axhal",
- "axio",
- "axpoll",
- "axsync",
- "axtask",
- "bitflags 2.11.0",
- "cfg-if",
- "enum_dispatch",
- "event-listener",
- "hashbrown",
- "lazy_static",
- "log",
- "ringbuf",
- "spin 0.10.0",
- "starry-smoltcp",
-]
-
-[[package]]
 name = "axplat"
 version = "0.3.1-pre.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -972,7 +942,7 @@ dependencies = [
  "axlog",
  "axmm",
  "axnet",
- "axnet-ng 0.3.0-preview.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "axnet-ng",
  "axplat",
  "axtask",
  "cfg-if",
@@ -3038,7 +3008,7 @@ dependencies = [
  "axio",
  "axlog",
  "axmm",
- "axnet-ng 0.3.0-preview.2",
+ "axnet-ng",
  "axpoll",
  "axruntime",
  "axsync",
