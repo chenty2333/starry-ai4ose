@@ -44,8 +44,7 @@ pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         .map_err(|_| AxError::BadAddress)?;
 
     // Read license string (for GPL check)
-    let license =
-        starry_vm::vm_load_until_nul(attr.license as *const u8).map_err(|_| AxError::BadAddress)?;
+    let license = starry_vm::vm_load_until_nul(attr.license as *const u8)?;
     let gpl_compatible = license_is_gpl(&license);
 
     // Run the verifier
@@ -228,6 +227,9 @@ fn validate_prog_test_run_attr(
     }
 
     if attr.flags != 0 || attr.cpu != 0 || attr.batch_size != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if attr._pad0 != 0 {
         return Err(AxError::InvalidInput);
     }
 
