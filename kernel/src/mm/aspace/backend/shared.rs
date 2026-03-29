@@ -40,7 +40,15 @@ impl SharedPages {
 
         let mut new_pages = Vec::with_capacity(len - current_len);
         for _ in current_len..len {
-            new_pages.push(alloc_frame(true, self.size)?);
+            match alloc_frame(true, self.size) {
+                Ok(frame) => new_pages.push(frame),
+                Err(err) => {
+                    for frame in new_pages {
+                        dealloc_frame(frame, self.size);
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         let mut pages = self.phys_pages.lock();
