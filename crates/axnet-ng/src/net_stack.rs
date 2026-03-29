@@ -1,10 +1,13 @@
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 
-use axerrno::{AxError, AxResult, ax_bail};
+use axerrno::{AxResult, ax_bail};
 use axsync::Mutex;
+use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 
 use crate::{
+    device::{Device, LoopbackDevice},
     listen_table::ListenTable,
+    router::{Router, Rule},
     service::Service,
     wrapper::SocketSetWrapper,
 };
@@ -43,6 +46,53 @@ impl NetStack {
             tcp_ephemeral_port: Mutex::new(PORT_START),
             udp_ephemeral_port: Mutex::new(PORT_START),
         })
+    }
+
+    /// Create a minimal network stack with only a loopback device.
+    ///
+    /// This is used for new network namespaces created via `CLONE_NEWNET`.
+    /// The resulting stack has a single `lo` interface (127.0.0.1/8) and no
+    /// external connectivity.
+    pub fn new_loopback_only() -> Arc<Self> {
+        let socket_set = Arc::new(SocketSetWrapper::new());
+        let listen_table = Arc::new(ListenTable::new());
+
+        let mut router = Router::new(listen_table.clone());
+        let lo_dev = router.add_device(Box::new(LoopbackDevice::new()));
+
+        let lo_ip = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
+        router.add_rule(Rule::new(
+            lo_ip.into(),
+            None,
+            lo_dev,
+            lo_ip.address().into(),
+        ));
+
+        let mut service = Service::new(router, socket_set.clone());
+        service.iface.update_ip_addrs(|addrs| {
+            addrs.push(lo_ip.into()).unwrap();
+        });
+
+        Self::new(listen_table, socket_set, service)
+    }
+
+    /// Add a network device to this stack's router.
+    ///
+    /// Returns the device index, needed for [`add_route`](Self::add_route).
+    pub fn add_device(&self, device: Box<dyn Device>) -> usize {
+        self.service.lock().router.add_device(device)
+    }
+
+    /// Add a routing rule to this stack.
+    pub fn add_route(&self, rule: Rule) {
+        self.service.lock().router.add_rule(rule);
+    }
+
+    /// Add an IP address to this stack's interface.
+    pub fn add_ip_addr(&self, addr: IpCidr) {
+        self.service.lock().iface.update_ip_addrs(|addrs| {
+            addrs.push(addr).unwrap();
+        });
     }
 
     /// Poll all network interfaces owned by this stack.

@@ -118,7 +118,6 @@ impl CloneArgs {
 
         let unsupported_ns_flags = CloneFlags::NEWIPC
             | CloneFlags::NEWNS
-            | CloneFlags::NEWNET
             | CloneFlags::NEWPID
             | CloneFlags::NEWUSER
             | CloneFlags::NEWUTS
@@ -230,6 +229,12 @@ impl CloneArgs {
                 Arc::new(SpinNoIrq::new(old_proc_data.signal.actions.lock().clone()))
             };
 
+            let net_ns = if flags.contains(CloneFlags::NEWNET) {
+                axnet::NetStack::new_loopback_only()
+            } else {
+                old_proc_data.net_ns.clone()
+            };
+
             let proc_data = ProcessData::new(
                 proc,
                 old_proc_data.exe_path.read().clone(),
@@ -237,7 +242,7 @@ impl CloneArgs {
                 aspace,
                 signal_actions,
                 exit_signal,
-                old_proc_data.net_ns.clone(),
+                net_ns,
             );
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_heap_top(old_proc_data.get_heap_top());

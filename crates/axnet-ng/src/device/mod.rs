@@ -4,11 +4,13 @@ use smoltcp::{storage::PacketBuffer, time::Instant, wire::IpAddress};
 
 mod ethernet;
 mod loopback;
+mod veth;
 #[cfg(feature = "vsock")]
 mod vsock;
 
 pub use ethernet::*;
 pub use loopback::*;
+pub use veth::*;
 #[cfg(feature = "vsock")]
 pub use vsock::*;
 

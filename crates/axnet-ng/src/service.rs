@@ -20,7 +20,7 @@ fn now() -> Instant {
 
 pub struct Service {
     pub iface: Interface,
-    router: Router,
+    pub(crate) router: Router,
     pub(crate) socket_set: Arc<SocketSetWrapper<'static>>,
     timeout: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }

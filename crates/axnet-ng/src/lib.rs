@@ -47,12 +47,14 @@ use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
 use spin::Once;
 
 pub use self::net_stack::NetStack;
+pub use self::router::Rule;
 pub use self::socket::*;
+pub use self::device::VethEnd;
 use self::{
     consts::{GATEWAY, IP, IP_PREFIX},
     device::{EthernetDevice, LoopbackDevice},
     listen_table::ListenTable,
-    router::{Router, Rule},
+    router::Router,
     service::Service,
     wrapper::SocketSetWrapper,
 };
