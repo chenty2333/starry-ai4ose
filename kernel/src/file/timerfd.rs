@@ -182,7 +182,11 @@ impl FileLike for TimerFd {
 
                 // If repeating, register the next alarm.
                 if let Some(deadline) = inner.next_expiration {
-                    register_pollset_alarm(self.clock.alarm_clock(), deadline, self.poll_rx.clone());
+                    register_pollset_alarm(
+                        self.clock.alarm_clock(),
+                        deadline,
+                        self.poll_rx.clone(),
+                    );
                 }
 
                 dst.write(&count.to_ne_bytes())?;

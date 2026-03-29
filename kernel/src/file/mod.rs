@@ -1,3 +1,5 @@
+#[cfg(feature = "bpf")]
+pub mod bpf;
 pub mod epoll;
 pub mod event;
 pub mod flock;
@@ -7,8 +9,6 @@ mod pidfd;
 mod pipe;
 pub mod signalfd;
 pub mod timerfd;
-#[cfg(feature = "bpf")]
-pub mod bpf;
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::{

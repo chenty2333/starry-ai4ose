@@ -1,3 +1,5 @@
+#[cfg(feature = "bpf")]
+mod bpf;
 mod fs;
 mod io_mpx;
 mod ipc;
@@ -9,8 +11,6 @@ mod sync;
 mod sys;
 mod task;
 mod time;
-#[cfg(feature = "bpf")]
-mod bpf;
 
 use axerrno::{AxError, LinuxError};
 use axhal::uspace::UserContext;

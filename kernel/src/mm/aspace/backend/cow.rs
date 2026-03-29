@@ -193,14 +193,15 @@ impl CowBackend {
         }
         match (&self.file, &other.file) {
             (None, None) => true,
-            (Some((lhs_backend, lhs_start, lhs_end)), Some((rhs_backend, rhs_start, rhs_end))) =>
+            (Some((lhs_backend, lhs_start, lhs_end)), Some((rhs_backend, rhs_start, rhs_end))) => {
                 lhs_start == rhs_start
                     && lhs_end == rhs_end
                     && match (lhs_backend, rhs_backend) {
                         (FileBackend::Cached(lhs), FileBackend::Cached(rhs)) => lhs.ptr_eq(rhs),
                         (FileBackend::Direct(lhs), FileBackend::Direct(rhs)) => lhs.ptr_eq(rhs),
                         _ => false,
-                    },
+                    }
+            }
             _ => false,
         }
     }

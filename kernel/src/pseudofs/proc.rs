@@ -64,7 +64,10 @@ fn real_meminfo() -> String {
 }
 
 fn is_shared_user_mapping(backend: &Backend) -> bool {
-    matches!(backend, Backend::Shared(_) | Backend::File(_) | Backend::Linear(_))
+    matches!(
+        backend,
+        Backend::Shared(_) | Backend::File(_) | Backend::Linear(_)
+    )
 }
 
 pub fn new_procfs() -> Filesystem {

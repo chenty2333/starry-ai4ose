@@ -8,8 +8,7 @@ use alloc::{format, vec};
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, File, OpenOptions};
-use axhal::paging::MappingFlags;
-use axhal::uspace::UserContext;
+use axhal::{paging::MappingFlags, uspace::UserContext};
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CORE};
 use memory_addr::PAGE_SIZE_4K;
 
@@ -261,10 +260,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     let load_offset = note_offset + note_total;
 
     // ---- Build prstatus ----
-    let ppid = proc_data
-        .proc
-        .parent()
-        .map_or(0, |p| p.pid() as i32);
+    let ppid = proc_data.proc.parent().map_or(0, |p| p.pid() as i32);
     let pgid = proc_data.proc.group().pgid() as i32;
 
     let mut prstatus = ElfPrstatus {

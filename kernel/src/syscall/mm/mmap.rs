@@ -6,6 +6,7 @@ use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange, align_up_4k};
+
 use crate::{
     file::{File, FileLike},
     mm::{AddrSpace, Backend, BackendOps, SharedPages},
@@ -129,8 +130,12 @@ fn map_relocated_segments(
                 .duplicate_mapping(seg.start, seg_start, aspace_handle)?
         };
         aspace.map(seg_start, seg.size, seg.flags, false, relocated)?;
-        seg.backend
-            .migrate_present_pages(seg.start, seg_start, seg.size, &mut aspace.page_table_mut().cursor())?;
+        seg.backend.migrate_present_pages(
+            seg.start,
+            seg_start,
+            seg.size,
+            &mut aspace.page_table_mut().cursor(),
+        )?;
     }
     Ok(())
 }
@@ -456,14 +461,8 @@ pub fn sys_mremap(
                 .ok_or(AxError::NoMemory)?
         };
 
-        if let Err(err) = map_relocated_segments(
-            &mut aspace,
-            &aspace_handle,
-            addr,
-            dst,
-            &segments,
-            false,
-        )
+        if let Err(err) =
+            map_relocated_segments(&mut aspace, &aspace_handle, addr, dst, &segments, false)
         {
             let _ = aspace.unmap(dst, new_size);
             return Err(err);
@@ -496,9 +495,8 @@ pub fn sys_mremap(
 
     // Try to grow in-place first.
     let after = addr + old_size;
-    let can_grow_inplace = !fixed
-        && new_size > old_size
-        && range_is_free(&aspace, after, grow, page_size as usize);
+    let can_grow_inplace =
+        !fixed && new_size > old_size && range_is_free(&aspace, after, grow, page_size as usize);
     if can_grow_inplace {
         primary.backend.ensure_range_covered(addr, new_size)?;
         let tail_backend = primary.backend.relocate(addr, addr, &aspace_handle)?;
@@ -582,11 +580,12 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
 
     match advice {
         // Hints the kernel may safely ignore.
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_FREE
-        | MADV_DONTNEED | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
-        | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK
-        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ
-        | MADV_POPULATE_WRITE | MADV_COLLAPSE => Ok(0),
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_FREE | MADV_DONTNEED
+        | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK | MADV_KEEPONFORK
+        | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE | MADV_COLLAPSE => {
+            Ok(0)
+        }
         _ => Err(AxError::InvalidInput),
     }
 }

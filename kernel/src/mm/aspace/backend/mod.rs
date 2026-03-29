@@ -1,5 +1,6 @@
 //! Memory mapping backends.
 use alloc::{boxed::Box, sync::Arc};
+
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
 use axhal::{
@@ -156,7 +157,10 @@ impl MappingBackend for Backend {
 
 impl Backend {
     pub fn is_shareable(&self) -> bool {
-        matches!(self, Backend::Linear(_) | Backend::Shared(_) | Backend::File(_))
+        matches!(
+            self,
+            Backend::Linear(_) | Backend::Shared(_) | Backend::File(_)
+        )
     }
 
     pub fn ensure_range_covered(&self, start: VirtAddr, size: usize) -> AxResult {
@@ -175,13 +179,15 @@ impl Backend {
     ) -> AxResult<Self> {
         match self {
             Backend::Linear(backend) => backend.relocate(old_start, new_start),
-            Backend::Cow(backend) => Ok(Backend::Cow(backend.clone_for_range(old_start, new_start))),
-            Backend::Shared(backend) => {
-                Ok(Backend::Shared(backend.clone_for_range(old_start, new_start)))
+            Backend::Cow(backend) => {
+                Ok(Backend::Cow(backend.clone_for_range(old_start, new_start)))
             }
-            Backend::File(backend) => {
-                Ok(Backend::File(backend.clone_for_range(old_start, new_start, aspace)))
-            }
+            Backend::Shared(backend) => Ok(Backend::Shared(
+                backend.clone_for_range(old_start, new_start),
+            )),
+            Backend::File(backend) => Ok(Backend::File(
+                backend.clone_for_range(old_start, new_start, aspace),
+            )),
         }
     }
 
@@ -193,12 +199,12 @@ impl Backend {
     ) -> AxResult<Self> {
         match self {
             Backend::Linear(backend) => backend.duplicate_mapping(old_start, new_start),
-            Backend::Cow(backend) => {
-                Ok(Backend::Cow(backend.duplicate_mapping(old_start, new_start)))
-            }
-            Backend::Shared(backend) => {
-                Ok(Backend::Shared(backend.duplicate_mapping(old_start, new_start)))
-            }
+            Backend::Cow(backend) => Ok(Backend::Cow(
+                backend.duplicate_mapping(old_start, new_start),
+            )),
+            Backend::Shared(backend) => Ok(Backend::Shared(
+                backend.duplicate_mapping(old_start, new_start),
+            )),
             Backend::File(backend) => Ok(Backend::File(
                 backend.duplicate_mapping(old_start, new_start, aspace),
             )),
@@ -214,7 +220,9 @@ impl Backend {
     ) -> AxResult {
         match self {
             Backend::Linear(_) | Backend::Shared(_) => Ok(()),
-            Backend::Cow(backend) => backend.clone_materialized_pages(old_start, new_start, size, pt),
+            Backend::Cow(backend) => {
+                backend.clone_materialized_pages(old_start, new_start, size, pt)
+            }
             Backend::File(backend) => {
                 backend.clone_materialized_pages(old_start, new_start, size, pt)
             }

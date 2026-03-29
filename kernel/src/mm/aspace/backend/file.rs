@@ -162,7 +162,10 @@ impl FileBackend {
         pt: &mut PageTableCursor,
     ) -> AxResult {
         let old_range = VirtAddrRange::from_start_size(old_start, size);
-        let new_pages = pages_in(VirtAddrRange::from_start_size(new_start, size), PageSize::Size4K)?;
+        let new_pages = pages_in(
+            VirtAddrRange::from_start_size(new_start, size),
+            PageSize::Size4K,
+        )?;
         for (old_addr, new_addr) in pages_in(old_range, PageSize::Size4K)?.zip(new_pages) {
             match pt.query(old_addr) {
                 Ok((paddr, flags, page_size)) => {

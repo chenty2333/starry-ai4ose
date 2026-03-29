@@ -98,9 +98,7 @@ pub fn flock_unlock(id: InodeId, owner: FlockOwner) {
             let changed = holders.remove(&owner);
             (changed, holders.is_empty())
         }
-        Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => {
-            (true, true)
-        }
+        Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => (true, true),
         _ => (false, false),
     };
     if changed {

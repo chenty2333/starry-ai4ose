@@ -57,7 +57,9 @@ impl SharedPages {
 
     fn pages_range(&self, start_index: usize, count: usize) -> AxResult<Vec<PhysAddr>> {
         let pages = self.phys_pages.lock();
-        let end = start_index.checked_add(count).ok_or(AxError::InvalidInput)?;
+        let end = start_index
+            .checked_add(count)
+            .ok_or(AxError::InvalidInput)?;
         if end > pages.len() {
             return Err(AxError::NoMemory);
         }
