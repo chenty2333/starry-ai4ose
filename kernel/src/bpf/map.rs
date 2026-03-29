@@ -1,6 +1,7 @@
 //! BPF map implementations (ArrayMap, HashMap).
 
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use axerrno::{AxError, AxResult};
 
@@ -14,6 +15,8 @@ pub trait BpfMap: Send + Sync {
     fn max_entries(&self) -> u32;
     fn name(&self) -> [u8; BPF_OBJ_NAME_LEN];
     fn id(&self) -> u32;
+    fn map_flags(&self) -> u32;
+    fn freeze(&self) -> AxResult<()>;
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> AxResult<()>;
@@ -27,15 +30,20 @@ pub fn create_map(
     key_size: u32,
     value_size: u32,
     max_entries: u32,
-    _flags: u32,
+    flags: u32,
     name: [u8; BPF_OBJ_NAME_LEN],
     id: u32,
 ) -> AxResult<Arc<dyn BpfMap>> {
+    if flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
     match map_type {
         BPF_MAP_TYPE_ARRAY => Ok(Arc::new(ArrayMap::new(
             key_size,
             value_size,
             max_entries,
+            flags,
             name,
             id,
         )?)),
@@ -43,6 +51,7 @@ pub fn create_map(
             key_size,
             value_size,
             max_entries,
+            flags,
             name,
             id,
         )?)),
@@ -58,8 +67,10 @@ pub struct ArrayMap {
     key_size: u32,
     value_size: u32,
     max_entries: u32,
+    map_flags: u32,
     name: [u8; BPF_OBJ_NAME_LEN],
     id: u32,
+    frozen: AtomicBool,
     data: spin::Mutex<Vec<u8>>,
 }
 
@@ -68,6 +79,7 @@ impl ArrayMap {
         key_size: u32,
         value_size: u32,
         max_entries: u32,
+        map_flags: u32,
         name: [u8; BPF_OBJ_NAME_LEN],
         id: u32,
     ) -> AxResult<Self> {
@@ -81,8 +93,10 @@ impl ArrayMap {
             key_size,
             value_size,
             max_entries,
+            map_flags,
             name,
             id,
+            frozen: AtomicBool::new(false),
             data: spin::Mutex::new(alloc::vec![0u8; total]),
         })
     }
@@ -123,6 +137,13 @@ impl BpfMap for ArrayMap {
     fn id(&self) -> u32 {
         self.id
     }
+    fn map_flags(&self) -> u32 {
+        self.map_flags
+    }
+    fn freeze(&self) -> AxResult<()> {
+        self.frozen.store(true, Ordering::Release);
+        Ok(())
+    }
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
         let index = Self::key_to_index(key)?;
@@ -132,6 +153,9 @@ impl BpfMap for ArrayMap {
     }
 
     fn update(&self, key: &[u8], value: &[u8], _flags: u64) -> AxResult<()> {
+        if self.frozen.load(Ordering::Acquire) {
+            return Err(AxError::OperationNotPermitted);
+        }
         let index = Self::key_to_index(key).ok_or(AxError::InvalidInput)?;
         let range = self.index_range(index).ok_or(AxError::InvalidInput)?;
         if value.len() != self.value_size as usize {
@@ -143,6 +167,9 @@ impl BpfMap for ArrayMap {
     }
 
     fn delete(&self, key: &[u8]) -> AxResult<()> {
+        if self.frozen.load(Ordering::Acquire) {
+            return Err(AxError::OperationNotPermitted);
+        }
         // Array maps: delete = zero the entry.
         let index = Self::key_to_index(key).ok_or(AxError::InvalidInput)?;
         let range = self.index_range(index).ok_or(AxError::InvalidInput)?;
@@ -172,8 +199,10 @@ pub struct BpfHashMap {
     key_size: u32,
     value_size: u32,
     max_entries: u32,
+    map_flags: u32,
     name: [u8; BPF_OBJ_NAME_LEN],
     id: u32,
+    frozen: AtomicBool,
     data: spin::Mutex<hashbrown::HashMap<Vec<u8>, Vec<u8>>>,
 }
 
@@ -182,6 +211,7 @@ impl BpfHashMap {
         key_size: u32,
         value_size: u32,
         max_entries: u32,
+        map_flags: u32,
         name: [u8; BPF_OBJ_NAME_LEN],
         id: u32,
     ) -> AxResult<Self> {
@@ -192,8 +222,10 @@ impl BpfHashMap {
             key_size,
             value_size,
             max_entries,
+            map_flags,
             name,
             id,
+            frozen: AtomicBool::new(false),
             data: spin::Mutex::new(hashbrown::HashMap::new()),
         })
     }
@@ -218,12 +250,22 @@ impl BpfMap for BpfHashMap {
     fn id(&self) -> u32 {
         self.id
     }
+    fn map_flags(&self) -> u32 {
+        self.map_flags
+    }
+    fn freeze(&self) -> AxResult<()> {
+        self.frozen.store(true, Ordering::Release);
+        Ok(())
+    }
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.data.lock().get(key).cloned()
     }
 
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> AxResult<()> {
+        if self.frozen.load(Ordering::Acquire) {
+            return Err(AxError::OperationNotPermitted);
+        }
         if key.len() != self.key_size as usize || value.len() != self.value_size as usize {
             return Err(AxError::InvalidInput);
         }
@@ -243,6 +285,9 @@ impl BpfMap for BpfHashMap {
     }
 
     fn delete(&self, key: &[u8]) -> AxResult<()> {
+        if self.frozen.load(Ordering::Acquire) {
+            return Err(AxError::OperationNotPermitted);
+        }
         let mut data = self.data.lock();
         if data.remove(key).is_some() {
             Ok(())

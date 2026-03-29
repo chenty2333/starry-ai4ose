@@ -1,13 +1,15 @@
 //! BPF map syscall command handlers.
 
+use core::mem::{offset_of, size_of};
+
 use axerrno::{AxError, AxResult};
 
 use crate::{
     bpf::{
-        BPF_REGISTRY, alloc_map_id,
+        alloc_map_id,
         defs::*,
         map::{self, BpfMap},
-        read_bpf_attr,
+        read_bpf_attr, require_bpf_attr_range,
     },
     file::FileLike,
 };
@@ -29,9 +31,6 @@ pub fn bpf_map_create(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         attr.map_name,
         id,
     )?;
-
-    // Register in global registry.
-    BPF_REGISTRY.lock().maps.insert(id, map.clone());
 
     // Create fd for the map.
     use crate::file::bpf::BpfMapFd;
@@ -98,10 +97,20 @@ pub fn bpf_map_get_next_key(attr_ptr: usize, attr_size: u32) -> AxResult<isize> 
         )?)
     };
 
-    let next = map
-        .get_next_key(key.as_deref())
-        .ok_or(AxError::NotFound)?;
+    let next = map.get_next_key(key.as_deref()).ok_or(AxError::NotFound)?;
 
     starry_vm::vm_write_slice(attr.value_or_next_key as *mut u8, &next)?;
+    Ok(0)
+}
+
+pub fn bpf_map_freeze(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
+    require_bpf_attr_range::<BpfAttrMapElem>(
+        attr_size,
+        offset_of!(BpfAttrMapElem, map_fd) + size_of::<u32>(),
+    )?;
+    let attr: BpfAttrMapElem = read_bpf_attr(attr_ptr, attr_size)?;
+
+    let map_fd = crate::file::bpf::BpfMapFd::from_fd(attr.map_fd as _)?;
+    map_fd.map.freeze()?;
     Ok(0)
 }

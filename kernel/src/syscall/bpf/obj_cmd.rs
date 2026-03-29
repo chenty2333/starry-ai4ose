@@ -1,23 +1,33 @@
 //! BPF object info query command handlers.
 
+use core::mem::{offset_of, size_of};
+
 use axerrno::{AxError, AxResult};
 
 use crate::{
-    bpf::{defs::*, read_bpf_attr},
-    file::{FileLike, bpf::{BpfMapFd, BpfProgFd}, get_file_like},
+    bpf::{defs::*, read_bpf_attr, require_bpf_attr_range, write_bpf_attr_value},
+    file::{
+        FileLike,
+        bpf::{BpfMapFd, BpfProgFd},
+        get_file_like,
+    },
 };
 
 pub fn bpf_obj_get_info_by_fd(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
+    require_bpf_attr_range::<BpfAttrGetInfoByFd>(
+        attr_size,
+        offset_of!(BpfAttrGetInfoByFd, info) + size_of::<u64>(),
+    )?;
     let attr: BpfAttrGetInfoByFd = read_bpf_attr(attr_ptr, attr_size)?;
     debug!("bpf_obj_get_info_by_fd: fd={}", attr.bpf_fd);
 
     let fd_obj = get_file_like(attr.bpf_fd as _)?;
 
     if let Some(map_fd) = fd_obj.downcast_ref::<BpfMapFd>() {
-        return write_map_info(map_fd, attr.info, attr.info_len, attr_ptr);
+        return write_map_info(map_fd, attr.info, attr.info_len, attr_ptr, attr_size);
     }
     if let Some(prog_fd) = fd_obj.downcast_ref::<BpfProgFd>() {
-        return write_prog_info(prog_fd, attr.info, attr.info_len, attr_ptr);
+        return write_prog_info(prog_fd, attr.info, attr.info_len, attr_ptr, attr_size);
     }
 
     Err(AxError::InvalidInput)
@@ -28,6 +38,7 @@ fn write_map_info(
     info_ptr: u64,
     info_len: u32,
     attr_ptr: usize,
+    attr_size: u32,
 ) -> AxResult<isize> {
     let map = &map_fd.map;
 
@@ -37,7 +48,7 @@ fn write_map_info(
         key_size: map.key_size(),
         value_size: map.value_size(),
         max_entries: map.max_entries(),
-        map_flags: 0,
+        map_flags: map.map_flags(),
         name: map.name(),
         ..Default::default()
     };
@@ -53,9 +64,12 @@ fn write_map_info(
     starry_vm::vm_write_slice(info_ptr as *mut u8, &info_bytes[..copy_len])
         .map_err(|_| AxError::BadAddress)?;
 
-    // Write back actual info_len
-    let info_len_ptr = (attr_ptr + 4) as *mut u32;
-    let _ = starry_vm::vm_write_slice(info_len_ptr, &[copy_len as u32]);
+    write_bpf_attr_value::<BpfAttrGetInfoByFd, _>(
+        attr_ptr,
+        attr_size,
+        offset_of!(BpfAttrGetInfoByFd, info_len),
+        &(copy_len as u32),
+    )?;
 
     Ok(0)
 }
@@ -65,6 +79,7 @@ fn write_prog_info(
     info_ptr: u64,
     info_len: u32,
     attr_ptr: usize,
+    attr_size: u32,
 ) -> AxResult<isize> {
     let prog = &prog_fd.prog;
 
@@ -109,9 +124,12 @@ fn write_prog_info(
     starry_vm::vm_write_slice(info_ptr as *mut u8, &info_bytes[..copy_len])
         .map_err(|_| AxError::BadAddress)?;
 
-    // Write back actual info_len
-    let info_len_ptr = (attr_ptr + 4) as *mut u32;
-    let _ = starry_vm::vm_write_slice(info_len_ptr, &[copy_len as u32]);
+    write_bpf_attr_value::<BpfAttrGetInfoByFd, _>(
+        attr_ptr,
+        attr_size,
+        offset_of!(BpfAttrGetInfoByFd, info_len),
+        &(copy_len as u32),
+    )?;
 
     Ok(0)
 }

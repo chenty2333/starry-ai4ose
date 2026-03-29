@@ -1,12 +1,14 @@
 //! BPF program syscall command handlers: PROG_LOAD and PROG_TEST_RUN.
 
 use alloc::{sync::Arc, vec};
+use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult};
 
 use crate::{
     bpf::{
-        BPF_REGISTRY, alloc_prog_id, defs::*, prog::BpfProgram, read_bpf_attr, verifier, vm::BpfVm,
+        alloc_prog_id, defs::*, prog::BpfProgram, read_bpf_attr, require_bpf_attr_range, verifier,
+        vm::BpfVm, write_bpf_attr_value,
     },
     file::{FileLike, bpf::BpfProgFd},
 };
@@ -63,12 +65,6 @@ pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         gpl_compatible,
     });
 
-    // Register in global registry
-    BPF_REGISTRY
-        .lock()
-        .programs
-        .insert(prog_id, program.clone());
-
     // Create fd
     BpfProgFd::new(program)
         .add_to_fd_table(false)
@@ -76,6 +72,7 @@ pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
 }
 
 pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
+    require_bpf_attr_range::<BpfAttrTestRun>(attr_size, size_of::<BpfAttrTestRun>())?;
     let attr: BpfAttrTestRun = read_bpf_attr(attr_ptr, attr_size)?;
     debug!(
         "bpf_prog_test_run: prog_fd={}, data_in={}, ctx_in={}, repeat={}",
@@ -118,22 +115,30 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
 
     let duration = (axhal::time::monotonic_time_nanos() - start) as u32;
 
-    // Write back results to user space
-    // retval field is at offset 4 in BpfAttrTestRun
-    let retval_ptr = (attr_ptr + 4) as *mut u32;
-    let _ = starry_vm::vm_write_slice(retval_ptr, &[retval as u32]);
-
-    // duration field is at offset 28
-    let duration_ptr = (attr_ptr + 28) as *mut u32;
-    let _ = starry_vm::vm_write_slice(duration_ptr, &[duration]);
+    write_bpf_attr_value::<BpfAttrTestRun, _>(
+        attr_ptr,
+        attr_size,
+        offset_of!(BpfAttrTestRun, retval),
+        &(retval as u32),
+    )?;
+    write_bpf_attr_value::<BpfAttrTestRun, _>(
+        attr_ptr,
+        attr_size,
+        offset_of!(BpfAttrTestRun, duration),
+        &duration,
+    )?;
 
     // Write context output if requested
     if attr.ctx_out != 0 && attr.ctx_size_out > 0 {
         let out_size = (attr.ctx_size_out as usize).min(ctx.len());
-        let _ = starry_vm::vm_write_slice(attr.ctx_out as *mut u8, &ctx[..out_size]);
-        // Write ctx_size_out back
-        let ctx_size_out_ptr = (attr_ptr + 36) as *mut u32;
-        let _ = starry_vm::vm_write_slice(ctx_size_out_ptr, &[out_size as u32]);
+        starry_vm::vm_write_slice(attr.ctx_out as *mut u8, &ctx[..out_size])
+            .map_err(|_| AxError::BadAddress)?;
+        write_bpf_attr_value::<BpfAttrTestRun, _>(
+            attr_ptr,
+            attr_size,
+            offset_of!(BpfAttrTestRun, ctx_size_out),
+            &(out_size as u32),
+        )?;
     }
 
     // Write data output if requested
@@ -143,10 +148,15 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
             // packet. For now, just copy data_in to data_out unchanged.
             let out_size = (attr.data_size_out as usize).min(data_size);
             if let Some(ref data) = data_in {
-                let _ = starry_vm::vm_write_slice(attr.data_out as *mut u8, &data[..out_size]);
+                starry_vm::vm_write_slice(attr.data_out as *mut u8, &data[..out_size])
+                    .map_err(|_| AxError::BadAddress)?;
             }
-            let data_size_out_ptr = (attr_ptr + 12) as *mut u32;
-            let _ = starry_vm::vm_write_slice(data_size_out_ptr, &[out_size as u32]);
+            write_bpf_attr_value::<BpfAttrTestRun, _>(
+                attr_ptr,
+                attr_size,
+                offset_of!(BpfAttrTestRun, data_size_out),
+                &(out_size as u32),
+            )?;
         }
     }
 
