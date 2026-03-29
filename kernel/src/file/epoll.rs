@@ -103,31 +103,30 @@ enum ConsumeResult {
 #[derive(Clone)]
 struct EntryKey {
     fd: i32,
-    file: Weak<FileDescription>,
+    file: Arc<FileDescription>,
 }
 impl EntryKey {
     fn new(fd: i32) -> AxResult<Self> {
-        let file = get_file_description(fd)?;
         Ok(Self {
             fd,
-            file: Arc::downgrade(&file),
+            file: get_file_description(fd)?,
         })
     }
 
     #[inline]
-    fn get_file(&self) -> Option<Arc<FileDescription>> {
-        self.file.upgrade()
+    fn get_file(&self) -> &FileDescription {
+        self.file.as_ref()
     }
 }
 
 impl Hash for EntryKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.fd, self.file.as_ptr()).hash(state);
+        (self.fd, Arc::as_ptr(&self.file)).hash(state);
     }
 }
 impl PartialEq for EntryKey {
     fn eq(&self, other: &Self) -> bool {
-        self.fd == other.fd && Weak::ptr_eq(&self.file, &other.file)
+        self.fd == other.fd && Arc::ptr_eq(&self.file, &other.file)
     }
 }
 
@@ -268,10 +267,6 @@ impl Epoll {
 
     // only register waker, not add to ready queue
     fn register_waker_only(&self, interest: &Arc<EpollInterest>) {
-        let Some(file) = interest.key.get_file() else {
-            return;
-        };
-
         if !interest.is_enabled() {
             return;
         }
@@ -282,15 +277,11 @@ impl Epoll {
         }));
 
         let mut context = Context::from_waker(&waker);
-        file.register(&mut context, interest.event.events);
+        interest.key.get_file().register(&mut context, interest.event.events);
     }
 
     // for add/modify
     fn check_and_register_waker(&self, interest: &Arc<EpollInterest>) {
-        let Some(file) = interest.key.get_file() else {
-            return;
-        };
-
         if !interest.is_enabled() {
             return;
         }
@@ -300,6 +291,7 @@ impl Epoll {
             interest: Arc::downgrade(interest),
         }));
 
+        let file = interest.key.get_file();
         let current = file.poll() & interest.event.events;
 
         if !current.is_empty() {
@@ -384,19 +376,12 @@ impl Epoll {
                 continue; // interest already removed
             };
 
-            let Some(file) = interest.key.get_file() else {
-                // file already closed remove interests
-                self.inner.interests.lock().remove(&interest.key);
-                interest.mark_not_in_queue();
-                continue;
-            };
-
             trace!(
                 "Epoll: consuming ready interest for fd={}, events={:?}",
                 interest.key.fd, interest.event.events
             );
 
-            match interest.consume(file.as_ref()) {
+            match interest.consume(interest.key.get_file()) {
                 ConsumeResult::EventAndKeep(event) => {
                     out[count] = epoll_event {
                         events: event.events.bits(),
