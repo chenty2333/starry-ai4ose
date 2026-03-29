@@ -30,6 +30,8 @@ enum RegType {
     CtxPtr,
     /// Register holds a pointer into a map value (returned by map_lookup_elem).
     MapValuePtr,
+    /// Register holds a nullable pointer returned by map_lookup_elem.
+    MapValueOrNull,
     /// Register holds a map pointer (used as argument to helpers).
     MapPtr,
 }
@@ -72,6 +74,12 @@ impl RegState {
         }
     }
 
+    fn map_value_or_null() -> Self {
+        Self {
+            ty: RegType::MapValueOrNull,
+        }
+    }
+
     fn map_ptr() -> Self {
         Self {
             ty: RegType::MapPtr,
@@ -85,7 +93,18 @@ impl RegState {
     fn is_ptr(&self) -> bool {
         matches!(
             self.ty,
-            RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr | RegType::MapPtr
+            RegType::StackPtr
+                | RegType::CtxPtr
+                | RegType::MapValuePtr
+                | RegType::MapValueOrNull
+                | RegType::MapPtr
+        )
+    }
+
+    fn is_mem_ptr(&self) -> bool {
+        matches!(
+            self.ty,
+            RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr
         )
     }
 }
@@ -459,7 +478,7 @@ fn pass_abstract_interp(
             }
             BPF_CLASS_LDX => {
                 check_reg_init(&regs, src, i, log)?;
-                if !regs[src].is_ptr() {
+                if !regs[src].is_mem_ptr() {
                     log.log(&alloc::format!("insn {i}: LDX src R{src} is not a pointer"));
                     return Err(AxError::InvalidInput);
                 }
@@ -468,14 +487,14 @@ fn pass_abstract_interp(
             BPF_CLASS_STX => {
                 check_reg_init(&regs, dst, i, log)?;
                 check_reg_init(&regs, src, i, log)?;
-                if !regs[dst].is_ptr() {
+                if !regs[dst].is_mem_ptr() {
                     log.log(&alloc::format!("insn {i}: STX dst R{dst} is not a pointer"));
                     return Err(AxError::InvalidInput);
                 }
             }
             BPF_CLASS_ST => {
                 check_reg_init(&regs, dst, i, log)?;
-                if !regs[dst].is_ptr() {
+                if !regs[dst].is_mem_ptr() {
                     log.log(&alloc::format!("insn {i}: ST dst R{dst} is not a pointer"));
                     return Err(AxError::InvalidInput);
                 }
@@ -523,8 +542,8 @@ fn pass_abstract_interp(
             }
         }
 
-        for succ in insn_successors(insns, decoded, i)? {
-            if merge_state(&mut states, succ, &regs) {
+        for (succ, succ_regs) in successor_states(insns, decoded, i, &regs)? {
+            if merge_state(&mut states, succ, &succ_regs) {
                 worklist.push_back(succ);
             }
         }
@@ -570,6 +589,12 @@ fn merge_state(
 fn join_reg_state(lhs: RegState, rhs: RegState) -> RegState {
     if lhs.ty == rhs.ty {
         lhs
+    } else if matches!(
+        (lhs.ty, rhs.ty),
+        (RegType::MapValuePtr, RegType::MapValueOrNull)
+            | (RegType::MapValueOrNull, RegType::MapValuePtr)
+    ) {
+        RegState::map_value_or_null()
     } else if !lhs.is_init() || !rhs.is_init() {
         RegState::default()
     } else {
@@ -628,9 +653,13 @@ fn verify_call(
     }
 
     clobber_caller_saved(regs);
+    if proto.invalidates_map_value_ptrs {
+        clobber_map_value_ptrs(regs);
+    }
     regs[0] = match proto.ret {
         HelperReturnKind::Scalar => RegState::scalar(),
         HelperReturnKind::MapValuePtr => RegState::map_value(),
+        HelperReturnKind::MapValueOrNull => RegState::map_value_or_null(),
     };
     Ok(())
 }
@@ -648,12 +677,14 @@ enum HelperArgKind {
 enum HelperReturnKind {
     Scalar,
     MapValuePtr,
+    MapValueOrNull,
 }
 
 #[derive(Clone, Copy)]
 struct HelperProto {
     args: [HelperArgKind; 5],
     ret: HelperReturnKind,
+    invalidates_map_value_ptrs: bool,
 }
 
 fn helper_proto(helper_id: u32) -> Option<HelperProto> {
@@ -666,7 +697,8 @@ fn helper_proto(helper_id: u32) -> Option<HelperProto> {
                 HelperArgKind::Unused,
                 HelperArgKind::Unused,
             ],
-            ret: HelperReturnKind::MapValuePtr,
+            ret: HelperReturnKind::MapValueOrNull,
+            invalidates_map_value_ptrs: false,
         },
         BPF_FUNC_MAP_UPDATE_ELEM => HelperProto {
             args: [
@@ -677,6 +709,7 @@ fn helper_proto(helper_id: u32) -> Option<HelperProto> {
                 HelperArgKind::Unused,
             ],
             ret: HelperReturnKind::Scalar,
+            invalidates_map_value_ptrs: true,
         },
         BPF_FUNC_MAP_DELETE_ELEM => HelperProto {
             args: [
@@ -687,6 +720,7 @@ fn helper_proto(helper_id: u32) -> Option<HelperProto> {
                 HelperArgKind::Unused,
             ],
             ret: HelperReturnKind::Scalar,
+            invalidates_map_value_ptrs: true,
         },
         BPF_FUNC_KTIME_GET_NS
         | BPF_FUNC_GET_PRANDOM_U32
@@ -701,6 +735,7 @@ fn helper_proto(helper_id: u32) -> Option<HelperProto> {
                 HelperArgKind::Unused,
             ],
             ret: HelperReturnKind::Scalar,
+            invalidates_map_value_ptrs: false,
         },
         BPF_FUNC_GET_CURRENT_COMM => HelperProto {
             args: [
@@ -711,6 +746,7 @@ fn helper_proto(helper_id: u32) -> Option<HelperProto> {
                 HelperArgKind::Unused,
             ],
             ret: HelperReturnKind::Scalar,
+            invalidates_map_value_ptrs: false,
         },
         BPF_FUNC_TRACE_PRINTK => HelperProto {
             args: [
@@ -721,6 +757,7 @@ fn helper_proto(helper_id: u32) -> Option<HelperProto> {
                 HelperArgKind::Init,
             ],
             ret: HelperReturnKind::Scalar,
+            invalidates_map_value_ptrs: false,
         },
         _ => return None,
     };
@@ -749,6 +786,14 @@ fn preserves_mem_ptr(insn: &BpfInsn, reg_ty: RegType) -> bool {
 fn clobber_caller_saved(regs: &mut [RegState; BPF_MAX_REGS]) {
     for reg in 1..=5 {
         regs[reg] = RegState::default();
+    }
+}
+
+fn clobber_map_value_ptrs(regs: &mut [RegState; BPF_MAX_REGS]) {
+    for reg in regs.iter_mut() {
+        if matches!(reg.ty, RegType::MapValuePtr | RegType::MapValueOrNull) {
+            *reg = RegState::scalar();
+        }
     }
 }
 
@@ -967,6 +1012,59 @@ fn insn_successors(insns: &[BpfInsn], decoded: &[BpfInsnAux], pc: usize) -> AxRe
             }
         }
         _ => Ok(next_successor(pc + 1, insns.len())),
+    }
+}
+
+fn successor_states(
+    insns: &[BpfInsn],
+    decoded: &[BpfInsnAux],
+    pc: usize,
+    regs: &[RegState; BPF_MAX_REGS],
+) -> AxResult<Vec<(usize, [RegState; BPF_MAX_REGS])>> {
+    let insn = &insns[pc];
+    let succs = insn_successors(insns, decoded, pc)?;
+
+    if !matches!(insn.class(), BPF_CLASS_JMP) || insn.code & BPF_SRC_X != 0 || insn.imm != 0 {
+        return Ok(succs.into_iter().map(|succ| (succ, *regs)).collect());
+    }
+
+    let dst = insn.dst_reg() as usize;
+    if regs[dst].ty != RegType::MapValueOrNull {
+        return Ok(succs.into_iter().map(|succ| (succ, *regs)).collect());
+    }
+
+    let target = calc_jump_target(pc, insn) as usize;
+    let fallthrough = pc + 1;
+    let mut null_regs = *regs;
+    let mut nonnull_regs = *regs;
+    nonnull_regs[dst] = RegState::map_value();
+
+    match insn.op() {
+        BPF_OP_JEQ => Ok(succs
+            .into_iter()
+            .map(|succ| {
+                if succ == target {
+                    (succ, null_regs)
+                } else if succ == fallthrough {
+                    (succ, nonnull_regs)
+                } else {
+                    (succ, *regs)
+                }
+            })
+            .collect()),
+        BPF_OP_JNE => Ok(succs
+            .into_iter()
+            .map(|succ| {
+                if succ == target {
+                    (succ, nonnull_regs)
+                } else if succ == fallthrough {
+                    (succ, null_regs)
+                } else {
+                    (succ, *regs)
+                }
+            })
+            .collect()),
+        _ => Ok(succs.into_iter().map(|succ| (succ, *regs)).collect()),
     }
 }
 

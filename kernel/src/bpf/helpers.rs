@@ -62,6 +62,14 @@ impl MapValueRegion {
         self.map.id() == map_id && self.key.as_slice() == key
     }
 
+    pub fn refresh(&mut self, value: &[u8]) -> AxResult<()> {
+        if value.len() != self.data.len() {
+            return Err(AxError::InvalidInput);
+        }
+        self.data.copy_from_slice(value);
+        Ok(())
+    }
+
     pub fn read_bytes(&self, ptr: usize, len: usize) -> Option<Vec<u8>> {
         let range = self.range_for(ptr, len)?;
         Some(self.data[range].to_vec())
@@ -148,14 +156,24 @@ impl<'a> HelperContext<'a> {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> u64 {
+        if let Some(region) = self
+            .map_value_regions
+            .iter_mut()
+            .find(|region| region.matches(map.id(), &key))
+        {
+            if region.refresh(&value).is_err() {
+                return 0;
+            }
+            return region.base() as u64;
+        }
+
         self.map_value_regions
             .push(MapValueRegion::new(map, key, value));
         self.map_value_regions.last().unwrap().base() as u64
     }
 
-    pub fn invalidate_map_value_regions(&mut self, map_id: u32, key: &[u8]) {
-        self.map_value_regions
-            .retain(|region| !region.matches(map_id, key));
+    pub fn invalidate_all_map_value_regions(&mut self) {
+        self.map_value_regions.clear();
     }
 
     fn read_stack_bytes(&self, ptr: usize, len: usize) -> Option<Vec<u8>> {
@@ -276,7 +294,7 @@ fn helper_map_update_elem(
 
     match map.update(&key, &value, flags) {
         Ok(()) => {
-            hctx.invalidate_map_value_regions(map.id(), &key);
+            hctx.invalidate_all_map_value_regions();
             0
         }
         Err(_) => helper_error(),
@@ -295,7 +313,7 @@ fn helper_map_delete_elem(map_idx: u64, key_ptr: u64, hctx: &mut HelperContext) 
 
     match map.delete(&key) {
         Ok(()) => {
-            hctx.invalidate_map_value_regions(map.id(), &key);
+            hctx.invalidate_all_map_value_regions();
             0
         }
         Err(_) => helper_error(),
@@ -385,7 +403,12 @@ fn helper_error() -> u64 {
     u64::MAX
 }
 
-fn checked_region(ptr: usize, len: usize, base: usize, size: usize) -> Option<Range<usize>> {
+pub(crate) fn checked_region(
+    ptr: usize,
+    len: usize,
+    base: usize,
+    size: usize,
+) -> Option<Range<usize>> {
     let end = ptr.checked_add(len)?;
     let region_end = base.checked_add(size)?;
     if ptr < base || end > region_end {

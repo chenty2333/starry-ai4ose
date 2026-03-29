@@ -485,9 +485,8 @@ impl<'a> BpfVm<'a> {
 
         // Check stack region
         let stack_base = self.stack.as_ptr() as usize;
-        let stack_end = stack_base + BPF_STACK_SIZE;
-        if ptr >= stack_base && ptr + size <= stack_end {
-            let offset = ptr - stack_base;
+        if let Some(range) = helpers::checked_region(ptr, size, stack_base, BPF_STACK_SIZE) {
+            let offset = range.start;
             return Ok(unsafe {
                 core::ptr::read_unaligned(self.stack.as_ptr().add(offset) as *const T)
             });
@@ -495,8 +494,7 @@ impl<'a> BpfVm<'a> {
 
         // Check context region
         let ctx_base = self.ctx_base as usize;
-        let ctx_end = ctx_base + self.ctx_size;
-        if ptr >= ctx_base && ptr + size <= ctx_end {
+        if helpers::checked_region(ptr, size, ctx_base, self.ctx_size).is_some() {
             return Ok(unsafe { core::ptr::read_unaligned(ptr as *const T) });
         }
 
@@ -516,9 +514,8 @@ impl<'a> BpfVm<'a> {
 
         // Check stack region
         let stack_base = self.stack.as_ptr() as usize;
-        let stack_end = stack_base + BPF_STACK_SIZE;
-        if ptr >= stack_base && ptr + size <= stack_end {
-            let offset = ptr - stack_base;
+        if let Some(range) = helpers::checked_region(ptr, size, stack_base, BPF_STACK_SIZE) {
+            let offset = range.start;
             unsafe {
                 core::ptr::write_unaligned(self.stack.as_mut_ptr().add(offset) as *mut T, val);
             }
