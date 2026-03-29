@@ -3,8 +3,8 @@ use core::time::Duration;
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME, itimerspec,
-    timespec,
+    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, TFD_CLOEXEC, TFD_NONBLOCK,
+    TFD_TIMER_ABSTIME, itimerspec, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -24,7 +24,7 @@ bitflags! {
 fn validate_clockid(clockid: i32) -> AxResult<crate::file::timerfd::TimerClock> {
     match clockid as u32 {
         CLOCK_REALTIME => Ok(crate::file::timerfd::TimerClock::Realtime),
-        CLOCK_MONOTONIC => Ok(crate::file::timerfd::TimerClock::Monotonic),
+        CLOCK_MONOTONIC | CLOCK_BOOTTIME => Ok(crate::file::timerfd::TimerClock::Monotonic),
         _ => Err(AxError::InvalidInput),
     }
 }

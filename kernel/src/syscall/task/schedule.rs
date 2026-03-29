@@ -1,17 +1,19 @@
+use core::time::Duration;
+
 use axerrno::{AxError, AxResult};
 use axhal::time::TimeValue;
 use axtask::{
     AxCpuMask, current,
-    future::{block_on, interruptible, sleep},
+    future::{block_on, interruptible},
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
-    SCHED_RR, TIMER_ABSTIME, timespec,
+    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP,
+    PRIO_PROCESS, PRIO_USER, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
-    task::{get_process_data, get_process_group},
+    task::{AlarmClock, get_process_data, get_process_group, sleep_until_clock},
     time::TimeValueLike,
 };
 
@@ -20,16 +22,23 @@ pub fn sys_sched_yield() -> AxResult<isize> {
     Ok(0)
 }
 
-fn sleep_impl(clock: impl Fn() -> TimeValue, dur: TimeValue) -> TimeValue {
+fn sleep_relative(dur: TimeValue) -> TimeValue {
     debug!("sleep_impl <= {dur:?}");
 
-    let start = clock();
+    let start = AlarmClock::Monotonic.now();
+    let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
 
-    // TODO: currently ignoring concrete clock type
     // We detect EINTR manually if the slept time is not enough.
-    let _ = block_on(interruptible(sleep(dur)));
+    let _ = block_on(interruptible(sleep_until_clock(AlarmClock::Monotonic, deadline)));
 
-    clock() - start
+    AlarmClock::Monotonic.now() - start
+}
+
+fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> bool {
+    debug!("sleep_absolute <= clock: {clock:?}, deadline: {deadline:?}");
+
+    let _ = block_on(interruptible(sleep_until_clock(clock, deadline)));
+    clock.now() >= deadline
 }
 
 /// Sleep some nanoseconds
@@ -38,7 +47,7 @@ pub fn sys_nanosleep(req: *const timespec, rem: *mut timespec) -> AxResult<isize
     let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
-    let actual = sleep_impl(axhal::time::monotonic_time, req);
+    let actual = sleep_relative(req);
 
     if let Some(diff) = req.checked_sub(actual) {
         debug!("sys_nanosleep => rem: {diff:?}");
@@ -58,8 +67,8 @@ pub fn sys_clock_nanosleep(
     rem: *mut timespec,
 ) -> AxResult<isize> {
     let clock = match clock_id as u32 {
-        CLOCK_REALTIME => axhal::time::wall_time,
-        CLOCK_MONOTONIC => axhal::time::monotonic_time,
+        CLOCK_REALTIME => AlarmClock::Realtime,
+        CLOCK_MONOTONIC | CLOCK_BOOTTIME => AlarmClock::Monotonic,
         _ => {
             warn!("Unsupported clock_id: {clock_id}");
             return Err(AxError::InvalidInput);
@@ -69,22 +78,24 @@ pub fn sys_clock_nanosleep(
     let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
-    let dur = if flags & TIMER_ABSTIME != 0 {
-        req.saturating_sub(clock())
-    } else {
-        req
-    };
-
-    let actual = sleep_impl(clock, dur);
-
-    if let Some(diff) = dur.checked_sub(actual) {
-        debug!("sys_clock_nanosleep => rem: {diff:?}");
-        if let Some(rem) = rem.nullable() {
-            rem.vm_write(timespec::from_time_value(diff))?;
+    if flags & TIMER_ABSTIME != 0 {
+        if sleep_absolute(clock, req) {
+            Ok(0)
+        } else {
+            Err(AxError::Interrupted)
         }
-        Err(AxError::Interrupted)
     } else {
-        Ok(0)
+        let actual = sleep_relative(req);
+
+        if let Some(diff) = req.checked_sub(actual) {
+            debug!("sys_clock_nanosleep => rem: {diff:?}");
+            if let Some(rem) = rem.nullable() {
+                rem.vm_write(timespec::from_time_value(diff))?;
+            }
+            Err(AxError::Interrupted)
+        } else {
+            Ok(0)
+        }
     }
 }
 

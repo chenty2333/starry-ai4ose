@@ -1,15 +1,27 @@
 //! Time management module.
 
-use alloc::{borrow::ToOwned, collections::binary_heap::BinaryHeap, sync::Arc};
-use core::{mem, time::Duration};
+use alloc::{
+    borrow::ToOwned,
+    collections::{BTreeMap, binary_heap::BinaryHeap},
+    sync::Arc,
+};
+use core::{
+    future::{Future, poll_fn},
+    mem,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
 
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos, wall_time};
 use axpoll::PollSet;
 use axtask::{
-    WeakAxTaskRef, current,
-    future::{block_on, timeout_at},
+    WeakAxTaskRef, current, register_timer_callback,
+    future::block_on,
 };
 use event_listener::{Event, listener};
+use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use starry_signal::Signo;
@@ -31,7 +43,7 @@ pub(crate) enum AlarmClock {
 }
 
 impl AlarmClock {
-    fn now(self) -> Duration {
+    pub(crate) fn now(self) -> Duration {
         match self {
             AlarmClock::Realtime => wall_time(),
             AlarmClock::Monotonic => axhal::time::monotonic_time(),
@@ -68,11 +80,94 @@ impl Ord for Entry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TimerKey {
+    deadline: Duration,
+    key: u64,
+}
+
+#[derive(Default)]
+struct ClockTimerRuntime {
+    next_key: u64,
+    wheel: BTreeMap<TimerKey, Waker>,
+}
+
+impl ClockTimerRuntime {
+    fn add(&mut self, now: Duration, deadline: Duration) -> Option<TimerKey> {
+        if deadline <= now {
+            return None;
+        }
+
+        let key = TimerKey {
+            deadline,
+            key: self.next_key,
+        };
+        self.wheel.insert(key, Waker::noop().clone());
+        self.next_key += 1;
+        Some(key)
+    }
+
+    fn poll(&mut self, key: &TimerKey, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(waker) = self.wheel.get_mut(key) {
+            *waker = cx.waker().clone();
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
+    fn cancel(&mut self, key: &TimerKey) {
+        self.wheel.remove(key);
+    }
+
+    fn wake(&mut self, now: Duration) {
+        if self.wheel.is_empty() {
+            return;
+        }
+
+        let pending = self.wheel.split_off(&TimerKey {
+            deadline: now,
+            key: u64::MAX,
+        });
+        let expired = mem::replace(&mut self.wheel, pending);
+        for (_, waker) in expired {
+            waker.wake();
+        }
+    }
+}
+
+struct ClockTimerFuture {
+    clock: AlarmClock,
+    key: TimerKey,
+}
+
+impl Future for ClockTimerFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        timer_runtime(self.clock).lock().poll(&self.key, cx)
+    }
+}
+
+impl Drop for ClockTimerFuture {
+    fn drop(&mut self) {
+        timer_runtime(self.clock).lock().cancel(&self.key);
+    }
+}
+
 lazy_static! {
     static ref REALTIME_ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
     static ref MONOTONIC_ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
-    static ref EVENT_NEW_TIMER: Event = Event::new();
+    static ref REALTIME_ALARM_EVENT: Event = Event::new();
+    static ref MONOTONIC_ALARM_EVENT: Event = Event::new();
+    static ref REALTIME_TIMER_RUNTIME: SpinNoIrq<ClockTimerRuntime> =
+        SpinNoIrq::new(ClockTimerRuntime::default());
+    static ref MONOTONIC_TIMER_RUNTIME: SpinNoIrq<ClockTimerRuntime> =
+        SpinNoIrq::new(ClockTimerRuntime::default());
 }
+
+static CLOCK_TIMER_CALLBACK_REGISTERED: [AtomicBool; axconfig::plat::MAX_CPU_NUM] =
+    [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM];
 
 /// The type of interval timer.
 #[repr(i32)]
@@ -247,43 +342,42 @@ impl TimeManager {
     }
 }
 
-async fn alarm_task() {
+enum AlarmWait {
+    DeadlineReached,
+    NewTimer,
+}
+
+async fn alarm_task(clock: AlarmClock) {
     loop {
         // Register before inspecting the queues so a newly inserted earlier
         // deadline cannot race past us and get delayed until a stale timeout.
-        listener!(EVENT_NEW_TIMER => listener);
+        listener!(alarm_event(clock) => listener);
 
-        let mut progressed = false;
-        progressed |= process_due(AlarmClock::Realtime);
-        progressed |= process_due(AlarmClock::Monotonic);
-        if progressed {
+        if process_due(clock) {
             continue;
         }
 
-        let next_realtime = queue_remaining(AlarmClock::Realtime);
-        let next_monotonic = queue_remaining(AlarmClock::Monotonic);
-
-        let Some(next_due) = (match (next_realtime, next_monotonic) {
-            (None, None) => None,
-            (Some(rt), None) => Some(rt),
-            (None, Some(mt)) => Some(mt),
-            (Some(rt), Some(mt)) => Some(rt.min(mt)),
-        }) else {
+        let Some(deadline) = queue_deadline(clock) else {
             listener.await;
             continue;
         };
 
-        let deadline = wall_time().checked_add(next_due);
-        let _ = timeout_at(deadline, listener).await;
+        let _ = wait_until_or_alarm(clock, deadline, listener).await;
     }
 }
 
 /// Spawns the alarm task.
 pub fn spawn_alarm_task() {
     info!("Initialize alarm...");
+    ensure_clock_timer_runtime();
     axtask::spawn_raw(
-        || block_on(alarm_task()),
-        "alarm_task".to_owned(),
+        || block_on(alarm_task(AlarmClock::Realtime)),
+        "alarm_realtime".to_owned(),
+        axconfig::TASK_STACK_SIZE,
+    );
+    axtask::spawn_raw(
+        || block_on(alarm_task(AlarmClock::Monotonic)),
+        "alarm_monotonic".to_owned(),
         axconfig::TASK_STACK_SIZE,
     );
 }
@@ -295,6 +389,37 @@ fn alarm_list(clock: AlarmClock) -> &'static Mutex<BinaryHeap<Entry>> {
     }
 }
 
+fn alarm_event(clock: AlarmClock) -> &'static Event {
+    match clock {
+        AlarmClock::Realtime => &REALTIME_ALARM_EVENT,
+        AlarmClock::Monotonic => &MONOTONIC_ALARM_EVENT,
+    }
+}
+
+fn timer_runtime(clock: AlarmClock) -> &'static SpinNoIrq<ClockTimerRuntime> {
+    match clock {
+        AlarmClock::Realtime => &REALTIME_TIMER_RUNTIME,
+        AlarmClock::Monotonic => &MONOTONIC_TIMER_RUNTIME,
+    }
+}
+
+fn ensure_clock_timer_runtime() {
+    let cpu_id = axhal::percpu::this_cpu_id();
+    if CLOCK_TIMER_CALLBACK_REGISTERED[cpu_id]
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        register_timer_callback(|_| {
+            wake_clock_timers(AlarmClock::Realtime);
+            wake_clock_timers(AlarmClock::Monotonic);
+        });
+    }
+}
+
+fn wake_clock_timers(clock: AlarmClock) {
+    timer_runtime(clock).lock().wake(clock.now());
+}
+
 fn register_alarm(clock: AlarmClock, deadline: Duration, action: AlarmAction) {
     let list = alarm_list(clock);
     let mut guard = list.lock();
@@ -302,7 +427,7 @@ fn register_alarm(clock: AlarmClock, deadline: Duration, action: AlarmAction) {
     guard.push(Entry { deadline, action });
     drop(guard);
     if should_wake {
-        EVENT_NEW_TIMER.notify(1);
+        alarm_event(clock).notify(1);
     }
 }
 
@@ -313,12 +438,10 @@ pub fn register_pollset_alarm(clock: AlarmClock, deadline: Duration, poll_set: A
     register_alarm(clock, deadline, AlarmAction::WakePollSet(poll_set));
 }
 
-fn queue_remaining(clock: AlarmClock) -> Option<Duration> {
+fn queue_deadline(clock: AlarmClock) -> Option<Duration> {
     let list = alarm_list(clock);
     let guard = list.lock();
-    let entry = guard.peek()?;
-    let now = clock.now();
-    Some(entry.deadline.saturating_sub(now))
+    Some(guard.peek()?.deadline)
 }
 
 fn pop_due(clock: AlarmClock) -> Option<AlarmAction> {
@@ -348,4 +471,29 @@ fn process_due(clock: AlarmClock) -> bool {
         }
     }
     progressed
+}
+
+async fn wait_until_or_alarm<L>(clock: AlarmClock, deadline: Duration, mut listener: L) -> AlarmWait
+where
+    L: Future<Output = ()> + Unpin,
+{
+    let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
+    poll_fn(|cx| {
+        if Pin::new(&mut listener).poll(cx).is_ready() {
+            return Poll::Ready(AlarmWait::NewTimer);
+        }
+        if sleeper.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(AlarmWait::DeadlineReached);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+pub async fn sleep_until_clock(clock: AlarmClock, deadline: Duration) {
+    ensure_clock_timer_runtime();
+    let key = timer_runtime(clock).lock().add(clock.now(), deadline);
+    if let Some(key) = key {
+        ClockTimerFuture { clock, key }.await;
+    }
 }
