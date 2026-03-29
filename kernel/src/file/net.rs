@@ -60,7 +60,11 @@ impl FileLike for Socket {
     where
         Self: Sized + 'static,
     {
-        get_typed_file(fd).map_err(|_| AxError::NotASocket)
+        match get_typed_file(fd) {
+            Ok(file) => Ok(file),
+            Err(AxError::InvalidInput) => Err(AxError::NotASocket),
+            Err(err) => Err(err),
+        }
     }
 }
 impl Pollable for Socket {

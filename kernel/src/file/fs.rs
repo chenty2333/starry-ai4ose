@@ -234,7 +234,11 @@ impl FileLike for Directory {
     }
 
     fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>> {
-        get_typed_file(fd).map_err(|_| AxError::NotADirectory)
+        match get_typed_file(fd) {
+            Ok(file) => Ok(file),
+            Err(AxError::InvalidInput) => Err(AxError::NotADirectory),
+            Err(err) => Err(err),
+        }
     }
 }
 impl Pollable for Directory {
