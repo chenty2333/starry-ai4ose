@@ -124,18 +124,12 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         &duration,
     )?;
 
-    // Write context output if requested
-    if attr.ctx_out != 0 && attr.ctx_size_out > 0 {
-        let out_size = (attr.ctx_size_out as usize).min(ctx.len());
-        starry_vm::vm_write_slice(attr.ctx_out as *mut u8, &ctx[..out_size])
-            .map_err(|_| AxError::BadAddress)?;
-        write_bpf_attr_value::<BpfAttrTestRun, _>(
-            attr_ptr,
-            attr_size,
-            offset_of!(BpfAttrTestRun, ctx_size_out),
-            &(out_size as u32),
-        )?;
-    }
+    write_bpf_attr_value::<BpfAttrTestRun, _>(
+        attr_ptr,
+        attr_size,
+        offset_of!(BpfAttrTestRun, ctx_size_out),
+        &0u32,
+    )?;
 
     write_bpf_attr_value::<BpfAttrTestRun, _>(
         attr_ptr,
@@ -192,7 +186,7 @@ fn validate_prog_test_run_attr(attr: &BpfAttrTestRun, prog_type: u32) -> AxResul
     if attr.ctx_size_in > 0 && attr.ctx_in == 0 {
         return Err(AxError::InvalidInput);
     }
-    if attr.ctx_size_out > 0 && attr.ctx_out == 0 {
+    if attr.ctx_out != 0 || attr.ctx_size_out != 0 {
         return Err(AxError::InvalidInput);
     }
 
