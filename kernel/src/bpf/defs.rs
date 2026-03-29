@@ -26,11 +26,54 @@ pub struct BpfInsn {
 const _: [(); 8] = [(); core::mem::size_of::<BpfInsn>()];
 
 impl BpfInsn {
+    pub fn class(&self) -> u8 {
+        self.code & 0x07
+    }
+
+    pub fn op(&self) -> u8 {
+        self.code & 0xf0
+    }
+
     pub fn dst_reg(&self) -> u8 {
         self.regs & 0x0f
     }
     pub fn src_reg(&self) -> u8 {
         (self.regs >> 4) & 0x0f
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpfLdImm64Data {
+    Immediate(u64),
+    MapFd(i32),
+    MapIndex(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpfInsnAux {
+    Basic,
+    LdImm64Head(BpfLdImm64Data),
+    LdImm64Cont { head: usize },
+}
+
+impl BpfInsnAux {
+    pub fn is_continuation(self) -> bool {
+        matches!(self, Self::LdImm64Cont { .. })
+    }
+
+    pub fn ld_imm64_data(self) -> Option<BpfLdImm64Data> {
+        match self {
+            Self::LdImm64Head(data) => Some(data),
+            _ => None,
+        }
+    }
+}
+
+pub fn bpf_jump_delta(insn: &BpfInsn) -> i64 {
+    if insn.class() == BPF_CLASS_JMP32 && insn.op() == BPF_OP_JA {
+        insn.imm as i64
+    } else {
+        insn.off as i64
     }
 }
 

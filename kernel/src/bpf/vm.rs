@@ -19,6 +19,7 @@ pub struct BpfVm<'a> {
     regs: [u64; BPF_MAX_REGS],
     stack: [u8; BPF_STACK_SIZE],
     insns: &'a [BpfInsn],
+    decoded_insns: &'a [BpfInsnAux],
     pc: usize,
     maps: &'a [Arc<dyn BpfMap>],
     /// Scratch buffer for helper return values (e.g., map_lookup_elem).
@@ -29,11 +30,16 @@ pub struct BpfVm<'a> {
 }
 
 impl<'a> BpfVm<'a> {
-    pub fn new(insns: &'a [BpfInsn], maps: &'a [Arc<dyn BpfMap>]) -> Self {
+    pub fn new(
+        insns: &'a [BpfInsn],
+        decoded_insns: &'a [BpfInsnAux],
+        maps: &'a [Arc<dyn BpfMap>],
+    ) -> Self {
         Self {
             regs: [0; BPF_MAX_REGS],
             stack: [0; BPF_STACK_SIZE],
             insns,
+            decoded_insns,
             pc: 0,
             maps,
             scratch: Vec::new(),
@@ -65,6 +71,9 @@ impl<'a> BpfVm<'a> {
                 return Err(AxError::ResourceBusy);
             }
             if self.pc >= self.insns.len() {
+                return Err(AxError::InvalidInput);
+            }
+            if self.decoded_insns[self.pc].is_continuation() {
                 return Err(AxError::InvalidInput);
             }
 
@@ -106,10 +115,18 @@ impl<'a> BpfVm<'a> {
             BPF_OP_SUB => self.regs[dst].wrapping_sub(src_val),
             BPF_OP_MUL => self.regs[dst].wrapping_mul(src_val),
             BPF_OP_DIV => {
-                if src_val == 0 { 0 } else { self.regs[dst] / src_val }
+                if src_val == 0 {
+                    0
+                } else {
+                    self.regs[dst] / src_val
+                }
             }
             BPF_OP_MOD => {
-                if src_val == 0 { self.regs[dst] } else { self.regs[dst] % src_val }
+                if src_val == 0 {
+                    self.regs[dst]
+                } else {
+                    self.regs[dst] % src_val
+                }
             }
             BPF_OP_OR => self.regs[dst] | src_val,
             BPF_OP_AND => self.regs[dst] & src_val,
@@ -167,10 +184,18 @@ impl<'a> BpfVm<'a> {
             BPF_OP_SUB => dst_val.wrapping_sub(src_val),
             BPF_OP_MUL => dst_val.wrapping_mul(src_val),
             BPF_OP_DIV => {
-                if src_val == 0 { 0 } else { dst_val / src_val }
+                if src_val == 0 {
+                    0
+                } else {
+                    dst_val / src_val
+                }
             }
             BPF_OP_MOD => {
-                if src_val == 0 { dst_val } else { dst_val % src_val }
+                if src_val == 0 {
+                    dst_val
+                } else {
+                    dst_val % src_val
+                }
             }
             BPF_OP_OR => dst_val | src_val,
             BPF_OP_AND => dst_val & src_val,
@@ -180,25 +205,23 @@ impl<'a> BpfVm<'a> {
             BPF_OP_XOR => dst_val ^ src_val,
             BPF_OP_MOV => src_val,
             BPF_OP_ARSH => ((dst_val as i32) >> (src_val & 31)) as u32,
-            BPF_OP_END => {
-                match insn.imm {
-                    16 => {
-                        if insn.code & BPF_SRC_X != 0 {
-                            (dst_val as u16).to_be() as u32
-                        } else {
-                            (dst_val as u16).to_le() as u32
-                        }
+            BPF_OP_END => match insn.imm {
+                16 => {
+                    if insn.code & BPF_SRC_X != 0 {
+                        (dst_val as u16).to_be() as u32
+                    } else {
+                        (dst_val as u16).to_le() as u32
                     }
-                    32 => {
-                        if insn.code & BPF_SRC_X != 0 {
-                            dst_val.to_be()
-                        } else {
-                            dst_val.to_le()
-                        }
-                    }
-                    _ => return Err(AxError::InvalidInput),
                 }
-            }
+                32 => {
+                    if insn.code & BPF_SRC_X != 0 {
+                        dst_val.to_be()
+                    } else {
+                        dst_val.to_le()
+                    }
+                }
+                _ => return Err(AxError::InvalidInput),
+            },
             _ => return Err(AxError::InvalidInput),
         };
 
@@ -244,7 +267,7 @@ impl<'a> BpfVm<'a> {
         }
 
         if op == BPF_OP_JA {
-            self.pc = ((self.pc as i64) + 1 + (insn.off as i64)) as usize;
+            self.pc = ((self.pc as i64) + 1 + bpf_jump_delta(insn)) as usize;
             return Ok(None);
         }
 
@@ -254,7 +277,7 @@ impl<'a> BpfVm<'a> {
         let taken = eval_jmp_cond(op, dst_val, src_val);
 
         if taken {
-            self.pc = ((self.pc as i64) + 1 + (insn.off as i64)) as usize;
+            self.pc = ((self.pc as i64) + 1 + bpf_jump_delta(insn)) as usize;
         } else {
             self.pc += 1;
         }
@@ -269,9 +292,12 @@ impl<'a> BpfVm<'a> {
         let dst = insn.dst_reg() as usize;
         let op = insn.code & 0xf0;
 
+        if op == BPF_OP_CALL || op == BPF_OP_EXIT {
+            return Err(AxError::InvalidInput);
+        }
+
         if op == BPF_OP_JA {
-            // JMP32 JA uses imm as 32-bit offset (not off)
-            self.pc = ((self.pc as i64) + 1 + (insn.imm as i64)) as usize;
+            self.pc = ((self.pc as i64) + 1 + bpf_jump_delta(insn)) as usize;
             return Ok(());
         }
 
@@ -280,7 +306,7 @@ impl<'a> BpfVm<'a> {
         let taken = eval_jmp_cond(op, dst_val, src_val);
 
         if taken {
-            self.pc = ((self.pc as i64) + 1 + (insn.off as i64)) as usize;
+            self.pc = ((self.pc as i64) + 1 + bpf_jump_delta(insn)) as usize;
         } else {
             self.pc += 1;
         }
@@ -367,15 +393,11 @@ impl<'a> BpfVm<'a> {
     fn exec_ld(&mut self, insn: &BpfInsn) -> AxResult<()> {
         let dst = insn.dst_reg() as usize;
 
-        // Must be BPF_LD | BPF_DW | BPF_IMM
-        if (insn.code & 0x18) != BPF_SIZE_DW || (insn.code & 0xe0) != BPF_MODE_IMM {
-            return Err(AxError::InvalidInput);
-        }
-
-        let next = self.insns.get(self.pc + 1).ok_or(AxError::InvalidInput)?;
-        let imm64 = (insn.imm as u32 as u64) | ((next.imm as u32 as u64) << 32);
-
-        self.regs[dst] = imm64;
+        self.regs[dst] = match self.decoded_insns[self.pc] {
+            BpfInsnAux::LdImm64Head(BpfLdImm64Data::Immediate(imm64)) => imm64,
+            BpfInsnAux::LdImm64Head(BpfLdImm64Data::MapIndex(map_index)) => map_index as u64,
+            _ => return Err(AxError::InvalidInput),
+        };
         self.pc += 2;
         Ok(())
     }

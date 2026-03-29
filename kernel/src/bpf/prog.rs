@@ -8,6 +8,7 @@ use super::{defs::*, map::BpfMap};
 pub struct BpfProgram {
     pub prog_type: u32,
     pub insns: Vec<BpfInsn>,
+    pub decoded_insns: Vec<BpfInsnAux>,
     pub name: [u8; BPF_OBJ_NAME_LEN],
     pub prog_id: u32,
     pub expected_attach_type: u32,
