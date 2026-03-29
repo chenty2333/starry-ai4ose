@@ -4,6 +4,13 @@ use alloc::{sync::Arc, vec::Vec};
 
 use super::{defs::*, map::BpfMap};
 
+pub fn uses_raw_ctx_prog_type(prog_type: u32) -> bool {
+    matches!(
+        prog_type,
+        BPF_PROG_TYPE_TRACEPOINT | BPF_PROG_TYPE_RAW_TRACEPOINT
+    )
+}
+
 /// A loaded (and verified) BPF program.
 pub struct BpfProgram {
     pub prog_type: u32,

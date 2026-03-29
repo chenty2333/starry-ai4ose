@@ -11,7 +11,7 @@ use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 
-use super::{defs::*, helpers::HelperMemMask, map::BpfMap};
+use super::{defs::*, helpers::HelperMemMask, map::BpfMap, prog::uses_raw_ctx_prog_type};
 use crate::file::{FileLike, bpf::BpfMapFd};
 
 // ---------------------------------------------------------------------------
@@ -156,10 +156,15 @@ pub struct VerifiedProgram {
 /// `log_level` > 0 enables the verifier log.
 pub fn verify_program(
     insns: &[BpfInsn],
-    _prog_type: u32,
+    prog_type: u32,
     log_level: u32,
 ) -> AxResult<VerifiedProgram> {
     let mut log = VerifierLog::new(log_level > 0);
+
+    if !uses_raw_ctx_prog_type(prog_type) {
+        log.log("unsupported program type for current verifier/VM model");
+        return Err(AxError::InvalidInput);
+    }
 
     if insns.is_empty() || insns.len() > BPF_MAX_INSNS {
         log.log("program length out of range");

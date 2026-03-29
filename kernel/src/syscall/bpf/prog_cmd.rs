@@ -1,14 +1,18 @@
 //! BPF program syscall command handlers: PROG_LOAD and PROG_TEST_RUN.
 
-use alloc::{sync::Arc, vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult};
 
 use crate::{
     bpf::{
-        alloc_prog_id, defs::*, prog::BpfProgram, read_bpf_attr, require_bpf_attr_range, verifier,
-        vm::BpfVm, write_bpf_attr_value,
+        alloc_prog_id,
+        defs::*,
+        prog::{BpfProgram, uses_raw_ctx_prog_type},
+        read_bpf_attr, require_bpf_attr_range, verifier,
+        vm::BpfVm,
+        write_bpf_attr_value,
     },
     file::{FileLike, bpf::BpfProgFd},
 };
@@ -19,6 +23,8 @@ pub fn bpf_prog_load(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         "bpf_prog_load: type={}, insn_cnt={}, log_level={}",
         attr.prog_type, attr.insn_cnt, attr.log_level
     );
+
+    validate_prog_load_attr(&attr)?;
 
     // Validate basic parameters
     if attr.insn_cnt == 0 || attr.insn_cnt > BPF_MAX_INSNS as u32 {
@@ -83,24 +89,14 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
     let prog_fd = BpfProgFd::from_fd(attr.prog_fd as _)?;
     let prog = &prog_fd.prog;
 
+    validate_prog_test_run_attr(&attr, prog.prog_type)?;
+
     // Read context from user space (if provided)
     let ctx_size = attr.ctx_size_in as usize;
     let mut ctx = if ctx_size > 0 && attr.ctx_in != 0 {
         starry_vm::vm_load(attr.ctx_in as *const u8, ctx_size).map_err(|_| AxError::BadAddress)?
     } else {
-        // Provide a minimal empty context
-        vec![0u8; 64]
-    };
-
-    // Read data input (if provided)
-    let data_size = attr.data_size_in as usize;
-    let data_in = if data_size > 0 && attr.data_in != 0 {
-        Some(
-            starry_vm::vm_load(attr.data_in as *const u8, data_size)
-                .map_err(|_| AxError::BadAddress)?,
-        )
-    } else {
-        None
+        Vec::new()
     };
 
     // Run the program
@@ -141,26 +137,66 @@ pub fn bpf_prog_test_run(attr_ptr: usize, attr_size: u32) -> AxResult<isize> {
         )?;
     }
 
-    // Write data output if requested
-    if let Some(ref _data) = data_in {
-        if attr.data_out != 0 && attr.data_size_out > 0 {
-            // For socket filter programs, the data_out would be the filtered
-            // packet. For now, just copy data_in to data_out unchanged.
-            let out_size = (attr.data_size_out as usize).min(data_size);
-            if let Some(ref data) = data_in {
-                starry_vm::vm_write_slice(attr.data_out as *mut u8, &data[..out_size])
-                    .map_err(|_| AxError::BadAddress)?;
-            }
-            write_bpf_attr_value::<BpfAttrTestRun, _>(
-                attr_ptr,
-                attr_size,
-                offset_of!(BpfAttrTestRun, data_size_out),
-                &(out_size as u32),
-            )?;
-        }
-    }
+    write_bpf_attr_value::<BpfAttrTestRun, _>(
+        attr_ptr,
+        attr_size,
+        offset_of!(BpfAttrTestRun, data_size_out),
+        &0u32,
+    )?;
 
     Ok(0)
+}
+
+fn validate_prog_load_attr(attr: &BpfAttrProgLoad) -> AxResult<()> {
+    if !uses_raw_ctx_prog_type(attr.prog_type) {
+        return Err(AxError::InvalidInput);
+    }
+
+    if attr.prog_flags != 0
+        || attr.expected_attach_type != 0
+        || attr.prog_ifindex != 0
+        || attr.prog_btf_fd != 0
+        || attr.func_info_rec_size != 0
+        || attr.func_info != 0
+        || attr.func_info_cnt != 0
+        || attr.line_info_rec_size != 0
+        || attr.line_info != 0
+        || attr.line_info_cnt != 0
+        || attr.attach_btf_id != 0
+        || attr.attach_prog_fd_or_btf_obj_fd != 0
+        || attr.core_relo_cnt != 0
+        || attr.fd_array != 0
+        || attr.core_relos != 0
+        || attr.core_relo_rec_size != 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+
+    Ok(())
+}
+
+fn validate_prog_test_run_attr(attr: &BpfAttrTestRun, prog_type: u32) -> AxResult<()> {
+    if !uses_raw_ctx_prog_type(prog_type) {
+        return Err(AxError::InvalidInput);
+    }
+
+    if attr.flags != 0 || attr.cpu != 0 || attr.batch_size != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    if attr.data_size_in != 0 || attr.data_size_out != 0 || attr.data_in != 0 || attr.data_out != 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+
+    if attr.ctx_size_in > 0 && attr.ctx_in == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if attr.ctx_size_out > 0 && attr.ctx_out == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    Ok(())
 }
 
 fn license_is_gpl(license: &[u8]) -> bool {
