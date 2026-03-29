@@ -271,7 +271,7 @@ impl SocketOps for TcpSocket {
                     bound_endpoint.addr = Some(
                         self.stack
                             .get_service()
-                            .get_source_address(&remote_endpoint.addr),
+                            .get_source_address(&remote_endpoint.addr)?,
                     );
                 }
                 if bound_endpoint.port == 0 {

@@ -126,9 +126,13 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
 
     let mut service = Service::new(router, socket_set.clone());
     service.iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs.push(lo_ip.into()).unwrap();
+        ip_addrs
+            .push(lo_ip.into())
+            .expect("loopback address insertion should succeed");
         if let Some(eth0_ip) = eth0_ip {
-            ip_addrs.push(eth0_ip.into()).unwrap();
+            ip_addrs
+                .push(eth0_ip.into())
+                .expect("eth0 address insertion should succeed");
         }
     });
 

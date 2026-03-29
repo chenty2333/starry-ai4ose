@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, sync::Arc};
 
-use axerrno::{AxResult, ax_bail};
+use axerrno::{AxResult, ax_bail, ax_err_type};
 use axsync::Mutex;
 use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 
@@ -70,7 +70,9 @@ impl NetStack {
 
         let mut service = Service::new(router, socket_set.clone());
         service.iface.update_ip_addrs(|addrs| {
-            addrs.push(lo_ip.into()).unwrap();
+            addrs
+                .push(lo_ip.into())
+                .expect("loopback address insertion should succeed");
         });
 
         Self::new(listen_table, socket_set, service)
@@ -89,10 +91,14 @@ impl NetStack {
     }
 
     /// Add an IP address to this stack's interface.
-    pub fn add_ip_addr(&self, addr: IpCidr) {
+    pub fn add_ip_addr(&self, addr: IpCidr) -> AxResult {
+        let mut result = Ok(());
         self.service.lock().iface.update_ip_addrs(|addrs| {
-            addrs.push(addr).unwrap();
+            if addrs.push(addr).is_err() {
+                result = Err(ax_err_type!(BadState, "IP address list full"));
+            }
         });
+        result
     }
 
     /// Poll all network interfaces owned by this stack.

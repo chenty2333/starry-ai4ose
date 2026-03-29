@@ -1,5 +1,5 @@
 use core::{
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::Waker,
     time::Duration,
 };
@@ -23,7 +23,7 @@ pub(crate) struct GeneralOptions {
     send_timeout_nanos: AtomicU64,
     recv_timeout_nanos: AtomicU64,
 
-    device_mask: AtomicU32,
+    device_mask: AtomicU64,
 }
 impl Default for GeneralOptions {
     fn default() -> Self {
@@ -39,7 +39,7 @@ impl GeneralOptions {
             send_timeout_nanos: AtomicU64::new(0),
             recv_timeout_nanos: AtomicU64::new(0),
 
-            device_mask: AtomicU32::new(0),
+            device_mask: AtomicU64::new(0),
         }
     }
 
@@ -61,11 +61,11 @@ impl GeneralOptions {
         (nanos > 0).then(|| Duration::from_nanos(nanos))
     }
 
-    pub fn set_device_mask(&self, mask: u32) {
+    pub fn set_device_mask(&self, mask: u64) {
         self.device_mask.store(mask, Ordering::Release);
     }
 
-    pub fn device_mask(&self) -> u32 {
+    pub fn device_mask(&self) -> u64 {
         self.device_mask.load(Ordering::Acquire)
     }
 

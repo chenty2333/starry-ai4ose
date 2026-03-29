@@ -166,7 +166,7 @@ impl SocketOps for UdpSocket {
         let src = self
             .stack
             .get_service()
-            .get_source_address(&remote_addr.addr);
+            .get_source_address(&remote_addr.addr)?;
         *guard = Some((remote_addr, src));
         debug!("UDP socket {}: connected to {}", self.handle, remote_addr);
         Ok(())
@@ -179,7 +179,7 @@ impl SocketOps for UdpSocket {
                 let src = self
                     .stack
                     .get_service()
-                    .get_source_address(&addr.addr);
+                    .get_source_address(&addr.addr)?;
                 (addr, src)
             }
             None => self.remote_endpoint()?,

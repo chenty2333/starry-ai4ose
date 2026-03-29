@@ -4,6 +4,7 @@ use core::{
     task::{Context, Waker},
 };
 
+use axerrno::{AxError, AxResult};
 use axhal::time::{NANOS_PER_MICROS, TimeValue, wall_time_nanos};
 use axtask::future::sleep_until;
 use smoltcp::{
@@ -45,25 +46,31 @@ impl Service {
         self.router.dispatch(timestamp)
     }
 
-    pub fn get_source_address(&self, dst_addr: &IpAddress) -> IpAddress {
+    pub fn get_source_address(&self, dst_addr: &IpAddress) -> AxResult<IpAddress> {
         let Some(rule) = self.router.table.lookup(dst_addr) else {
-            panic!("no route to destination: {dst_addr}");
+            return Err(AxError::from(axerrno::LinuxError::ENETUNREACH));
         };
-        rule.src
+        Ok(rule.src)
     }
 
-    pub fn device_mask_for(&self, endpoint: &IpListenEndpoint) -> u32 {
+    pub fn device_mask_for(&self, endpoint: &IpListenEndpoint) -> u64 {
         match endpoint.addr {
             Some(addr) => self
                 .router
                 .table
                 .lookup(&addr)
-                .map_or(0, |it| 1u32 << it.dev),
-            None => u32::MAX,
+                .map_or(0, |it| {
+                    if it.dev >= 64 {
+                        u64::MAX
+                    } else {
+                        1u64 << it.dev
+                    }
+                }),
+            None => u64::MAX,
         }
     }
 
-    pub fn register_waker(&mut self, mask: u32, waker: &Waker) {
+    pub fn register_waker(&mut self, mask: u64, waker: &Waker) {
         let next = self.iface.poll_at(now(), &self.socket_set.inner.lock());
 
         if let Some(t) = next {
@@ -84,7 +91,7 @@ impl Service {
         }
 
         for (i, device) in self.router.devices.iter().enumerate() {
-            if mask & (1 << i) != 0 {
+            if i >= 64 || mask & (1u64 << i) != 0 {
                 device.register_waker(waker);
             }
         }

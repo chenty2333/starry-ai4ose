@@ -115,6 +115,9 @@ impl CloneArgs {
         if flags.contains(CloneFlags::PIDFD | CloneFlags::DETACHED) {
             return Err(AxError::InvalidInput);
         }
+        if flags.contains(CloneFlags::THREAD | CloneFlags::NEWNET) {
+            return Err(AxError::InvalidInput);
+        }
 
         let unsupported_ns_flags = CloneFlags::NEWIPC
             | CloneFlags::NEWNS
